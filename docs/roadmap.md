@@ -45,6 +45,9 @@ It cannot reach true exactly-once — that needs a transaction spanning the sink
 and the cursor store, which a CLI writing to stdout cannot have — and the
 README should keep saying so.
 
+Until it exists, `--rewind` is the manual escape hatch: it steps a run back
+so recent records are reprocessed, by ledger count or by duration.
+
 ### Contract-spec-aware decoding
 
 The one place `stellar events` is clearly better. Given a contract's

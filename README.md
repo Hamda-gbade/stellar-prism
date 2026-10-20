@@ -113,6 +113,28 @@ prism events --from 3966000 --limit 10000 --json --backfill-workers 4
 Workers fetch disjoint ledger ranges, then records are merged by ID before
 they reach stdout, so output order and de-duplication are unchanged.
 
+### Reprocessing with `--rewind`
+
+`--rewind` steps the start point back so the records in between are processed
+again — the manual way to reprocess what a stream just missed:
+
+```sh
+# Reprocess the last 500 ledgers, then keep following
+prism events --contract CDLZF...CYSC --rewind 500 --follow
+
+# Or by time: 30 minutes' worth of ledgers
+prism events --contract CDLZF...CYSC --rewind 30m --follow
+```
+
+The step is measured from `--from` when it is given, and from the server's
+head otherwise. While a stream is following, `SIGUSR2` asks for the same
+step again, which reprocesses the records between the old and the new
+position.
+
+A rewind re-emits the records it steps over, on purpose: that is what
+reprocessing means. A rewind that reaches past the server's ~24-hour
+retention window is reported as a gap and exits 2, like any other gap.
+
 ### NDJSON for pipelines
 
 `--json` emits one object per line, flushed after each record (or batch), so a
@@ -180,7 +202,8 @@ This is a streaming tool, so the guarantee matters more than the feature list:
 
 - **No duplicates within a run.** Cursor paging is exact, and every record is
   checked against the highest ID already emitted, so a page replayed after a
-  reconnect is suppressed.
+  reconnect is suppressed. A `--rewind` is the one exception: it deliberately
+  re-emits the records it steps over, which is what reprocessing means.
 - **A dropped connection cannot skip records.** A failed fetch is retried with
   the cursor *unchanged*.
 - **No silent gaps by default.** Records can only be genuinely lost by falling
@@ -248,6 +271,8 @@ before v1.0.
 - Event, ledger and transaction streams; `prism tx` via the lens explain path.
 - Count/time batching (`--batch`) and concurrent historical backfill
   (`--backfill-workers`).
+- `--rewind` to step a stream back and reprocess recent ledgers, by count or
+  by duration, while it runs.
 - Explicit gap policy: stop by default, or `--gap-strategy resume` with the
   skipped range reported.
 - Payloads render as the XDR wire shape — prism has no contract-spec decoding,

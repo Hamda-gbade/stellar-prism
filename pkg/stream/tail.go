@@ -28,6 +28,9 @@ type Stats struct {
 	Gaps int
 	// Recovered counts gaps the stream skipped past under GapResume.
 	Recovered int
+	// Rewinds counts rewinds the stream applied. Each one re-emitted the
+	// records between the old and the new position.
+	Rewinds int
 }
 
 // Options configures a Tailer.
@@ -58,6 +61,16 @@ type Options struct {
 	MaxGapRecoveries int
 	// OnGap, when set, is called for every detected gap.
 	OnGap func(GapEvent)
+	// Rewind, when set, lets a caller step the stream back while it runs.
+	//
+	// The tailer applies a pending request before its next fetch: the source
+	// is repositioned, the cursor is cleared and the de-duplication mark is
+	// reset, so the records in between are emitted again. That is deliberate
+	// reprocessing, and it is the only way a stream re-emits a record within
+	// a single run.
+	Rewind *RewindController
+	// OnRewind, when set, is called after a rewind has been applied.
+	OnRewind func(RewindTarget)
 }
 
 // Tailer drives a Source, emitting records to a Sink.
@@ -81,6 +94,11 @@ type Options struct {
 //     record and commit its cursor, so a process killed between the two will
 //     re-emit on restart. Durable cursors would narrow this and are on the
 //     roadmap; consumers that care should key off Record.ID.
+//
+//   - A rewind re-emits on purpose. Stepping the cursor back reprocesses the
+//     records in between, so they are emitted a second time. It is the only
+//     way a record is emitted twice within a run, and it happens only when
+//     the caller asks for one.
 type Tailer struct {
 	src  Source
 	sink Sink
@@ -93,6 +111,12 @@ type Tailer struct {
 	// fixed-width and zero-padded, a plain string comparison orders them
 	// correctly, which is what makes de-duplication a single comparison.
 	lastID string
+	// lastLedger is the ledger of the most recently emitted record. It is
+	// the fallback anchor for a rewind when the cursor cannot be read.
+	lastLedger uint32
+	// rewoundTo is the ledger the last rewind landed on. It is what makes a
+	// rewind that reached past the server's retention window detectable.
+	rewoundTo uint32
 
 	stats    Stats
 	recovery GapRecovery
@@ -149,6 +173,13 @@ func (t *Tailer) Run(ctx context.Context) error {
 			return t.finish(nil)
 		}
 
+		// A rewind is applied before the fetch, so a request made while the
+		// stream is running takes effect at a page boundary rather than in
+		// the middle of a page.
+		if err := t.applyRewind(); err != nil {
+			return t.finish(err)
+		}
+
 		batch, err := t.fetchWithRetry(ctx)
 		if err != nil {
 			if IsCancellation(err) {
@@ -157,7 +188,17 @@ func (t *Tailer) Run(ctx context.Context) error {
 			return err
 		}
 
-		if gapErr := t.checkGap(batch); gapErr != nil {
+		gapErr := t.checkGap(batch)
+		if gapErr == nil {
+			gapErr = t.checkRewindGap(batch)
+		}
+		// The rewind check applies to the page that follows the rewind.
+		// Once that page has been seen the target has been passed, and
+		// comparing it with a later retention floor would report a gap
+		// that is not one: the server's floor moves forward with time.
+		t.rewoundTo = 0
+
+		if gapErr != nil {
 			t.stats.Gaps++
 			recovered, recoverErr := t.recovery.Handle(t.src, gapErr)
 			if recoverErr != nil {
@@ -268,6 +309,85 @@ func (t *Tailer) checkGap(b Batch) *GapError {
 	return nil
 }
 
+// applyRewind consumes a pending rewind request and repositions the stream.
+//
+// Repositioning clears the cursor and the de-duplication mark, which is what
+// makes the records in between be emitted again: a rewind is deliberate
+// reprocessing, and it is the only way a stream re-emits a record within a
+// single run.
+func (t *Tailer) applyRewind() error {
+	if t.opts.Rewind == nil {
+		return nil
+	}
+	req, ok := t.opts.Rewind.Take()
+	if !ok {
+		return nil
+	}
+
+	anchor, ok := t.rewindAnchor(req)
+	if !ok {
+		return fmt.Errorf(
+			"cannot rewind the %s stream: it has not reached a position yet", t.src.Name())
+	}
+	target, err := req.Distance.Target(anchor)
+	if err != nil {
+		return fmt.Errorf("rewinding the %s stream: %w", t.src.Name(), err)
+	}
+
+	rewinder, ok := t.src.(Rewinder)
+	if !ok {
+		return fmt.Errorf(
+			"source %q cannot be rewound because it does not implement Rewinder", t.src.Name())
+	}
+
+	rewinder.Rewind(target.Ledger)
+	t.cursor = ""
+	t.lastID = ""
+	t.rewoundTo = target.Ledger
+	t.stats.Rewinds++
+
+	if t.opts.OnRewind != nil {
+		t.opts.OnRewind(target)
+	}
+	return nil
+}
+
+// rewindAnchor reports the position a rewind is measured from.
+//
+// An explicit anchor wins, because the caller knows where it wants the step
+// measured from. Otherwise the step is measured from the stream's own
+// position: the cursor it reached, or the last record it emitted.
+func (t *Tailer) rewindAnchor(req RewindRequest) (uint32, bool) {
+	if req.Anchor != 0 {
+		return req.Anchor, true
+	}
+	if t.cursor != "" {
+		if at, ok := t.src.CursorLedger(t.cursor); ok {
+			return at, true
+		}
+	}
+	if t.lastLedger != 0 {
+		return t.lastLedger, true
+	}
+	return 0, false
+}
+
+// checkRewindGap reports whether a rewind reached past the server's
+// retention window.
+//
+// Rewinding is a request to reprocess records, so landing before the oldest
+// retained ledger means the records that were wanted are gone. That is a
+// gap, and it is reported like any other rather than skipped over.
+func (t *Tailer) checkRewindGap(b Batch) *GapError {
+	if t.rewoundTo == 0 || b.Oldest == 0 {
+		return nil
+	}
+	if t.rewoundTo < b.Oldest {
+		return &GapError{Source: t.src.Name(), From: t.rewoundTo, Oldest: b.Oldest}
+	}
+	return nil
+}
+
 // emit writes a batch's records, suppressing any the server replayed, and
 // reports whether the configured limit has been reached.
 func (t *Tailer) emit(b Batch) (done bool, err error) {
@@ -284,6 +404,7 @@ func (t *Tailer) emit(b Batch) (done bool, err error) {
 			return false, fmt.Errorf("writing record %s: %w", r.ID, err)
 		}
 		t.lastID = r.ID
+		t.lastLedger = r.Sequence
 		t.stats.Emitted++
 
 		if t.opts.Limit > 0 && t.stats.Emitted >= t.opts.Limit {

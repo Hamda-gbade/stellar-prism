@@ -63,6 +63,7 @@ pkg/stream/
   drainer.go          concurrent historical backfill + ordered merge
   batcher.go          count/time batching sink wrapper
   gap_recovery.go     GapStrategy, Rewinder and gap handling
+  rewind.go           rewind distances, targets and the rewind controller
   context.go          TaskGroup and cancellation helpers
   clock.go            Clock and Backoff, both injectable
 pkg/sink/
@@ -192,6 +193,11 @@ worker on every path, including sink failure and limit exhaustion, so a
 terminated backfill cannot leak goroutines or leave a worker writing to a
 closed sink.
 
+The rewind watcher in `internal/cli/rewind.go` is the only other goroutine the
+CLI starts. It owns a signal channel and nothing else: `Close` stops the
+signal delivery and waits for the goroutine to return, so a command that
+ends leaves nothing behind.
+
 ### What is deliberately *not* handled
 
 **Chain reorganisations.** Stellar ledgers are final on close — SCP gives
@@ -266,6 +272,75 @@ compressed). Rotation is synchronous; the active file is reopened before
 pruning, so a failed prune cannot stop the stream. `--rotate-*` without
 `--output-file` is rejected.
 
+## Rewinding the stream (`--rewind`)
+
+A stream's cursor is the position it has reached. `--rewind` steps it back so
+the records in between are processed again — the manual escape hatch for "the
+event I need was just before where I was looking".
+
+```console
+$ prism events --contract CDLZF...CYSC --rewind 500 --follow
+prism: rewinding 500 ledgers back to ledger 3966312
+```
+
+The distance is either a count of ledgers (`500`, `500l`) or a duration
+(`45s`, `30m`, `2h`, `1h30m`, `7d`). A duration is converted with
+`NominalLedgerInterval` — five seconds, roughly one ledger close — so it
+lands near the requested point rather than exactly on it.
+
+### Where the step is measured from
+
+The step is measured from the start the command resolved: `--from` when it is
+given, and the server's head otherwise. So `--from 3966000 --rewind 500`
+starts at ledger 3965500, and `--rewind 500` on its own starts 500 ledgers
+before the head.
+
+A step that would reach before the first ledger is clamped to it rather than
+rejected: "as far back as the chain goes" is a request, not a mistake. The
+clamp is reported, because a rewind that quietly landed somewhere else would
+be worse than one that did not happen.
+
+### Rewinding a running stream
+
+While following, `SIGUSR2` asks for the same step again. The signal is only
+handled while `--rewind` is in effect; without it, `SIGUSR2` keeps its usual
+meaning and terminates the process. The signal is handled by one goroutine
+that owns nothing but the request (`internal/cli/rewind.go`); the tailer
+applies it at the next page boundary, so a request never lands in the middle
+of a page.
+
+### What a rewind does to the guarantee
+
+A rewind re-emits the records between the old and the new position. That is
+the point of it, and it is the only way a record is emitted twice within a
+single run: the de-duplication mark is reset along with the cursor, because
+the records being reprocessed are exactly the ones the mark would suppress.
+
+A rewind that lands before the server's retention window is a gap, and it is
+reported like any other: the tailer compares the rewind target with the
+server's oldest retained ledger and returns a `*GapError`, so the run exits
+2 rather than continuing with a hole in the stream. Under
+`--gap-strategy resume` the usual recovery applies and the missed range is
+announced.
+
+### The pieces
+
+`pkg/stream/rewind.go` holds the logic:
+
+| Symbol | Role |
+|---|---|
+| `ParseRewind` | parses `500` or `30m` into a `RewindDistance` |
+| `RewindDistance.Ledgers` | converts a distance into ledgers |
+| `RewindDistance.Target` | computes where a step lands, clamping at the first ledger |
+| `RewindController` | hands a request to the tailer, safely |
+| `RewindRequest` | the request itself: a distance and an optional anchor |
+
+The controller is the seam: whoever asks for the rewind — a flag, a signal
+handler — and the tailer, which is the only goroutine allowed to move a
+cursor, meet there. A request carrying an explicit anchor is measured from
+that anchor; one without is measured from the stream's own position, which
+is the cursor it reached or the last record it emitted.
+
 ## Testing the guarantee
 
 `internal/fakerpc` is a scriptable in-memory RPC. Tests describe failures
@@ -286,7 +361,9 @@ pages, out-of-order pages, retention overrun with both gap policies, lagging
 backends, permanent errors, retry exhaustion, cancellation mid-follow, sink
 failure, full-page draining, concurrent backfill, batcher count/time/explicit
 flushes, and task-group cancellation. Gap recovery is also unit-tested
-without a network through the `Rewinder` seam.
+without a network through the `Rewinder` seam. Rewinding is covered the same
+way: a rewind applied mid-stream, in a follow loop, against a source that
+cannot be repositioned, and across the retention window.
 
 Time is injected via `Clock`, so there are no real sleeps and no wall-clock
 flakiness. Follow-loop tests carry a sleep budget that cancels the context, so
@@ -301,6 +378,10 @@ The invariants were verified by breaking the code on purpose:
 |---|---|
 | De-duplication disabled | `TestTailSuppressesReplayedPages` and `TestTailRejectsOutOfOrderPages` fail with exact diagnostics |
 | Gap detection disabled | `TestTailDetectsRetentionGap` fails in 0.00s |
+| De-duplication mark not reset on a rewind | `TestTailAppliesRewind` and `TestTailRewindsWhileFollowing` fail with exact diagnostics |
+| Source not repositioned on a rewind | `TestTailAppliesRewind` fails in 0.00s |
+| Retention check after a rewind disabled | `TestTailRewindReportsRetentionGap` fails in 0.00s |
+| Retention check after a rewind applied to every later page | `TestTailRewindChecksRetentionOnlyOnce` fails in 0.00s |
 
 If you change the state machine, re-run that exercise. A test suite that
 cannot fail is not protecting anything.

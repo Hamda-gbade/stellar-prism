@@ -23,6 +23,7 @@ import (
 type streamFlags struct {
 	follow           bool
 	from             uint32
+	rewind           string
 	limit            int
 	asJSON           bool
 	raw              bool
@@ -51,6 +52,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"keep streaming as new ledgers close, like tail -f")
 	cmd.Flags().Uint32Var(&s.from, "from", 0,
 		"start from this ledger and continue forward (default: the latest ledger)")
+	cmd.Flags().StringVar(&s.rewind, "rewind", "",
+		"step back from the start point and reprocess those records: a ledger count (500) or a duration (30m); while following, SIGUSR2 steps back again")
 	cmd.Flags().IntVarP(&s.limit, "limit", "n", 0,
 		"stop after this many records (0 means unlimited)")
 	cmd.Flags().BoolVar(&s.asJSON, "json", false,
@@ -95,6 +98,9 @@ func (s *streamFlags) validate() error {
 	if s.backfillWorkers < 1 {
 		return fmt.Errorf("--backfill-workers must be at least 1")
 	}
+	if _, _, err := s.rewindDistance(); err != nil {
+		return err
+	}
 	if _, err := stream.ParseGapStrategy(s.gapStrategy); err != nil {
 		return err
 	}
@@ -115,6 +121,21 @@ func (s *streamFlags) validate() error {
 		}
 	}
 	return nil
+}
+
+// rewindDistance parses the --rewind flag.
+//
+// It reports whether a rewind was asked for at all, so the caller can tell
+// "no rewind" from "a rewind of nothing", which is not a thing.
+func (s *streamFlags) rewindDistance() (stream.RewindDistance, bool, error) {
+	if s.rewind == "" {
+		return stream.RewindDistance{}, false, nil
+	}
+	distance, err := stream.ParseRewind(s.rewind)
+	if err != nil {
+		return stream.RewindDistance{}, false, fmt.Errorf("--rewind: %w", err)
+	}
+	return distance, true, nil
 }
 
 // newSink builds the output sink implied by the flags.
@@ -225,7 +246,13 @@ last. The semantics are identical to ` + "`stellar events --topic`" + `.
 
 Events are retained by RPC for roughly 24 hours, so --from cannot reach
 further back than that. If the stream ever falls behind that window, prism
-reports the missed ledger range and exits 2 rather than skipping silently.`,
+reports the missed ledger range and exits 2 rather than skipping silently.
+
+--rewind steps the start point back so the records in between are processed
+again. It is measured from --from, or from the server's head when --from is
+absent, and it accepts a ledger count (500) or a duration (30m). While
+following, sending SIGUSR2 asks for the same step again, which reprocesses
+the records between the old and the new position.`,
 		Example: `  # Follow one contract
   prism events --contract CBGSB... --follow
 
@@ -236,7 +263,10 @@ reports the missed ledger range and exits 2 rather than skipping silently.`,
   prism events --contract CBGSB... --follow --json | jq -r '.contract'
 
   # Backfill from a ledger then keep following
-  prism events --from 1234567 --follow`,
+  prism events --from 1234567 --follow
+
+  # Reprocess the last 500 ledgers, then keep following
+  prism events --contract CBGSB... --rewind 500 --follow`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := sf.validate(); err != nil {
@@ -363,6 +393,25 @@ func runStream(
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// A rewind moves the start point back, so the records in between are
+	// processed again. It is measured from the start the command resolved,
+	// which is --from when given and the server's head otherwise.
+	distance, hasRewind, err := sf.rewindDistance()
+	if err != nil {
+		return err
+	}
+	if hasRewind {
+		target, err := distance.Target(from)
+		if err != nil {
+			return fmt.Errorf("--rewind: %w", err)
+		}
+		if !sf.quiet {
+			fmt.Fprintf(stderr, "prism: rewinding %d ledgers back to ledger %d\n",
+				target.Back, target.Ledger)
+		}
+		from = target.Ledger
+	}
+
 	out, err := sf.newSink(stdout, g.color, func(err error) {
 		fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
 	})
@@ -385,6 +434,22 @@ func runStream(
 	opts, err := sf.options(stderr, sf.quiet)
 	if err != nil {
 		return err
+	}
+
+	// While following, the same distance can be asked for again at runtime:
+	// SIGUSR2 asks the stream to step back, and the records in between are
+	// processed a second time.
+	if hasRewind && sf.follow {
+		controller := stream.NewRewindController()
+		opts.Rewind = controller
+		opts.OnRewind = func(target stream.RewindTarget) {
+			if !sf.quiet {
+				fmt.Fprintf(stderr, "prism: rewound %d ledgers back to ledger %d\n",
+					target.Back, target.Ledger)
+			}
+		}
+		watcher := newRewindWatcher(ctx, notifyRewindSignals(), controller, distance, stderr)
+		defer watcher.Close()
 	}
 
 	if sf.from > 0 && sf.backfillWorkers > 1 {
