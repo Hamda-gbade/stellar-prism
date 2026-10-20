@@ -9,7 +9,11 @@ Working and tested:
 - `prism events` — contract, topic and type filters; one-shot or `--follow`
 - `prism ledgers` — ledger close metadata
 - `prism tx` — fetch and explain, through the lens explain path
+- `prism transactions` — a transaction stream
 - NDJSON on everything, flushed per record
+- `--timescale-dsn` — batched PostgreSQL/TimescaleDB ingestion, with an
+  idempotent `COPY` that tolerates replays after a restart
+- `--parquet-dir` — columnar Parquet part files, encoded by embedded DuckDB
 - `--from` backfill, draining full pages at network speed
 - Reconnection with jittered backoff; retry never advances the cursor
 - Gap detection against the server's retention window, exiting 2
@@ -68,9 +72,10 @@ sinks are unchanged. A good first substantial contribution.
 
 ### Alternative sinks
 
-The `Sink` seam makes these small: a file rotator, a webhook poster, an
-S3/GCS writer. Worth adding when someone actually needs one rather than
-speculatively — each adds configuration surface and failure modes.
+The `Sink` seam makes these small: a webhook poster, an S3/GCS writer, Kafka.
+Base64 output, PostgreSQL and Parquet now exist; further destinations are worth
+adding when someone actually needs one rather than speculatively — each adds
+configuration surface and failure modes.
 
 ### Horizon as a second backend
 
@@ -85,8 +90,9 @@ not need a metrics endpoint.
 
 ## Explicitly not planned
 
-- **Indexing or storage.** prism streams and exits. Mercury and Zephyr are
-  hosted indexers; if you need queryable history, use one of those.
+- **Indexing.** prism can write records to PostgreSQL/TimescaleDB or Parquet,
+  but it does not index, query or serve them. Mercury and Zephyr remain the
+  hosted indexers; prism's sinks are for the store you already run.
 - **Transaction submission or signing.** prism reads. It never handles secret
   keys, and adding that would make an inspection tool security-sensitive.
 - **Reimplementing XDR decoding.** That is

@@ -22,6 +22,9 @@ Transactions can be streamed continuously by using the --follow flag.`,
   prism transactions --from 1234567 --limit 5 --json`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := sf.validate(); err != nil {
+				return err
+			}
 			client := newClient(rpc.ResolveURL(g.rpcURL), g.timeout)
 
 			from := sf.from

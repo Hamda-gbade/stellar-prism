@@ -30,7 +30,28 @@ type streamFlags struct {
 	poll     time.Duration
 	pageSize uint
 	retries  int
+
+	// Sink selection. When either destination is set, records are written
+	// there instead of stdout.
+	timescaleDSN       string
+	timescaleTable     string
+	parquetDir         string
+	parquetPrefix      string
+	parquetCompression string
+	batchSize          int
+	flushInterval      time.Duration
 }
+
+// newTimescaleSink and newParquetSink are variables so tests can substitute a
+// fake database, exactly like newClient. Production code never reassigns them.
+var (
+	newTimescaleSink = func(ctx context.Context, dsn string, cfg sink.TimescaleConfig) (stream.Sink, error) {
+		return sink.NewTimescale(ctx, dsn, cfg)
+	}
+	newParquetSink = func(ctx context.Context, cfg sink.ParquetConfig) (stream.Sink, error) {
+		return sink.NewParquet(ctx, cfg)
+	}
+)
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 	cmd.Flags().BoolVarP(&s.follow, "follow", "f", false,
@@ -51,14 +72,70 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"how many records to request per RPC call")
 	cmd.Flags().IntVar(&s.retries, "max-retries", 0,
 		"give up after this many consecutive RPC failures (0 means never give up)")
+
+	cmd.Flags().StringVar(&s.timescaleDSN, "timescale-dsn", "",
+		"write records to PostgreSQL/TimescaleDB at this connection string instead of stdout")
+	cmd.Flags().StringVar(&s.timescaleTable, "timescale-table", sink.DefaultTimescaleTable,
+		"destination table for --timescale-dsn, optionally schema-qualified")
+	cmd.Flags().StringVar(&s.parquetDir, "parquet-dir", "",
+		"write records as Parquet part files in this directory instead of stdout")
+	cmd.Flags().StringVar(&s.parquetPrefix, "parquet-prefix", sink.DefaultParquetPrefix,
+		"file name prefix for Parquet parts (written as PREFIX-000001.parquet)")
+	cmd.Flags().StringVar(&s.parquetCompression, "parquet-compression", sink.DefaultParquetCompression,
+		"Parquet codec: zstd, snappy, gzip or uncompressed")
+	cmd.Flags().IntVar(&s.batchSize, "batch-size", 0,
+		"records per database transaction or Parquet part file (0 uses the sink default)")
+	cmd.Flags().DurationVar(&s.flushInterval, "flush-interval", 0,
+		"flush a partial batch after this long (0 uses the sink default)")
+}
+
+// validate rejects sink combinations that would silently discard output.
+// It runs before any RPC call so a typo costs no network round trip.
+func (s *streamFlags) validate() error {
+	if s.timescaleDSN != "" && s.parquetDir != "" {
+		return fmt.Errorf("--timescale-dsn and --parquet-dir cannot be used together")
+	}
+	if s.timescaleDSN == "" && s.parquetDir == "" {
+		return nil
+	}
+	if s.asJSON || s.raw || s.compact {
+		return fmt.Errorf(
+			"--json, --raw and --compact describe stdout output and cannot be combined with a database or Parquet sink")
+	}
+	if s.batchSize < 0 {
+		return fmt.Errorf("--batch-size must not be negative, got %d", s.batchSize)
+	}
+	if s.flushInterval < 0 {
+		return fmt.Errorf("--flush-interval must not be negative, got %s", s.flushInterval)
+	}
+	return nil
 }
 
 // newSink builds the output sink implied by the flags.
-func (s *streamFlags) newSink(w io.Writer, colorMode string) stream.Sink {
-	if s.asJSON {
-		return sink.NewNDJSON(w, !s.raw)
+//
+// A database or Parquet destination takes precedence over stdout, and is
+// rejected alongside the stdout-only flags by validate.
+func (s *streamFlags) newSink(ctx context.Context, w io.Writer, colorMode string) (stream.Sink, error) {
+	switch {
+	case s.timescaleDSN != "":
+		return newTimescaleSink(ctx, s.timescaleDSN, sink.TimescaleConfig{
+			Table:         s.timescaleTable,
+			BatchSize:     s.batchSize,
+			FlushInterval: s.flushInterval,
+		})
+	case s.parquetDir != "":
+		return newParquetSink(ctx, sink.ParquetConfig{
+			Dir:           s.parquetDir,
+			Prefix:        s.parquetPrefix,
+			Compression:   s.parquetCompression,
+			BatchSize:     s.batchSize,
+			FlushInterval: s.flushInterval,
+		})
+	case s.asJSON:
+		return sink.NewNDJSON(w, !s.raw), nil
+	default:
+		return sink.NewHuman(w, lensformat.PaletteFor(w, colorMode), s.compact || s.raw), nil
 	}
-	return sink.NewHuman(w, lensformat.PaletteFor(w, colorMode), s.compact || s.raw)
 }
 
 // options builds the tailer options implied by the flags.
@@ -118,6 +195,9 @@ reports the missed ledger range and exits 2 rather than skipping silently.`,
   prism events --from 1234567 --follow`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := sf.validate(); err != nil {
+				return err
+			}
 			client := newClient(rpc.ResolveURL(g.rpcURL), g.timeout)
 
 			from := sf.from
@@ -174,6 +254,9 @@ for liveness rather than reading contents.`,
   prism ledgers --from 1234567 --limit 5 --json`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := sf.validate(); err != nil {
+				return err
+			}
 			client := newClient(rpc.ResolveURL(g.rpcURL), g.timeout)
 
 			from := sf.from
@@ -214,10 +297,22 @@ func runStream(
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	out := sf.newSink(stdout, g.color)
+	out, err := sf.newSink(ctx, stdout, g.color)
+	if err != nil {
+		return err
+	}
 	tailer := stream.NewTailer(src, out, sf.options(stderr, sf.asJSON && stderr == nil))
 
-	err := tailer.Run(ctx)
+	err = tailer.Run(ctx)
+
+	// Batch sinks hold data until they are closed. Close explicitly so the
+	// final part file or transaction is written before the process exits, and
+	// so the sink's background goroutine stops.
+	if closer, ok := out.(io.Closer); ok {
+		if closeErr := closer.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("closing the sink: %w", closeErr)
+		}
+	}
 
 	var gap *stream.GapError
 	if errors.As(err, &gap) {

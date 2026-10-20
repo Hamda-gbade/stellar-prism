@@ -63,6 +63,7 @@ returns — there is no polling loop, no cursor advancement, no reconnection, an
 | **NDJSON for pipelines** | ❌ | ✅ |
 | **Gap detection** | ❌ | ✅ |
 | Ledger streaming | ❌ | ✅ |
+| Database / Parquet ingestion | ❌ | ✅ |
 | Contract-spec-decoded payloads | ✅ **better** | ❌ ([roadmap](docs/roadmap.md)) |
 
 ## Install
@@ -114,6 +115,31 @@ $ prism events --limit 4 --json | jq -r '"\(.ledger)  \(.contract[0:8])…  \(.v
 3966820  CDLZFC3S…  ScValTypeScvI128
 3966820  CDLZFC3S…  ScValTypeScvI128
 ```
+
+### Ingesting into PostgreSQL or Parquet
+
+All three stream commands can write records somewhere other than stdout.
+`--timescale-dsn` batches into PostgreSQL, promoting the table to a TimescaleDB
+hypertable partitioned by ledger when the extension is installed;
+`--parquet-dir` writes columnar part files, encoded by embedded DuckDB:
+
+```sh
+# Follow a contract straight into TimescaleDB
+prism events --contract CDLZF...CYSC --follow \
+  --timescale-dsn "$DATABASE_URL" --timescale-table prism_events
+
+# Archive a transaction backfill as Parquet, ready for analytics
+prism transactions --from 3966000 --limit 100000 --parquet-dir ./txs
+
+# Query the archive
+# SELECT kind, count(*) FROM read_parquet('txs/*.parquet') GROUP BY kind;
+```
+
+Batches flush when full, every `--flush-interval`, and on exit — including when
+the stream ends in a gap error — so the final records are never lost. A replay
+after a restart is a no-op in TimescaleDB rather than a duplicate-key failure.
+Neither flag can be combined with `--json`, `--raw` or `--compact`, which
+describe stdout output.
 
 ### `prism tx` — why did this transaction fail?
 
