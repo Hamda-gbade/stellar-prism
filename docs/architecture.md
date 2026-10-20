@@ -56,6 +56,8 @@ pkg/stream/
 pkg/sink/
   ndjson.go           NDJSON, one object per line
   human.go            terminal output, payloads via lens
+  kafka.go            Kafka producer sink, keyed partitioning
+  amqp.go             AMQP 0-9-1 sink, durable queue + confirms
 ```
 
 ## The state machine
@@ -179,6 +181,55 @@ worker on every path, including sink failure and limit exhaustion, so a
 terminated backfill cannot leak goroutines or leave a worker writing to a
 closed sink.
 
+### Broker sinks
+
+`--kafka-brokers`/`--kafka-topic` and `--amqp-url`/`--amqp-queue` replace
+stdout with a broker. The stream, the cursor and the delivery guarantee are
+unchanged: `Emit` publishes synchronously, so a broker that stops accepting
+messages stops the poll loop instead of filling an in-process queue.
+
+Both sinks publish the **same JSON document `--json` prints**, produced by
+`sink.EncodeRecord`. A consumer therefore parses one stable shape regardless
+of where records came from, and `--raw` still switches the body to base64 XDR.
+`--batch` applies too: both sinks implement `BatchSink`, so a batch reaches
+the broker as one producer call (Kafka) or one confirmed publish per record
+(AMQP, which has no atomic multi-message publish).
+
+Kafka partitions by message key, chosen with `--kafka-partition-by`:
+
+| Value | Key | Effect |
+|---|---|---|
+| `contract` (default) | event contract ID, else transaction hash, else record ID | all activity for one contract is ordered on one partition |
+| `tx` | transaction hash | an event and its transaction land together |
+| `record` | record ID | spreads load evenly |
+
+The key is never empty, because an empty key round-robins and would silently
+break the ordering the strategy exists to provide. The production producer is
+a synchronous kafka-go `Writer` with a hash balancer and `RequiredAcks=all`,
+so a successful `Emit` means every in-sync replica has the message.
+
+AMQP declares the queue **durable** (not exclusive, not auto-delete) and
+publishes **persistent** messages with the record ID as `message_id`. It
+enables publisher confirms and waits for the broker's ack on every publish; a
+nack is a stream error, not a dropped record. A queue that already exists
+with different durability flags is a startup error rather than a silent
+re-declaration, since changing those flags would discard queued messages.
+
+Both sinks open their connections only when the stream starts and implement
+`io.Closer`; the CLI closes them on every exit path, including Ctrl-C. When
+batching is enabled the closer flushes the buffer **before** closing the
+connection, so the last partial batch cannot be lost. A publish is bounded by
+a 10-second timeout, so a wedged broker fails the stream rather than hanging
+it forever.
+
+`KafkaProducer`, `AMQPPublisher` and `AMQPMessage` are the seams that keep
+the suite offline. Sink tests inject recording fakes; CLI tests swap
+`newKafkaProducer`/`newAMQPPublisher` and run the real flag parsing, batching
+and close path against a fake RPC. Tests against real brokers live in
+`internal/cli/broker_integration_test.go` and are skipped unless
+`PRISM_KAFKA_BROKERS`/`PRISM_KAFKA_TOPIC` or
+`PRISM_AMQP_URL`/`PRISM_AMQP_QUEUE` are set.
+
 ### What is deliberately *not* handled
 
 **Chain reorganisations.** Stellar ledgers are final on close — SCP gives
@@ -281,6 +332,12 @@ Flush per record if the sink is for live viewing. Decode XDR through `lens`
 rather than reaching for `xdr` directly, so output stays consistent with the
 rest of the family — and report an undecodable payload inline rather than
 returning an error, so one malformed value cannot kill a long-running tail.
+
+If the sink ships records somewhere, use `sink.EncodeRecord` for the body so
+it stays byte-identical to `--json`, put the broker client behind a small
+interface so tests can run without one, and implement `io.Closer` so the CLI
+releases the connection on cancellation. `kafka.go` and `amqp.go` are the
+worked examples.
 
 ## Adding an RPC method
 

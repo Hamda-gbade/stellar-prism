@@ -135,6 +135,26 @@ $ prism events --limit 4 --json | jq -r '"\(.ledger)  \(.contract[0:8])…  \(.v
 3966820  CDLZFC3S…  ScValTypeScvI128
 ```
 
+### Ship to Kafka or RabbitMQ
+
+Any streaming command can publish to a broker instead of stdout:
+
+```sh
+# Partition by contract ID, so one contract's events stay ordered
+prism events --follow --kafka-brokers localhost:9092 \
+  --kafka-topic soroban.events
+
+# Durable queue, persistent messages, publisher confirms
+prism events --follow --amqp-url amqp://guest:guest@localhost:5672/ \
+  --amqp-queue soroban.events
+```
+
+Messages carry the same JSON documents `--json` prints, with `--raw` leaving
+XDR base64-encoded. `--kafka-partition-by contract|tx|record` chooses the
+message key; AMQP declares the queue durable and waits for the broker's ack
+on every publish. A broker failure stops the stream rather than silently
+dropping records.
+
 ### `prism tx` — why did this transaction fail?
 
 Fetches a transaction and renders it through the lens explain path, pairing the

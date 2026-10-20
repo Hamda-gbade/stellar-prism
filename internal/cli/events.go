@@ -36,6 +36,16 @@ type streamFlags struct {
 	batchTimeout     time.Duration
 	gapStrategy      string
 	maxGapRecoveries int
+
+	// Broker output. When configured, records are published to the broker
+	// instead of written to stdout.
+	kafkaBrokers     []string
+	kafkaTopic       string
+	kafkaPartitionBy string
+	amqpURL          string
+	amqpQueue        string
+	amqpExchange     string
+	amqpRoutingKey   string
 }
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
@@ -69,6 +79,21 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		`what to do when retention pruned records: "fail" (exit 2) or "resume" from the oldest retained ledger`)
 	cmd.Flags().IntVar(&s.maxGapRecoveries, "max-gap-recoveries", 0,
 		"limit how many times --gap-strategy resume may skip ahead (0 means no limit)")
+
+	cmd.Flags().StringSliceVar(&s.kafkaBrokers, "kafka-brokers", nil,
+		"Kafka broker addresses (comma-separated); requires --kafka-topic")
+	cmd.Flags().StringVar(&s.kafkaTopic, "kafka-topic", "",
+		"publish records as JSON to this Kafka topic instead of stdout; requires --kafka-brokers")
+	cmd.Flags().StringVar(&s.kafkaPartitionBy, "kafka-partition-by", string(sink.PartitionContract),
+		`Kafka message key: "contract" keeps one contract's records ordered on one partition, "tx" keys by transaction hash, "record" keys by record ID`)
+	cmd.Flags().StringVar(&s.amqpURL, "amqp-url", "",
+		"AMQP 0-9-1 broker URL, e.g. amqp://guest:guest@localhost:5672/; requires --amqp-queue")
+	cmd.Flags().StringVar(&s.amqpQueue, "amqp-queue", "",
+		"declare this durable queue and publish records to it instead of stdout; requires --amqp-url")
+	cmd.Flags().StringVar(&s.amqpExchange, "amqp-exchange", "",
+		"AMQP exchange to publish to (default: the default exchange, routing by queue name)")
+	cmd.Flags().StringVar(&s.amqpRoutingKey, "amqp-routing-key", "",
+		"AMQP routing key (default: the queue name)")
 }
 
 func (s *streamFlags) validate() error {
@@ -89,26 +114,65 @@ func (s *streamFlags) validate() error {
 			return fmt.Errorf("batching needs --batch-size or --batch-timeout above zero")
 		}
 	}
-	return nil
+	return s.validateBroker()
 }
 
-// newSink builds the output sink implied by the flags.
-func (s *streamFlags) newSink(w io.Writer, colorMode string, onBatchError func(error)) stream.Sink {
-	var out stream.Sink
-	if s.asJSON {
+// newSink builds the output sink implied by the flags, together with a
+// closer for any resource the sink owns (a broker connection, or a batching
+// buffer that has not been flushed yet). A nil closer means there is nothing
+// to release.
+func (s *streamFlags) newSink(w io.Writer, colorMode string, onBatchError func(error)) (stream.Sink, io.Closer, error) {
+	var (
+		out   stream.Sink
+		owned io.Closer
+	)
+
+	switch {
+	case s.kafkaTopic != "":
+		k, err := s.newKafkaSink()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, owned = k, k
+	case s.amqpQueue != "":
+		a, err := s.newAMQPSink()
+		if err != nil {
+			return nil, nil, err
+		}
+		out, owned = a, a
+	case s.asJSON:
 		out = sink.NewNDJSON(w, !s.raw)
-	} else {
+	default:
 		out = sink.NewHuman(w, lensformat.PaletteFor(w, colorMode), s.compact || s.raw)
 	}
+
 	if !s.batch {
-		return out
+		return out, owned, nil
 	}
-	return stream.NewBatcher(out, stream.BatcherOptions{
+
+	batcher := stream.NewBatcher(out, stream.BatcherOptions{
 		MaxRecords: s.batchSize,
 		MaxDelay:   s.batchTimeout,
 		OnError:    onBatchError,
 	})
+
+	switch {
+	case owned != nil:
+		// Flush the buffer before releasing the connection, or the last
+		// batch dies with the process.
+		return batcher, closerFunc(func() error {
+			return errors.Join(batcher.Close(), owned.Close())
+		}), nil
+	default:
+		return batcher, batcher, nil
+	}
 }
+
+// closerFunc adapts a function to io.Closer.
+type closerFunc func() error
+
+// Close implements io.Closer.
+func (f closerFunc) Close() error { return f() }
 
 // options builds the tailer options implied by the flags.
 func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, error) {
@@ -294,10 +358,13 @@ func runStream(
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	out := sf.newSink(stdout, g.color, func(err error) {
+	out, closer, err := sf.newSink(stdout, g.color, func(err error) {
 		fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
 	})
-	if closer, ok := out.(io.Closer); ok {
+	if err != nil {
+		return err
+	}
+	if closer != nil {
 		defer func() {
 			closeErr := closer.Close()
 			if closeErr == nil {
