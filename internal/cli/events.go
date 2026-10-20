@@ -21,15 +21,16 @@ import (
 
 // streamFlags are the options shared by every streaming command.
 type streamFlags struct {
-	follow   bool
-	from     uint32
-	limit    int
-	asJSON   bool
-	raw      bool
-	compact  bool
-	poll     time.Duration
-	pageSize uint
-	retries  int
+	follow    bool
+	from      uint32
+	limit     int
+	asJSON    bool
+	raw       bool
+	compact   bool
+	poll      time.Duration
+	pageSize  uint
+	retries   int
+	stateFile string
 }
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
@@ -51,6 +52,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"how many records to request per RPC call")
 	cmd.Flags().IntVar(&s.retries, "max-retries", 0,
 		"give up after this many consecutive RPC failures (0 means never give up)")
+	cmd.Flags().StringVar(&s.stateFile, "state-file", "",
+		"persist the stream position to this file after each emitted record and resume from it on the next run (a saved position takes precedence over --from)")
 }
 
 // newSink builds the output sink implied by the flags.
@@ -115,7 +118,10 @@ reports the missed ledger range and exits 2 rather than skipping silently.`,
   prism events --contract CBGSB... --follow --json | jq -r '.contract'
 
   # Backfill from a ledger then keep following
-  prism events --from 1234567 --follow`,
+  prism events --from 1234567 --follow
+
+  # Durable cursor: resume where the previous run stopped
+  prism events --contract CBGSB... --follow --state-file ./prism.state.json`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client := newClient(rpc.ResolveURL(g.rpcURL), g.timeout)
@@ -215,7 +221,34 @@ func runStream(
 	defer stop()
 
 	out := sf.newSink(stdout, g.color)
-	tailer := stream.NewTailer(src, out, sf.options(stderr, sf.asJSON && stderr == nil))
+
+	// Durable cursors, when asked for: OpenStateFile validates any existing
+	// file up front, so a corrupt state fails before the stream starts.
+	var state stream.StateStore
+	if sf.stateFile != "" {
+		file, err := stream.OpenStateFile(sf.stateFile)
+		if err != nil {
+			return err
+		}
+		// A saved position wins over --from; say so rather than silently
+		// ignoring a flag the operator set deliberately.
+		if sf.from != 0 {
+			saved, loadErr := file.Load()
+			if loadErr != nil {
+				return loadErr
+			}
+			if saved.Source == src.Name() && saved.PagingToken != "" {
+				fmt.Fprintf(stderr,
+					"prism: resuming the %s stream from %s (ledger %d); ignoring --from\n",
+					src.Name(), file.Path(), saved.Ledger)
+			}
+		}
+		state = file
+	}
+
+	opts := sf.options(stderr, sf.asJSON && stderr == nil)
+	opts.State = state
+	tailer := stream.NewTailer(src, out, opts)
 
 	err := tailer.Run(ctx)
 

@@ -48,6 +48,7 @@ pkg/stream/
   events.go           contract events source
   ledgers.go          ledger close source
   clock.go            Clock and Backoff, both injectable
+  state_file.go       durable cursor: atomic, file-backed stream position
 pkg/sink/
   ndjson.go           NDJSON, one object per line
   human.go            terminal output, payloads via lens
@@ -121,6 +122,52 @@ prism reports the missed range and exits 2. It does **not** silently resume
 from the oldest available ledger — a stream with an unannounced hole is worse
 than one that stops, especially for anything auditing contract activity.
 
+### Durable cursors (`--state-file`)
+
+Exactly-once across restarts would need a transaction spanning the sink and
+the cursor store, which a CLI writing to stdout cannot have. What prism can
+have is much better than nothing, and `--state-file <path>` turns it on: the
+stream position is persisted after **every successfully emitted record**, so
+a restart resumes where the previous run stopped and the restart window
+narrows from "the whole run" to "one interrupted record".
+
+The position is one small, versioned JSON document (see
+`pkg/stream/state_file.go`):
+
+```json
+{"version":1,"source":"events","ledger":3966820,"paging_token":"…","last_id":"…","updated_at":"2026-10-20T12:00:00Z"}
+```
+
+Four rules carry the weight:
+
+**1. The file is written after the emit, never before.** It can therefore
+never run ahead of the stream: a crash between the two re-emits exactly the
+interrupted record on restart, and the restored high-water mark (`last_id`)
+suppresses anything the previous run already delivered.
+
+**2. Writes are atomic.** Each save writes a complete snapshot to a
+temporary file in the same directory, fsyncs it, and renames it over the
+destination, so a reader only ever sees a complete snapshot — the previous
+state or the new one, never a torn file. A crash before the rename reverts
+to the previous position, which can only re-emit, never skip: at-least-once
+holds unconditionally.
+
+**3. The saved position wins, visibly.** On startup the tailer resumes from
+the stored paging token, and the CLI notes on stderr when that overrides an
+explicit `--from`. A state file written by a different stream is refused
+rather than misapplied, and a token the Source cannot interpret fails the
+run before any request is made.
+
+**4. The restored high-water mark keeps de-duplication across the restart.**
+`last_id` is reloaded into the tailer, so a server that replays the tail of
+the stream to a freshly restarted client — which the RPC docs warn to expect
+— is still suppressed, exactly as within a single run.
+
+Persistence is synchronous and file-backed: no goroutines, no open
+descriptors between writes, nothing to clean up when the stream terminates
+or is interrupted. The cost is one small fsync per record, which is the
+price of the guarantee; a poll-only RPC keeps the record rate modest.
+
 ### Backpressure
 
 `Sink.Emit` is synchronous. A slow consumer (`prism … | jq | something-slow`)
@@ -153,8 +200,10 @@ Every scenario funnels through one helper asserting three invariants:
 
 Covered: clean streams, drops at every position, consecutive drops, replayed
 pages, out-of-order pages, retention overrun, lagging backends, permanent
-errors, retry exhaustion, cancellation mid-follow, sink failure, and
-full-page draining.
+errors, retry exhaustion, cancellation mid-follow, sink failure,
+full-page draining, durable-cursor resume across restarts, replay
+suppression across restarts, corrupt/foreign/uninterpretable state files,
+and persist failures mid-page.
 
 Time is injected via `Clock`, so there are no real sleeps and no wall-clock
 flakiness. Follow-loop tests carry a sleep budget that cancels the context, so
@@ -169,6 +218,9 @@ The invariants were verified by breaking the code on purpose:
 |---|---|
 | De-duplication disabled | `TestTailSuppressesReplayedPages` and `TestTailRejectsOutOfOrderPages` fail with exact diagnostics |
 | Gap detection disabled | `TestTailDetectsRetentionGap` fails in 0.00s |
+| Per-emit persistence disabled | `TestTailStateRecordsPositionAfterEachEmit`, `TestTailStateResumesAcrossRestart` and the CLI restart test fail |
+| Startup restore disabled | `TestTailStateResumesAcrossRestart`, `TestTailStateRefusesPositionFromAnotherStream`, `TestTailStateRejectsUninterpretableToken` and `TestTailStateGapDetectedOnResume` fail |
+| Restored high-water mark dropped | `TestTailStateSuppressesReplayAfterRestart` fails, naming the re-emitted IDs |
 
 If you change the state machine, re-run that exercise. A test suite that
 cannot fail is not protecting anything.
