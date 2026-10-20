@@ -17,7 +17,10 @@ func newTransactionsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command
 		Short: "Stream transactions",
 		Long: `Stream transactions as ledgers close.
 
-Transactions can be streamed continuously by using the --follow flag.`,
+Transactions can be streamed continuously by using the --follow flag.
+
+With --pg-dsn the position is committed to PostgreSQL as the stream advances,
+so an interrupted run resumes where it stopped.`,
 		Example: `  prism transactions --follow
   prism transactions --from 1234567 --limit 5 --json`,
 		Args: cobra.NoArgs,
@@ -37,6 +40,7 @@ Transactions can be streamed continuously by using the --follow flag.`,
 				StartLedger: from,
 				PageLimit:   sf.pageSize,
 			})
+			sf.derivedKey = cursorKey(cmd.Name(), fromKeyPart(sf.from))
 			return runStream(cmd.Context(), src, &sf, g, stdout, stderr)
 		},
 	}

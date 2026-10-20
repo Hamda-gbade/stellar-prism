@@ -30,6 +30,16 @@ type streamFlags struct {
 	poll     time.Duration
 	pageSize uint
 	retries  int
+
+	// pgDSN enables durable cursors in PostgreSQL. Empty means off, subject
+	// to the environment default resolved in runStream.
+	pgDSN string
+	// pgCursorKey overrides the derived cursor row name.
+	pgCursorKey string
+	// derivedKey is computed by each command from its own query before
+	// runStream, because only the command knows which filters select records.
+	// See cursorKey.
+	derivedKey string
 }
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
@@ -51,6 +61,10 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"how many records to request per RPC call")
 	cmd.Flags().IntVar(&s.retries, "max-retries", 0,
 		"give up after this many consecutive RPC failures (0 means never give up)")
+	cmd.Flags().StringVar(&s.pgDSN, "pg-dsn", "",
+		"PostgreSQL DSN for a durable cursor, so a restart resumes where this run stopped (default $"+envPGDSN+"; empty disables persistence)")
+	cmd.Flags().StringVar(&s.pgCursorKey, "pg-cursor-key", "",
+		"cursor row to save and resume under (default: <command>/<hash of --from and filters, so each distinct stream resumes itself)")
 }
 
 // newSink builds the output sink implied by the flags.
@@ -104,7 +118,10 @@ last. The semantics are identical to ` + "`stellar events --topic`" + `.
 
 Events are retained by RPC for roughly 24 hours, so --from cannot reach
 further back than that. If the stream ever falls behind that window, prism
-reports the missed ledger range and exits 2 rather than skipping silently.`,
+reports the missed ledger range and exits 2 rather than skipping silently.
+
+With --pg-dsn the position is committed to PostgreSQL after every record, so
+an interrupted run resumes where it stopped instead of starting over.`,
 		Example: `  # Follow one contract
   prism events --contract CBGSB... --follow
 
@@ -115,7 +132,10 @@ reports the missed ledger range and exits 2 rather than skipping silently.`,
   prism events --contract CBGSB... --follow --json | jq -r '.contract'
 
   # Backfill from a ledger then keep following
-  prism events --from 1234567 --follow`,
+  prism events --from 1234567 --follow
+
+  # Resume across restarts with a durable cursor in PostgreSQL
+  prism events --contract CBGSB... --follow --pg-dsn "$PRISM_PG_DSN"`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client := newClient(rpc.ResolveURL(g.rpcURL), g.timeout)
@@ -141,6 +161,20 @@ reports the missed ledger range and exits 2 rather than skipping silently.`,
 			if err != nil {
 				return err
 			}
+
+			// The key names this exact query: same filters, same stream, and
+			// therefore the same durable position on a later run.
+			parts := []string{fromKeyPart(sf.from)}
+			for _, c := range contractIDs {
+				parts = append(parts, "contract="+c)
+			}
+			for _, topic := range topics {
+				parts = append(parts, "topic="+topic)
+			}
+			for _, et := range eventTypes {
+				parts = append(parts, "type="+et)
+			}
+			sf.derivedKey = cursorKey(cmd.Name(), parts...)
 
 			return runStream(cmd.Context(), src, &sf, g, stdout, stderr)
 		},
@@ -169,7 +203,10 @@ func newLedgersCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 		Long: `Stream ledger close metadata as ledgers close.
 
 Ledger metadata is large, so --compact is often what you want when watching
-for liveness rather than reading contents.`,
+for liveness rather than reading contents.
+
+With --pg-dsn the position is committed to PostgreSQL as the stream advances,
+so an interrupted run resumes where it stopped.`,
 		Example: `  prism ledgers --follow --compact
   prism ledgers --from 1234567 --limit 5 --json`,
 		Args: cobra.NoArgs,
@@ -189,6 +226,7 @@ for liveness rather than reading contents.`,
 				StartLedger: from,
 				PageLimit:   sf.pageSize,
 			})
+			sf.derivedKey = cursorKey(cmd.Name(), fromKeyPart(sf.from))
 			return runStream(cmd.Context(), src, &sf, g, stdout, stderr)
 		},
 	}
@@ -215,9 +253,35 @@ func runStream(
 	defer stop()
 
 	out := sf.newSink(stdout, g.color)
-	tailer := stream.NewTailer(src, out, sf.options(stderr, sf.asJSON && stderr == nil))
+	opts := sf.options(stderr, sf.asJSON && stderr == nil)
 
-	err := tailer.Run(ctx)
+	// Durable persistence is opt-in: only a DSN (flag or environment) opens
+	// anything, and without one no connection is ever attempted.
+	key := sf.derivedKey
+	if sf.pgCursorKey != "" {
+		key = sf.pgCursorKey
+	}
+	dsn := sf.pgDSN
+	if dsn == "" {
+		dsn = os.Getenv(envPGDSN)
+	}
+	store, closeStore, err := openCursorStore(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	if closeStore != nil {
+		defer func() {
+			if closeErr := closeStore(); closeErr != nil {
+				fmt.Fprintf(stderr, "prism: closing the PostgreSQL cursor store: %v\n", closeErr)
+			}
+		}()
+	}
+	opts.Store = store
+	opts.StoreKey = key
+
+	tailer := stream.NewTailer(src, out, opts)
+
+	err = tailer.Run(ctx)
 
 	var gap *stream.GapError
 	if errors.As(err, &gap) {
@@ -225,6 +289,14 @@ func runStream(
 		fmt.Fprintf(stderr,
 			"prism: restart with --from %d to resume from the oldest data the server still has\n",
 			gap.Oldest)
+		if store != nil {
+			// A saved position behind retention would gap again on every
+			// restart, so say what to do about the row rather than leaving a
+			// trap.
+			fmt.Fprintf(stderr,
+				"prism: that starts a fresh stream with a new cursor row; the stale row for %q can be deleted\n",
+				key)
+		}
 		return &exitError{code: 2, msg: gap.Error()}
 	}
 	return err
