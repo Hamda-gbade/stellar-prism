@@ -9,10 +9,12 @@ Working and tested:
 - `prism events` — contract, topic and type filters; one-shot or `--follow`
 - `prism ledgers` — ledger close metadata
 - `prism tx` — fetch and explain, through the lens explain path
-- NDJSON on everything, flushed per record
-- `--from` backfill, draining full pages at network speed
+- NDJSON on everything, flushed per record or per `--batch`
+- `--from` backfill, draining full pages at network speed, optionally with
+  `--backfill-workers`
 - Reconnection with jittered backoff; retry never advances the cursor
-- Gap detection against the server's retention window, exiting 2
+- Gap detection against the server's retention window: exit 2 by default, or
+  `--gap-strategy resume` with the skipped range reported
 - Streaming core fully tested with no network, and mutation-checked
 
 Known limits, stated plainly:

@@ -93,10 +93,30 @@ Topic filters are evaluated by the RPC server with the same semantics as
 `stellar events --topic`: `*` matches exactly one segment, `**` matches zero or
 more and must come last.
 
+### Batched output and parallel backfill
+
+Batching trades a little latency for fewer sink writes. It is opt-in:
+
+```sh
+# Flush when 500 records accumulate or after 250ms, whichever comes first
+prism events --from 3966000 --follow --json --batch \
+  --batch-size 500 --batch-timeout 250ms
+```
+
+Historical backfill can fetch pages concurrently with `--backfill-workers`:
+
+```sh
+# Drain 24 hours of history with four overlapping fetch loops
+prism events --from 3966000 --limit 10000 --json --backfill-workers 4
+```
+
+Workers fetch disjoint ledger ranges, then records are merged by ID before
+they reach stdout, so output order and de-duplication are unchanged.
+
 ### NDJSON for pipelines
 
-`--json` emits one object per line, flushed per record, so a live stream pipes
-straight into `jq`:
+`--json` emits one object per line, flushed after each record (or batch), so a
+live stream pipes straight into `jq`:
 
 ```console
 $ prism events --limit 2 --json
@@ -163,10 +183,13 @@ This is a streaming tool, so the guarantee matters more than the feature list:
   reconnect is suppressed.
 - **A dropped connection cannot skip records.** A failed fetch is retried with
   the cursor *unchanged*.
-- **No silent gaps.** Records can only be genuinely lost by falling behind the
-  RPC's ~24-hour retention window. prism detects that against the server's
-  reported oldest ledger, prints the missed range, and **exits 2** rather than
-  carrying on with a hole in the stream.
+- **No silent gaps by default.** Records can only be genuinely lost by falling
+  behind the RPC's ~24-hour retention window. prism detects that against the
+  server's reported oldest ledger, prints the missed range, and **exits 2**
+  rather than carrying on with a hole in the stream. If losing the pruned range
+  is acceptable, `--gap-strategy resume` reports it and continues from the
+  oldest ledger the server still retains; the skip is counted in the stats and
+  printed on stderr.
 - **Not exactly-once across restarts.** prism cannot atomically emit a record
   and commit its cursor, so a process killed between the two re-emits on
   restart. Key off `id` if that matters to you. Durable cursors are on the
@@ -222,7 +245,11 @@ and [docs/architecture.md](docs/architecture.md).
 machine covered by tests that run with no network. The library API may shift
 before v1.0.
 
-- Event and ledger streams; `prism tx` via the lens explain path.
+- Event, ledger and transaction streams; `prism tx` via the lens explain path.
+- Count/time batching (`--batch`) and concurrent historical backfill
+  (`--backfill-workers`).
+- Explicit gap policy: stop by default, or `--gap-strategy resume` with the
+  skipped range reported.
 - Payloads render as the XDR wire shape — prism has no contract-spec decoding,
   and `stellar events` is better for that today.
 - No durable cursor yet, so exactly-once across restarts is not offered.

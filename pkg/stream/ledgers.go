@@ -41,6 +41,9 @@ func NewLedgerSource(client rpc.Client, q LedgerQuery) *LedgerSource {
 // Name implements Source.
 func (s *LedgerSource) Name() string { return "ledgers" }
 
+// Rewind implements Rewinder, repositioning a fresh fetch at ledger.
+func (s *LedgerSource) Rewind(ledger uint32) { s.query.StartLedger = ledger }
+
 // CursorLedger implements Source. The getLedgers cursor is the ledger
 // sequence in decimal.
 func (s *LedgerSource) CursorLedger(cursor string) (uint32, bool) {

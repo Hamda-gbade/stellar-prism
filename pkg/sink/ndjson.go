@@ -102,6 +102,24 @@ type transactionLine struct {
 
 // Emit implements stream.Sink.
 func (n *NDJSON) Emit(r stream.Record) error {
+	if err := n.encode(r); err != nil {
+		return err
+	}
+	return n.Flush()
+}
+
+// EmitBatch implements stream.BatchSink, writing a whole batch before a
+// single flush.
+func (n *NDJSON) EmitBatch(records []stream.Record) error {
+	for _, r := range records {
+		if err := n.encode(r); err != nil {
+			return err
+		}
+	}
+	return n.Flush()
+}
+
+func (n *NDJSON) encode(r stream.Record) error {
 	var payload any
 
 	switch r.Kind {
@@ -210,11 +228,6 @@ func (n *NDJSON) Emit(r stream.Record) error {
 
 	if err := n.enc.Encode(payload); err != nil {
 		return fmt.Errorf("ndjson: encoding record %s: %w", r.ID, err)
-	}
-	// Flush per record: a tail that buffers is a tail that appears to hang,
-	// and anything downstream is waiting on these lines in real time.
-	if err := n.w.Flush(); err != nil {
-		return fmt.Errorf("ndjson: flushing record %s: %w", r.ID, err)
 	}
 	return nil
 }

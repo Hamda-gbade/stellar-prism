@@ -44,6 +44,24 @@ func NewHuman(w io.Writer, palette lensformat.Palette, compact bool) *Human {
 
 // Emit implements stream.Sink.
 func (h *Human) Emit(r stream.Record) error {
+	if err := h.emitRecord(r); err != nil {
+		return err
+	}
+	return h.Flush()
+}
+
+// EmitBatch implements stream.BatchSink, writing a whole batch before a
+// single flush.
+func (h *Human) EmitBatch(records []stream.Record) error {
+	for _, r := range records {
+		if err := h.emitRecord(r); err != nil {
+			return err
+		}
+	}
+	return h.Flush()
+}
+
+func (h *Human) emitRecord(r stream.Record) error {
 	// Blank line between records, but not before the first, so the stream
 	// starts flush against the prompt.
 	if !h.first {
@@ -70,10 +88,6 @@ func (h *Human) Emit(r stream.Record) error {
 		return fmt.Errorf("human: unknown record kind %q", r.Kind)
 	}
 
-	// Flush per record: a tail that buffers looks like a tail that has hung.
-	if err := h.w.Flush(); err != nil {
-		return fmt.Errorf("human: flush: %w", err)
-	}
 	return nil
 }
 

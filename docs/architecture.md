@@ -47,6 +47,11 @@ pkg/stream/
   tail.go             the state machine
   events.go           contract events source
   ledgers.go          ledger close source
+  transactions.go     transaction source
+  drainer.go          concurrent historical backfill + ordered merge
+  batcher.go          count/time batching sink wrapper
+  gap_recovery.go     GapStrategy, Rewinder and gap handling
+  context.go          TaskGroup and cancellation helpers
   clock.go            Clock and Backoff, both injectable
 pkg/sink/
   ndjson.go           NDJSON, one object per line
@@ -180,9 +185,18 @@ response, so the condition is directly observable:
 if cursorLedger < batch.Oldest { return &GapError{...} }
 ```
 
-prism reports the missed range and exits 2. It does **not** silently resume
-from the oldest available ledger — a stream with an unannounced hole is worse
-than one that stops, especially for anything auditing contract activity.
+By default prism reports the missed range and exits 2. It does **not**
+silently resume from the oldest available ledger — a stream with an
+unannounced hole is worse than one that stops, especially for anything
+auditing contract activity.
+
+`--gap-strategy resume` opts into a different policy. The tailer calls
+`Rewind(batch.Oldest)` on sources that implement `Rewinder`, clears the
+cursor, and fetches again from the oldest retained ledger. The skipped range
+is still announced: it reaches `Options.OnGap`, the CLI prints it on stderr,
+and `Stats.Gaps` / `Stats.Recovered` count it. `--max-gap-recoveries` bounds
+how many times a stream may skip ahead. A source without `Rewinder` cannot
+resume and fails exactly as it would under the default policy.
 
 ### Backpressure
 
@@ -190,6 +204,43 @@ than one that stops, especially for anything auditing contract activity.
 blocks the write, which blocks the poll loop. That is correct backpressure
 with no queue to grow. It is also why both sinks flush per record: a tail that
 buffers looks like a tail that has hung.
+
+`--batch` changes the unit of work, not the backpressure: `Batcher` buffers
+records until `--batch-size` is reached or `--batch-timeout` elapses, then
+hands the whole slice to the sink. It uses a single timer, not a goroutine,
+and `Close` stops the timer and flushes the remainder, so Ctrl-C cannot leave
+a buffered record behind. Sinks that implement `BatchSink` (both built-ins do)
+flush once per batch; other sinks are driven with one `Emit` per record.
+
+### Parallel historical backfill
+
+`--backfill-workers N` (with an explicit `--from`) uses `Drainer` instead of
+the sequential tailer for the historical phase. It probes the source once to
+learn the retention bounds, splits the ledger range into N contiguous chunks,
+and gives each worker its own `Source` and cursor. Workers stop at their chunk
+boundary, so no ledger is fetched twice.
+
+Records from the workers are merged by ID through a small heap before reaching
+the sink. That preserves the same ordering and de-duplication guarantee as the
+sequential tailer without buffering the whole backfill in memory: at most one
+page per worker is live at a time. A full page is fetched ahead by a worker
+while the merge consumes the previous one, so fetching is genuinely
+concurrent. After the historical phase the CLI either exits (`--follow` is
+off) or starts a normal tailer at `Until()+1`.
+
+If `--from` predates the retention window, the probe handles the gap according
+to `--gap-strategy`. A gap discovered inside a worker is handled the same way,
+or returned as a `*GapError` under the default policy.
+
+### Cancellation and goroutine ownership
+
+`TaskGroup` in `context.go` is the one place that starts concurrent workers.
+The first non-cancellation error cancels every sibling; `Wait` blocks until
+all workers have returned and then cancels the shared context. A caller
+cancellation is a clean stop, not an error. `Drainer.Run` waits for every
+worker on every path, including sink failure and limit exhaustion, so a
+terminated backfill cannot leak goroutines or leave a worker writing to a
+closed sink.
 
 ### What is deliberately *not* handled
 
@@ -215,9 +266,11 @@ Every scenario funnels through one helper asserting three invariants:
    Counting records would not.
 
 Covered: clean streams, drops at every position, consecutive drops, replayed
-pages, out-of-order pages, retention overrun, lagging backends, permanent
-errors, retry exhaustion, cancellation mid-follow, sink failure, and
-full-page draining.
+pages, out-of-order pages, retention overrun with both gap policies, lagging
+backends, permanent errors, retry exhaustion, cancellation mid-follow, sink
+failure, full-page draining, concurrent backfill, batcher count/time/explicit
+flushes, and task-group cancellation. Gap recovery is also unit-tested
+without a network through the `Rewinder` seam.
 
 Time is injected via `Clock`, so there are no real sleeps and no wall-clock
 flakiness. Follow-loop tests carry a sleep budget that cancels the context, so

@@ -40,6 +40,9 @@ func NewTransactionSource(client rpc.Client, q TransactionQuery) *TransactionSou
 // Name implements Source.
 func (s *TransactionSource) Name() string { return "transactions" }
 
+// Rewind implements Rewinder, repositioning a fresh fetch at ledger.
+func (s *TransactionSource) Rewind(ledger uint32) { s.query.StartLedger = ledger }
+
 // CursorLedger implements Source.
 func (s *TransactionSource) CursorLedger(cursor string) (uint32, bool) {
 	if cursor == "" {

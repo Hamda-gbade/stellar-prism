@@ -330,3 +330,104 @@ func nonEmptyLines(s string) []string {
 	}
 	return out
 }
+
+func TestEventsCommandGapResume(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(6000, 35),
+		fakerpc.WithPageLimit(5),
+		fakerpc.WithScript(map[int]fakerpc.Behaviour{
+			1: {OldestLedger: 6010},
+		}),
+	)
+	withFake(t, srv)
+
+	stdout, stderr, err := run(t, "events", "--from", "6000", "--json",
+		"--page-size", "5", "--gap-strategy", "resume")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	lines := nonEmptyLines(stdout)
+	if len(lines) != 30 {
+		t.Fatalf("emitted %d records after resuming, want 30\n%s", len(lines), stdout)
+	}
+	if !strings.Contains(stderr, "recovering by resuming at ledger 6010") {
+		t.Errorf("stderr does not explain the recovery\n%s", stderr)
+	}
+}
+
+func TestEventsCommandBackfillWorkers(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(9000, 30), fakerpc.WithPageLimit(5))
+	withFake(t, srv)
+
+	stdout, _, err := run(t, "events", "--from", "9000", "--json", "--page-size", "5", "--backfill-workers", "3")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := len(nonEmptyLines(stdout)); got != 30 {
+		t.Errorf("emitted %d records with backfill workers, want 30\n%s", got, stdout)
+	}
+}
+
+func TestEventsCommandBatching(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(10000, 20), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	stdout, _, err := run(t, "events", "--from", "10000", "--json",
+		"--batch", "--batch-size", "3", "--batch-timeout", "20ms", "--limit", "7")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := len(nonEmptyLines(stdout)); got != 7 {
+		t.Errorf("emitted %d batched records, want 7\n%s", got, stdout)
+	}
+}
+
+func TestEventsCommandRejectsInvalidStreamOptions(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(100, 2))
+	withFake(t, srv)
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "unknown gap strategy",
+			args: []string{"events", "--from", "100", "--gap-strategy", "skip"},
+		},
+		{
+			name: "backfill workers below one",
+			args: []string{"events", "--from", "100", "--backfill-workers", "0"},
+		},
+		{
+			name: "batching without a threshold",
+			args: []string{"events", "--from", "100", "--batch", "--batch-size", "0", "--batch-timeout", "0"},
+		},
+		{
+			name: "negative batch size",
+			args: []string{"events", "--from", "100", "--batch", "--batch-size", "-1"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := run(t, tc.args...); err == nil {
+				t.Fatal("Execute() error = nil, want a validation failure")
+			}
+		})
+	}
+}
+
+func TestEventsHelpAdvertisesStreamOptions(t *testing.T) {
+	stdout, _, err := run(t, "events", "--help")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	for _, flag := range []string{
+		"--backfill-workers", "--batch", "--batch-size", "--batch-timeout",
+		"--gap-strategy", "--max-gap-recoveries",
+	} {
+		if !strings.Contains(stdout, flag) {
+			t.Errorf("help does not mention %s", flag)
+		}
+	}
+}

@@ -113,6 +113,9 @@ func NewEventSource(client rpc.Client, q EventQuery) (*EventSource, error) {
 // Name implements Source.
 func (s *EventSource) Name() string { return "events" }
 
+// Rewind implements Rewinder, repositioning a fresh fetch at ledger.
+func (s *EventSource) Rewind(ledger uint32) { s.query.StartLedger = ledger }
+
 // CursorLedger implements Source by parsing the RPC cursor format.
 func (s *EventSource) CursorLedger(cursor string) (uint32, bool) {
 	if cursor == "" {
