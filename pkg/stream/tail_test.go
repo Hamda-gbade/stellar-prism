@@ -145,6 +145,31 @@ func TestTailDeliversEveryRecordOnce(t *testing.T) {
 	assertStreamInvariants(t, sink.ids, idsOf(events))
 }
 
+func TestTailerFiltersRecordsAndCountsThem(t *testing.T) {
+	t.Parallel()
+	events := fakerpc.MakeEvents(100, 6)
+	srv := fakerpc.NewServer(events, fakerpc.WithPageLimit(10))
+	src, err := stream.NewEventSource(srv, stream.EventQuery{StartLedger: 100, PageLimit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	filter, err := stream.CompileExpression(`ledger % 2 == 0`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := &collector{}
+	tailer := stream.NewTailer(src, out, stream.Options{Filter: filter, Clock: newFakeClock()})
+	if err := tailer.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := tailer.Stats().Filtered, 3; got != want {
+		t.Errorf("Filtered = %d, want %d", got, want)
+	}
+	if got, want := len(out.records), 3; got != want {
+		t.Errorf("emitted %d records, want %d", got, want)
+	}
+}
+
 // TestTailSurvivesDropsWithoutGapOrDuplicate is the central test. Connections
 // fail at several points; the stream must still deliver every record exactly
 // once, because a failed fetch retries the same cursor.

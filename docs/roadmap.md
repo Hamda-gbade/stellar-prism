@@ -9,21 +9,32 @@ Working and tested:
 - `prism events` — contract, topic and type filters; one-shot or `--follow`
 - `prism ledgers` — ledger close metadata
 - `prism tx` — fetch and explain, through the lens explain path
+- `prism abi` — resolve a contract's WASM via RPC and render its embedded spec
+- `prism completion` and `prism gendocs` — shell completion and reference docs
+- `--color auto|always|never` honoring `NO_COLOR`
 - NDJSON on everything, flushed per record or per `--batch`
 - `--from` backfill, draining full pages at network speed, optionally with
   `--backfill-workers`
+- `--since 10m` — relative windows converted to approximate start ledgers
 - Reconnection with jittered backoff; retry never advances the cursor
+- `--adaptive` — poll waits tuned from observed ledger close frequency
+- Client-side `--topic-pattern` — glob, prefix and regex over decoded topics
+- `--fanout-dir` — one NDJSON file per contract via the streaming demux
 - Gap detection against the server's retention window: exit 2 by default, or
   `--gap-strategy resume` with the skipped range reported
+- Optional cursor journal (`--state-file`) with background pruning, and
+  `--resume` to continue a stream from the last recorded position
 - Streaming core fully tested with no network, and mutation-checked
 
 Known limits, stated plainly:
 
-- **No contract-spec decoding.** Payloads render as the XDR wire shape.
-  `stellar events` decodes against the contract's spec and is better for
-  reading values today. See below.
-- **No durable cursor.** Exactly-once across restarts is not offered; a
-  process killed between emitting and advancing will re-emit on restart.
+- **Event payloads still render as the XDR wire shape.** `prism abi` can
+  resolve and display the spec, including decoding standalone `--arg` values,
+  but the live event stream does not yet apply struct/field names
+  automatically. See below.
+- **No exactly-once across restarts.** `--state-file` and `--resume` narrow
+  the restart window to a single record, but a process killed between
+  emitting and recording still re-emits on restart.
 - **Polling, not push.** Soroban RPC has no subscription API, so latency is
   bounded by `--poll` (one ledger close by default).
 - **~24-hour history.** RPC retention bounds how far `--from` can reach.
@@ -33,13 +44,18 @@ Known limits, stated plainly:
 
 ### Durable cursors
 
-`--state-file` persisting the cursor after each successful emit, so a restart
-resumes where it left off. This narrows the restart window from "the whole run"
-to "one record" and makes prism usable as a long-lived ingestion process.
+Landed as `--state-file` and `--resume`: prism records the position after
+every page it delivered in full, and the next run can start from it. The
+journal is compacted by a background pruner, so it does not grow without
+bound however long the stream runs.
 
-It cannot reach true exactly-once — that needs a transaction spanning the sink
-and the cursor store, which a CLI writing to stdout cannot have — and the
-README should keep saying so.
+What is still missing is true exactly-once. That needs a transaction spanning
+the sink and the cursor store, which a CLI writing to stdout cannot have, so
+the README keeps saying so.
+
+Two smaller things could follow: recording the position per *ledger* rather
+than per page, and letting several streams share one state file without
+keying it by filter set.
 
 ### Contract-spec-aware decoding
 
@@ -60,9 +76,9 @@ sinks are unchanged. A good first substantial contribution.
 
 ### Better `--follow` ergonomics
 
-- `--since 10m` as an alternative to `--from <ledger>`
 - a heartbeat line on stderr when a follow is idle, so a quiet contract is
-  distinguishable from a hung process
+  distinguishable from a hung process (the `--since` half of this list has
+  already shipped — see it in the working list above)
 - `--stats` on exit, reporting records emitted, duplicates suppressed and
   retries
 

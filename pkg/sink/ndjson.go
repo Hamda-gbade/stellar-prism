@@ -56,48 +56,173 @@ func NewNDJSON(w io.Writer, decode bool) *NDJSON {
 
 // eventLine is the documented NDJSON shape for an event.
 type eventLine struct {
-	Kind       string            `json:"kind"`
-	ID         string            `json:"id"`
-	Ledger     uint32            `json:"ledger"`
-	Time       string            `json:"time,omitempty"`
-	Type       string            `json:"type,omitempty"`
-	ContractID string            `json:"contract,omitempty"`
-	TxHash     string            `json:"tx,omitempty"`
-	TxIndex    uint32            `json:"txIndex"`
-	OpIndex    uint32            `json:"opIndex"`
-	Topics     []json.RawMessage `json:"topics,omitempty"`
-	Value      json.RawMessage   `json:"value,omitempty"`
-	TopicsXDR  []string          `json:"topicsXdr,omitempty"`
-	ValueXDR   string            `json:"valueXdr,omitempty"`
+	Kind             string            `json:"kind"`
+	ID               string            `json:"id"`
+	Ledger           uint32            `json:"ledger"`
+	Time             string            `json:"time,omitempty"`
+	Type             string            `json:"type,omitempty"`
+	ContractID       string            `json:"contract,omitempty"`
+	TxHash           string            `json:"tx,omitempty"`
+	TxIndex          uint32            `json:"txIndex"`
+	OpIndex          uint32            `json:"opIndex"`
+	CallDepth        int               `json:"callDepth,omitempty"`
+	ParentContractID string            `json:"parentContract,omitempty"`
+	InvocationPath   []string          `json:"invocationPath,omitempty"`
+	Topics           []json.RawMessage `json:"topics,omitempty"`
+	Value            json.RawMessage   `json:"value,omitempty"`
+	TopicsXDR        []string          `json:"topicsXdr,omitempty"`
+	ValueXDR         string            `json:"valueXdr,omitempty"`
 }
 
 // ledgerLine is the documented NDJSON shape for a ledger close.
 type ledgerLine struct {
-	Kind        string          `json:"kind"`
-	ID          string          `json:"id"`
-	Ledger      uint32          `json:"ledger"`
-	Time        string          `json:"time,omitempty"`
-	Hash        string          `json:"hash,omitempty"`
-	Metadata    json.RawMessage `json:"metadata,omitempty"`
-	MetadataXDR string          `json:"metadataXdr,omitempty"`
-	HeaderXDR   string          `json:"headerXdr,omitempty"`
+	Consensus   *stream.ConsensusMetrics `json:"consensus,omitempty"`
+	Kind        string                   `json:"kind"`
+	ID          string                   `json:"id"`
+	Ledger      uint32                   `json:"ledger"`
+	Time        string                   `json:"time,omitempty"`
+	Hash        string                   `json:"hash,omitempty"`
+	Metadata    json.RawMessage          `json:"metadata,omitempty"`
+	MetadataXDR string                   `json:"metadataXdr,omitempty"`
+	HeaderXDR   string                   `json:"headerXdr,omitempty"`
 }
 
 // transactionLine is the documented NDJSON shape for a transaction.
 type transactionLine struct {
+	Memo          *stream.SanitizedMemo `json:"memo,omitempty"`
+	MemoError     string                `json:"memoError,omitempty"`
+	Kind          string                `json:"kind"`
+	ID            string                `json:"id"`
+	Ledger        uint32                `json:"ledger"`
+	Time          string                `json:"time,omitempty"`
+	Hash          string                `json:"hash,omitempty"`
+	Index         uint32                `json:"index"`
+	Successful    bool                  `json:"successful"`
+	Status        string                `json:"status,omitempty"`
+	FeeAccount    string                `json:"feeAccount,omitempty"`
+	FeeBump       *feeBumpLine          `json:"feeBump,omitempty"`
+	Failure       *failureLine          `json:"failure,omitempty"`
+	Envelope      json.RawMessage       `json:"envelope,omitempty"`
+	Result        json.RawMessage       `json:"result,omitempty"`
+	ResultMeta    json.RawMessage       `json:"resultMeta,omitempty"`
+	EnvelopeXDR   string                `json:"envelopeXdr,omitempty"`
+	ResultXDR     string                `json:"resultXdr,omitempty"`
+	ResultMetaXDR string                `json:"resultMetaXdr,omitempty"`
+	Conflicts     []conflictLine        `json:"conflicts,omitempty"`
+}
+
+type conflictLine struct {
+	KeyXDR       string   `json:"keyXdr"`
+	ContractID   string   `json:"contract,omitempty"`
+	Transactions []string `json:"transactions"`
+}
+
+type operationLine struct {
 	Kind          string          `json:"kind"`
 	ID            string          `json:"id"`
 	Ledger        uint32          `json:"ledger"`
 	Time          string          `json:"time,omitempty"`
-	Hash          string          `json:"hash,omitempty"`
 	Index         uint32          `json:"index"`
-	Successful    bool            `json:"successful"`
-	Envelope      json.RawMessage `json:"envelope,omitempty"`
+	Type          string          `json:"type"`
+	SourceAccount string          `json:"sourceAccount,omitempty"`
+	Parameters    json.RawMessage `json:"parameters,omitempty"`
+	ParametersXDR string          `json:"parametersXdr,omitempty"`
+	ResultCode    string          `json:"resultCode,omitempty"`
 	Result        json.RawMessage `json:"result,omitempty"`
-	ResultMeta    json.RawMessage `json:"resultMeta,omitempty"`
-	EnvelopeXDR   string          `json:"envelopeXdr,omitempty"`
 	ResultXDR     string          `json:"resultXdr,omitempty"`
-	ResultMetaXDR string          `json:"resultMetaXdr,omitempty"`
+	TxHash        string          `json:"tx,omitempty"`
+}
+
+type simulationLine struct {
+	Kind           string                     `json:"kind"`
+	ID             string                     `json:"id"`
+	Ledger         uint32                     `json:"ledger"`
+	Time           string                     `json:"time,omitempty"`
+	Error          string                     `json:"error,omitempty"`
+	ReturnValue    json.RawMessage            `json:"returnValue,omitempty"`
+	ReturnValueXDR string                     `json:"returnValueXdr,omitempty"`
+	Instructions   uint32                     `json:"instructions"`
+	DiskReadBytes  uint32                     `json:"diskReadBytes"`
+	WriteBytes     uint32                     `json:"writeBytes"`
+	MinResourceFee int64                      `json:"minResourceFee"`
+	Changed        []string                   `json:"changed,omitempty"`
+	Previous       *stream.SimulationSnapshot `json:"previous,omitempty"`
+}
+
+// failureLine is the documented NDJSON shape for a decoded failure.
+//
+// It mirrors stream.Failure: the transaction-level code, the inner code a
+// fee-bump wrapper reported, and the first failing operation each render as
+// their own object, so a jq expression can select whichever level matters.
+type failureLine struct {
+	Code      string                `json:"code,omitempty"`
+	Constant  string                `json:"constant,omitempty"`
+	Summary   string                `json:"summary,omitempty"`
+	Hint      string                `json:"hint,omitempty"`
+	Headline  string                `json:"headline,omitempty"`
+	Inner     *failureLine          `json:"inner,omitempty"`
+	Operation *operationFailureLine `json:"operation,omitempty"`
+}
+
+// operationFailureLine is the documented NDJSON shape for the first failing
+// operation of a transaction.
+type operationFailureLine struct {
+	Index    int    `json:"index"`
+	Type     string `json:"type,omitempty"`
+	Trapped  bool   `json:"trapped,omitempty"`
+	Code     string `json:"code,omitempty"`
+	Constant string `json:"constant,omitempty"`
+	Summary  string `json:"summary,omitempty"`
+	Hint     string `json:"hint,omitempty"`
+}
+
+// feeBumpLine is the documented NDJSON shape for fee-bump classification.
+type feeBumpLine struct {
+	FeeAccount      string `json:"feeAccount,omitempty"`
+	InnerSource     string `json:"innerSource,omitempty"`
+	InnerHash       string `json:"innerHash,omitempty"`
+	MaxFee          int64  `json:"maxFee,omitempty"`
+	InnerFee        int64  `json:"innerFee,omitempty"`
+	FeeCharged      int64  `json:"feeCharged,omitempty"`
+	InnerOperations int    `json:"innerOperations,omitempty"`
+	OuterSignatures int    `json:"outerSignatures,omitempty"`
+	InnerSignatures int    `json:"innerSignatures,omitempty"`
+}
+
+// storageChangeLine is the documented NDJSON shape for a storage mutation.
+type storageChangeLine struct {
+	Kind       string          `json:"kind"`
+	ID         string          `json:"id"`
+	Ledger     uint32          `json:"ledger"`
+	Time       string          `json:"time,omitempty"`
+	ChangeType string          `json:"changeType,omitempty"`
+	EntryType  string          `json:"entryType,omitempty"`
+	ContractID string          `json:"contract,omitempty"`
+	Durability string          `json:"durability,omitempty"`
+	KeyHash    string          `json:"keyHash,omitempty"`
+	WASMHash   string          `json:"wasmHash,omitempty"`
+	Key        json.RawMessage `json:"key,omitempty"`
+	Entry      json.RawMessage `json:"entry,omitempty"`
+	Change     json.RawMessage `json:"change,omitempty"`
+	KeyXDR     string          `json:"keyXdr,omitempty"`
+	EntryXDR   string          `json:"entryXdr,omitempty"`
+	ChangeXDR  string          `json:"changeXdr,omitempty"`
+}
+
+// wasmLine is the documented NDJSON shape for a deployment host function.
+type wasmLine struct {
+	Kind       string `json:"kind"`
+	ID         string `json:"id"`
+	Ledger     uint32 `json:"ledger"`
+	Time       string `json:"time,omitempty"`
+	Action     string `json:"action,omitempty"`
+	ContractID string `json:"contract,omitempty"`
+	WASMHash   string `json:"wasmHash,omitempty"`
+	WASMSize   int    `json:"wasmSize,omitempty"`
+	Executable string `json:"executable,omitempty"`
+	TxHash     string `json:"tx,omitempty"`
+	OpIndex    uint32 `json:"opIndex"`
+	Successful bool   `json:"successful"`
 }
 
 // Emit implements stream.Sink.
@@ -148,6 +273,9 @@ func (n *NDJSON) document(r stream.Record) (any, error) {
 			line.Type = r.Event.Type
 			line.ContractID = r.Event.ContractID
 			line.TxHash = r.Event.TxHash
+			line.CallDepth = r.Event.CallDepth
+			line.ParentContractID = r.Event.ParentContractID
+			line.InvocationPath = r.Event.InvocationPath
 
 			if n.decode {
 				for _, t := range r.Event.TopicXDR {
@@ -180,6 +308,7 @@ func (n *NDJSON) document(r stream.Record) (any, error) {
 		}
 		if r.Close != nil {
 			line.Hash = r.Close.Hash
+			line.Consensus = r.Close.Consensus
 			if n.decode && r.Close.MetadataXDR != "" {
 				raw, err := n.decodeXDR(r.Close.MetadataXDR)
 				if err != nil {
@@ -202,8 +331,19 @@ func (n *NDJSON) document(r stream.Record) (any, error) {
 		}
 		if r.Transaction != nil {
 			line.Hash = r.Transaction.Hash
+			memo, memoErr := stream.DecodeMemo(r.Transaction.EnvelopeXDR)
+			if memoErr == nil {
+				line.Memo = &memo
+			} else {
+				line.Memo = r.Transaction.Memo
+				line.MemoError = r.Transaction.MemoError
+			}
 			line.Index = r.Transaction.Index
 			line.Successful = r.Transaction.Successful
+			line.Status = r.Transaction.Status
+			line.FeeAccount = r.Transaction.FeeAccount
+			line.FeeBump = feeBumpLineOf(r.Transaction.FeeBump)
+			line.Failure = failureLineOf(r.Transaction.Failure)
 			if n.decode {
 				if r.Transaction.EnvelopeXDR != "" {
 					raw, err := n.decodeXDR(r.Transaction.EnvelopeXDR)
@@ -231,6 +371,117 @@ func (n *NDJSON) document(r stream.Record) (any, error) {
 				line.ResultXDR = r.Transaction.ResultXDR
 				line.ResultMetaXDR = r.Transaction.ResultMetaXDR
 			}
+			for _, conflict := range r.Transaction.Conflicts {
+				line.Conflicts = append(line.Conflicts, conflictLine{
+					KeyXDR: conflict.KeyXDR, ContractID: conflict.ContractID, Transactions: conflict.Transactions,
+				})
+			}
+		}
+		payload = line
+
+	case stream.KindOperation:
+		line := operationLine{Kind: string(r.Kind), ID: r.ID, Ledger: r.Sequence, Time: formatTime(r.Time)}
+		if op := r.Operation; op != nil {
+			line.Index, line.Type, line.SourceAccount, line.ResultCode, line.TxHash = op.Index, op.Type, op.SourceAccount, op.ResultCode, op.TransactionHash
+			if n.decode {
+				if op.ParametersXDR != "" {
+					raw, err := n.decodeXDR(op.ParametersXDR)
+					if err != nil {
+						return err
+					}
+					line.Parameters = raw
+				}
+				if op.ResultXDR != "" {
+					raw, err := n.decodeXDR(op.ResultXDR)
+					if err != nil {
+						return err
+					}
+					line.Result = raw
+				}
+			} else {
+				line.ParametersXDR, line.ResultXDR = op.ParametersXDR, op.ResultXDR
+			}
+		}
+		payload = line
+
+	case stream.KindSimulation:
+		line := simulationLine{Kind: string(r.Kind), ID: r.ID, Ledger: r.Sequence, Time: formatTime(r.Time)}
+		if sim := r.Simulation; sim != nil {
+			line.Ledger, line.Error = sim.Ledger, sim.Error
+			line.Instructions, line.DiskReadBytes, line.WriteBytes, line.MinResourceFee = sim.Instructions, sim.DiskReadBytes, sim.WriteBytes, sim.MinResourceFee
+			line.Changed, line.Previous = sim.Changed, sim.Previous
+			if n.decode && sim.ReturnValueXDR != "" {
+				raw, err := n.decodeXDR(sim.ReturnValueXDR)
+				if err != nil {
+					return err
+				}
+				line.ReturnValue = raw
+			} else {
+				line.ReturnValueXDR = sim.ReturnValueXDR
+			}
+		}
+		payload = line
+
+	case stream.KindStorageChange:
+		line := storageChangeLine{
+			Kind:   string(r.Kind),
+			ID:     r.ID,
+			Ledger: r.Sequence,
+			Time:   formatTime(r.Time),
+		}
+		if c := r.StorageChange; c != nil {
+			line.ChangeType = c.ChangeType
+			line.EntryType = c.EntryType
+			line.ContractID = c.ContractID
+			line.Durability = c.Durability
+			line.KeyHash = c.KeyHash
+			line.WASMHash = c.WASMHash
+			if n.decode {
+				if c.KeyXDR != "" {
+					raw, err := n.decodeXDR(c.KeyXDR)
+					if err != nil {
+						return err
+					}
+					line.Key = raw
+				}
+				if c.EntryXDR != "" {
+					raw, err := n.decodeXDR(c.EntryXDR)
+					if err != nil {
+						return err
+					}
+					line.Entry = raw
+				}
+				if c.ChangeXDR != "" {
+					raw, err := n.decodeXDR(c.ChangeXDR)
+					if err != nil {
+						return err
+					}
+					line.Change = raw
+				}
+			} else {
+				line.KeyXDR = c.KeyXDR
+				line.EntryXDR = c.EntryXDR
+				line.ChangeXDR = c.ChangeXDR
+			}
+		}
+		payload = line
+
+	case stream.KindWASMDeployment:
+		line := wasmLine{
+			Kind:   string(r.Kind),
+			ID:     r.ID,
+			Ledger: r.Sequence,
+			Time:   formatTime(r.Time),
+		}
+		if w := r.WASMDeployment; w != nil {
+			line.Action = w.Action
+			line.ContractID = w.ContractID
+			line.WASMHash = w.WASMHash
+			line.WASMSize = w.WASMSize
+			line.Executable = w.Executable
+			line.TxHash = w.TxHash
+			line.OpIndex = w.OpIndex
+			line.Successful = w.Successful
 		}
 		payload = line
 
@@ -263,6 +514,60 @@ func EncodeRecord(r stream.Record, decode bool) ([]byte, error) {
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
+// feeBumpLineOf converts a classification to its wire shape, or returns nil
+// when the transaction was not fee-bumped.
+func feeBumpLineOf(info *stream.FeeBump) *feeBumpLine {
+	if info == nil {
+		return nil
+	}
+	return &feeBumpLine{
+		FeeAccount:      info.FeeAccount,
+		InnerSource:     info.InnerSource,
+		InnerHash:       info.InnerHash,
+		MaxFee:          info.MaxFee,
+		InnerFee:        info.InnerFee,
+		FeeCharged:      info.FeeCharged,
+		InnerOperations: info.InnerOperations,
+		OuterSignatures: info.OuterSignatures,
+		InnerSignatures: info.InnerSignatures,
+	}
+}
+
+// failureLineOf converts a decoded failure to its wire shape, preserving the
+// level at which each code was reported.
+func failureLineOf(failure *stream.Failure) *failureLine {
+	if failure == nil {
+		return nil
+	}
+	line := &failureLine{
+		Code:     failure.Detail.Code,
+		Constant: failure.Detail.Constant,
+		Summary:  failure.Detail.Summary,
+		Hint:     failure.Detail.Hint,
+		Headline: failure.Headline,
+	}
+	if failure.Inner != nil {
+		line.Inner = &failureLine{
+			Code:     failure.Inner.Code,
+			Constant: failure.Inner.Constant,
+			Summary:  failure.Inner.Summary,
+			Hint:     failure.Inner.Hint,
+		}
+	}
+	if failure.Operation != nil {
+		line.Operation = &operationFailureLine{
+			Index:    failure.Operation.Index,
+			Type:     failure.Operation.Type,
+			Trapped:  failure.Operation.Trapped,
+			Code:     failure.Operation.Detail.Code,
+			Constant: failure.Operation.Detail.Constant,
+			Summary:  failure.Operation.Detail.Summary,
+			Hint:     failure.Operation.Detail.Hint,
+		}
+	}
+	return line
+}
+
 // decodeXDR renders a base64 payload through lens, producing the same
 // {type, value} envelope that `lens decode --json` emits.
 //
@@ -282,6 +587,7 @@ func (n *NDJSON) decodeXDR(payload string) (json.RawMessage, error) {
 		return fallback, nil
 	}
 
+	sanitizeJSONMemoNodes(value.Node, false)
 	var buf bytes.Buffer
 	if err := n.lensFmt.Format(&buf, value); err != nil {
 		return nil, fmt.Errorf("ndjson: formatting decoded payload: %w", err)
@@ -302,4 +608,20 @@ func formatTime(t time.Time) string {
 		return ""
 	}
 	return t.UTC().Format(time.RFC3339)
+}
+
+// Preserve the lens envelope while sanitizing its decoded memo fields too.
+func sanitizeJSONMemoNodes(n *lens.Node, inMemo bool) {
+	if n == nil {
+		return
+	}
+	inMemo = inMemo || n.TypeName == "Memo"
+	if inMemo {
+		if s, ok := n.Value.(string); ok {
+			n.Value = stream.SanitizeText(s)
+		}
+	}
+	for _, child := range n.Children {
+		sanitizeJSONMemoNodes(child, inMemo)
+	}
 }

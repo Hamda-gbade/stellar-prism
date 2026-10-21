@@ -334,3 +334,29 @@ func TestHumanEmitBatch(t *testing.T) {
 		t.Fatalf("EmitBatch() rendered %d records, want %d\n%s", got, len(records), buf.String())
 	}
 }
+
+func TestEventCallTreeMetadataRendersInHumanAndNDJSON(t *testing.T) {
+	t.Parallel()
+	r := eventRecord()
+	r.Event.CallDepth = 2
+	r.Event.ParentContractID = "CPARENT"
+	r.Event.InvocationPath = []string{"CROUTER", "CPAIR", "CTOKEN"}
+	var human bytes.Buffer
+	if err := sink.NewHuman(&human, lensformat.NoColor, false).Emit(r); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(human.String(), "└─ [call 2]") || !strings.Contains(human.String(), "from CPARENT") {
+		t.Fatalf("human event omitted call tree details:\n%s", human.String())
+	}
+	var ndjson bytes.Buffer
+	if err := sink.NewNDJSON(&ndjson, false).Emit(r); err != nil {
+		t.Fatal(err)
+	}
+	var line map[string]any
+	if err := json.Unmarshal(ndjson.Bytes(), &line); err != nil {
+		t.Fatal(err)
+	}
+	if line["callDepth"] != float64(2) || line["parentContract"] != "CPARENT" {
+		t.Fatalf("NDJSON call tree fields = %v", line)
+	}
+}
