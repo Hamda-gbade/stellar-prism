@@ -144,6 +144,43 @@ prism events --from 3966000 --limit 10000 --json --backfill-workers 4
 Workers fetch disjoint ledger ranges, then records are merged by ID before
 they reach stdout, so output order and de-duplication are unchanged.
 
+### Shipping records to other sinks
+
+Every streaming command can write to more than stdout. The extra sinks are
+opt-in, compose with each other, and reuse the same JSON object `--json`
+emits:
+
+| Flag | Destination |
+|---|---|
+| `--webhook-url` | Batched HTTP POSTs, optional HMAC-SHA256 signing and backoff retries |
+| `--cloud-bucket` + `--cloud-provider` | Gzipped NDJSON chunks in S3 or GCS |
+| `--metrics-addr` | Prometheus `/metrics` (throughput, ledger latency, errors) |
+| `--syslog-address` | RFC 5424 syslog or systemd-journald native fields |
+
+```sh
+# Fan a live stream out to a receiver and to S3-compatible storage
+prism events --follow --json \
+  --webhook-url https://example.com/prism \
+  --cloud-provider s3 --cloud-url https://s3.us-east-1.amazonaws.com \
+  --cloud-bucket my-prism-archive
+
+# Watch throughput and latency while tailing
+prism events --follow --json --metrics-addr 127.0.0.1:9090
+
+# Send events to the local systemd journal
+prism events --follow --json \
+  --syslog-address unixgram:///run/systemd/journal/socket \
+  --syslog-format journald
+```
+
+Credentials come from the environment (`PRISM_WEBHOOK_SECRET`,
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `GOOGLE_OAUTH_ACCESS_TOKEN`) so
+they do not appear in `ps` output. Delivery to webhooks and object storage is
+at-least-once: a batch is retried until acknowledged and uses a stable key or
+delivery id so a receiver can de-duplicate. See
+[docs/architecture.md](docs/architecture.md#built-in-sinks) for the payload
+shapes and retry rules.
+
 ### NDJSON for pipelines
 
 `--json` emits one object per line, flushed after each record (or batch), so a
