@@ -55,11 +55,18 @@ func (s *TransactionSource) CursorLedger(cursor string) (uint32, bool) {
 	}
 	// Try parsing as a full event cursor (has the form ledger-tx-op-event)
 	if parts := strings.Split(cursor, "-"); len(parts) >= 2 {
-		// First part is toid-encoded; parse it and extract the ledger sequence.
+		// First part may be toid-encoded; parse it and extract the ledger
+		// sequence. Legacy transaction cursors carry the ledger directly
+		// ("%010d-%06d"), so fall back to the plain value when the TOID
+		// payload has no ledger in it.
 		idInt, err := strconv.ParseInt(parts[0], 10, 64)
 		if err == nil {
-			parsed := toid.Parse(idInt)
-			return uint32(parsed.LedgerSequence), true
+			if parsed := toid.Parse(idInt); parsed.LedgerSequence > 0 {
+				return uint32(parsed.LedgerSequence), true
+			}
+			if n, err := strconv.ParseUint(parts[0], 10, 32); err == nil {
+				return uint32(n), true
+			}
 		}
 		// Fall back: try the second part as a plain ledger number.
 		if n, err := strconv.ParseUint(parts[1], 10, 32); err == nil {

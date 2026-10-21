@@ -61,6 +61,7 @@ internal/cli/         cobra commands — thin wrappers over pkg/stream
   syncwriter.go       serialised stderr, for the diagnostics several goroutines write
 internal/fakerpc/     scriptable in-memory RPC for tests
 pkg/rpc/              the Client interface + SDK adapter
+  wire_log.go         debug HTTP wire logger with credential redaction
 pkg/stream/
   record.go           Record: the neutral item every source produces
   source.go           Source and Sink interfaces, GapError   ← the seams
@@ -233,6 +234,61 @@ single `rpc.Client`, so every command gains failover without knowing about it.
 
 Options: `WithHealthInterval` (0 disables the probe), `WithHealthTimeout`,
 `WithFailureCooldown`, `WithClientFactory` (tests inject fakes).
+
+## Debug wire log (`--wire-log`)
+
+When an RPC response does not match what the docs promised, the useful
+artefact is the exact HTTP exchange. `pkg/rpc/wire_log.go` provides
+`rpc.WireLogger`, an `http.RoundTripper` that records each request and response
+as one NDJSON object and then passes the exchange through unchanged.
+`rpc.NewWithTransport` installs it under the SDK client; `New` keeps its
+existing signature and behaviour.
+
+```console
+$ prism events --from 3966000 --wire-log /tmp/prism-wire.ndjson
+$ jq -c 'select(.direction=="response") | {status, body}' /tmp/prism-wire.ndjson | head
+```
+
+| Flag | Meaning |
+|---|---|
+| `--wire-log <path>` | append the debug NDJSON log to this file; `-` writes to stderr |
+| `--wire-log-max-body <bytes>` | cap each recorded body; `0` uses 1 MiB, `-1` disables bodies |
+
+Each line carries `time`, `direction` (`request`, `response`, or `error`),
+`method`, `url`, headers, status, duration and the body where applicable.
+Bodies are recorded as UTF-8 text when possible and base64 otherwise, with a
+`truncated` marker when the cap was reached.
+
+**Credentials are masked before the line is encoded.** The default redaction
+set is `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`,
+`X-Api-Key`, `X-Auth-Token` and `X-Amz-Security-Token`;
+`WireLogOptions.RedactHeaders` adds provider-specific names. URL userinfo
+(including basic-auth credentials) is replaced with `[REDACTED]`, as are
+values of credential-bearing query parameters such as `token` and `api_key`.
+Transport error text is scrubbed with the same values, because those messages
+often echo the URL that failed.
+
+**The exchange is not altered.** Request bodies are read through a bounded
+prefix and rebuilt as a replay reader followed by the untouched remainder;
+response bodies use the same mechanism. The transport and the caller therefore
+see exactly the bytes they would have seen without the logger, and memory use
+is capped by `--wire-log-max-body` rather than by the response size.
+
+**There is no background writer.** The logger writes under one mutex and
+starts no goroutine, so there is nothing to join on Ctrl-C and no queue that
+can grow. `WireLogger.Close` is idempotent, flushes a writer that supports
+`Flush`, and returns the first logging failure. The CLI closes the RPC client
+first, so an in-flight failover probe cannot write to a closed file, then syncs
+and closes the log. A logging failure (a full disk, for example) is reported on
+stderr but never replaces the RPC result — debug output must not turn a working
+stream into a failing one.
+
+The logger makes no network calls of its own; it can only observe a request
+the SDK was already going to make. Unit tests cover redaction, truncation,
+body replay, writer and reader failures, and close idempotence. The integration
+test in `internal/cli` drives a real `httptest` RPC server through the CLI and
+asserts that the Authorization header and URL password are absent from the
+written log.
 
 ## Derived transaction streams
 

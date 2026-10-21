@@ -102,11 +102,26 @@ type SDKClient struct {
 // The HTTP client carries a per-request timeout so a hung connection surfaces
 // as a retryable error rather than stalling the stream indefinitely.
 func New(url string, timeout time.Duration) *SDKClient {
+	return NewWithTransport(url, timeout, nil)
+}
+
+// NewWithTransport returns a Client backed by the Stellar SDK that sends every
+// HTTP request through transport.
+//
+// A nil transport means http.DefaultTransport, so New and NewWithTransport
+// behave identically when no transport is supplied. A *WireLogger is the
+// intended use: it observes the exchange while remaining transparent to the
+// streaming code and the SDK.
+func NewWithTransport(url string, timeout time.Duration, transport http.RoundTripper) *SDKClient {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
+	httpClient := &http.Client{Timeout: timeout}
+	if transport != nil {
+		httpClient.Transport = transport
+	}
 	return &SDKClient{
-		inner: rpcclient.NewClient(url, &http.Client{Timeout: timeout}),
+		inner: rpcclient.NewClient(url, httpClient),
 	}
 }
 
