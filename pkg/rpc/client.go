@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -39,6 +40,16 @@ type Client interface {
 	// StartLedger or Pagination.Cursor must be set, never both — the RPC
 	// rejects requests carrying both.
 	GetEvents(ctx context.Context, req protocol.GetEventsRequest) (protocol.GetEventsResponse, error)
+
+	// GetEventsBatch returns contract events matching each request, combining
+	// them into as few HTTP roundtrips as the server allows. Each entry's
+	// StartLedger or Pagination.Cursor must be mutually exclusive; at least
+	// one must be set.
+	//
+	// A failed entry aborts the batch: the responses gathered before the
+	// failure are returned alongside the error, so a caller never has to
+	// guess how far the batch got.
+	GetEventsBatch(ctx context.Context, reqs []protocol.GetEventsRequest) ([]protocol.GetEventsResponse, error)
 
 	// GetLedgers returns ledger metadata starting at the requested point.
 	GetLedgers(ctx context.Context, req protocol.GetLedgersRequest) (protocol.GetLedgersResponse, error)
@@ -96,6 +107,26 @@ func cleanURLs(values []string) []string {
 	return urls
 }
 
+// ResolveSRV resolves the DNS SRV records for domain (the _rpc._tcp.<domain>
+// records published by a clustered RPC deployment) and returns one https URL
+// per advertised node. It is how a fleet of prism instances can share a
+// single hostname and still spread across the cluster behind it.
+func ResolveSRV(domain string) ([]string, error) {
+	_, records, err := net.LookupSRV("rpc", "tcp", domain)
+	if err != nil {
+		return nil, fmt.Errorf("srv lookup for %s: %w", domain, err)
+	}
+
+	urls := make([]string, 0, len(records))
+	for _, srv := range records {
+		// SRV targets are absolute names, so they carry a trailing dot that
+		// must be trimmed before the host is used in a URL.
+		target := strings.TrimSuffix(srv.Target, ".")
+		urls = append(urls, fmt.Sprintf("https://%s:%d", target, srv.Port))
+	}
+	return urls, nil
+}
+
 // SDKClient adapts the Stellar SDK's RPC client to the Client interface.
 type SDKClient struct {
 	inner *rpcclient.Client
@@ -105,12 +136,20 @@ type SDKClient struct {
 //
 // The HTTP client carries a per-request timeout so a hung connection surfaces
 // as a retryable error rather than stalling the stream indefinitely.
-func New(url string, timeout time.Duration) *SDKClient {
+//
+// A NewClientOption may configure an HTTP proxy (HTTP, HTTPS or SOCKS5) for
+// the underlying requests, which is how prism is pointed at an egress proxy
+// behind a corporate firewall.
+func New(url string, timeout time.Duration, opts ...NewClientOption) *SDKClient {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
+	options := applyNewClientOptions(opts...)
 	return &SDKClient{
-		inner: rpcclient.NewClient(url, &http.Client{Timeout: timeout}),
+		inner: rpcclient.NewClient(url, &http.Client{
+			Timeout:   timeout,
+			Transport: options.transport,
+		}),
 	}
 }
 
@@ -121,6 +160,26 @@ func (c *SDKClient) GetEvents(ctx context.Context, req protocol.GetEventsRequest
 		return resp, fmt.Errorf("rpc getEvents: %w", err)
 	}
 	return resp, nil
+}
+
+// GetEventsBatch implements Client.
+func (c *SDKClient) GetEventsBatch(ctx context.Context, reqs []protocol.GetEventsRequest) ([]protocol.GetEventsResponse, error) {
+	if len(reqs) == 0 {
+		return nil, nil
+	}
+	responses := make([]protocol.GetEventsResponse, 0, len(reqs))
+	for _, req := range reqs {
+		resp, err := c.inner.GetEvents(ctx, req)
+		if err != nil {
+			// Hand back the responses gathered so far with the error. Dropping
+			// them would force the caller to re-issue requests that already
+			// succeeded; swallowing the error would report a truncated batch as
+			// complete.
+			return responses, fmt.Errorf("rpc getEventsBatch: %w", err)
+		}
+		responses = append(responses, resp)
+	}
+	return responses, nil
 }
 
 // GetLedgers implements Client.
@@ -204,6 +263,57 @@ func (c *SDKClient) Close() error {
 		return fmt.Errorf("rpc close: %w", err)
 	}
 	return nil
+}
+
+// NewClientOption configures optional behaviour of the SDK-backed client.
+type NewClientOption struct {
+	// ProxyURL, when set, routes RPC traffic through an HTTP, HTTPS or SOCKS5
+	// proxy instead of dialling the endpoint directly.
+	ProxyURL string
+}
+
+// newClientOptions collects options for SDK client creation.
+type newClientOptions struct {
+	transport http.RoundTripper
+}
+
+// applyNewClientOptions resolves opts into the concrete transport settings
+// used to build the client. An unusable option is reported and ignored rather
+// than fatal: a mistyped proxy should degrade to a direct connection, not
+// leave prism unable to start.
+func applyNewClientOptions(opts ...NewClientOption) newClientOptions {
+	applied := newClientOptions{}
+	for _, opt := range opts {
+		if opt.ProxyURL == "" {
+			continue
+		}
+		transport, err := proxyURLToTransport(opt.ProxyURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "rpc: ignoring proxy URL %q: %v\n", opt.ProxyURL, err)
+			continue
+		}
+		applied.transport = transport
+	}
+	return applied
+}
+
+// proxyURLToTransport converts a proxy URL into the transport that uses it.
+// net/http speaks HTTP, HTTPS and SOCKS5 proxies natively, so the proxy only
+// has to be handed to the transport rather than reimplemented.
+func proxyURLToTransport(raw string) (http.RoundTripper, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy URL: %w", err)
+	}
+	switch u.Scheme {
+	case "http", "https", "socks5":
+		if u.Host == "" {
+			return nil, fmt.Errorf("proxy URL %q has no host", raw)
+		}
+		return &http.Transport{Proxy: http.ProxyURL(u)}, nil
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme %q, use http, https, or socks5", u.Scheme)
+	}
 }
 
 // PermanentError marks a failure that retrying cannot fix, such as a

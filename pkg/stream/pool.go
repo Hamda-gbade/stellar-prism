@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,15 @@ const (
 	DefaultHealthInterval  = 30 * time.Second
 	DefaultHealthTimeout   = 5 * time.Second
 	DefaultFailureCooldown = 30 * time.Second
+)
+
+// DefaultBackoff tunes the retry delays used when probing pool endpoints
+// that have fallen out of rotation.
+const (
+	DefaultBackoffInitial = 500 * time.Millisecond
+	DefaultBackoffMax     = 30 * time.Second
+	DefaultBackoffFactor  = 2.0
+	DefaultBackoffJitter  = true
 )
 
 // PoolOption configures an RPC Pool.
@@ -64,6 +74,18 @@ func WithFailureCooldown(d time.Duration) PoolOption {
 	}
 }
 
+// WithBackoff sets the retry backoff configuration for pool endpoint recovery.
+// This controls exponential backoff with jitter used when probing unhealthy
+// endpoints, helping prevent thundering herd problems during network partitions.
+func WithBackoff(initial, maxDelay time.Duration, factor float64, jitter bool) PoolOption {
+	return func(p *Pool) {
+		p.backoffInitial = initial
+		p.backoffMax = maxDelay
+		p.backoffFactor = factor
+		p.backoffJitter = jitter
+	}
+}
+
 // endpoint is one member of a Pool and its mutable health state.
 type endpoint struct {
 	url    string
@@ -98,6 +120,11 @@ type Pool struct {
 	healthInterval  time.Duration
 	healthTimeout   time.Duration
 	failureCooldown time.Duration
+	backoffInitial  time.Duration
+	backoffMax      time.Duration
+	backoffFactor   float64
+	backoffJitter   bool
+	clock           Clock
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -119,6 +146,11 @@ func NewPool(urls []string, opts ...PoolOption) (*Pool, error) {
 		healthInterval:  DefaultHealthInterval,
 		healthTimeout:   DefaultHealthTimeout,
 		failureCooldown: DefaultFailureCooldown,
+		backoffInitial:  DefaultBackoffInitial,
+		backoffMax:      DefaultBackoffMax,
+		backoffFactor:   DefaultBackoffFactor,
+		backoffJitter:   DefaultBackoffJitter,
+		clock:           RealClock{},
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -219,6 +251,75 @@ func (p *Pool) HealthCheck(ctx context.Context) {
 			p.markFailure(ep, err)
 		}
 	}
+	// Apply exponential backoff with jitter before the next probe cycle, but
+	// only while endpoints are still down: there is nothing to spread out once
+	// the pool has recovered, and sleeping then would only delay live traffic.
+	if p.backoffInitial > 0 {
+		if failures, down := p.failureState(); down {
+			if sleepErr := p.clock.Sleep(ctx, p.backoffDelay(failures)); sleepErr != nil {
+				return
+			}
+		}
+	}
+}
+
+// failureState reports the highest failure count across the pool and whether
+// any endpoint is currently marked unhealthy, both read under the lock that
+// guards the endpoints: HealthCheck runs concurrently with the streaming
+// calls that keep adjusting them.
+func (p *Pool) failureState() (failures int, down bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, ep := range p.endpoints {
+		if !ep.healthy {
+			down = true
+		}
+		if ep.failures > failures {
+			failures = ep.failures
+		}
+	}
+	return failures, down
+}
+
+// backoffDelay computes the delay before the next probe of a failing
+// endpoint: exponential in the failure count, capped at backoffMax, and
+// jittered so that pools which lost the same partition do not reconnect in
+// lockstep.
+func (p *Pool) backoffDelay(failureCount int) time.Duration {
+	attempt := failureCount + 1
+	initial := p.backoffInitial
+	maxDelay := p.backoffMax
+	factor := p.backoffFactor
+
+	if initial <= 0 {
+		initial = DefaultBackoffInitial
+	}
+	if maxDelay <= 0 {
+		maxDelay = DefaultBackoffMax
+	}
+	if factor < 1 {
+		factor = 2
+	}
+
+	d := float64(initial)
+	for range attempt - 1 {
+		d *= factor
+		if d >= float64(maxDelay) {
+			d = float64(maxDelay)
+			break
+		}
+	}
+	if d > float64(maxDelay) {
+		d = float64(maxDelay)
+	}
+
+	if p.backoffJitter {
+		// Full jitter: pick a random value in [0, d], then double it to get
+		// a range of [0, 2d], effectively giving [d/2, d] after normalization.
+		d = d/2 + d/2*rand.Float64()
+	}
+	return time.Duration(d)
 }
 
 func (p *Pool) healthLoop() {
@@ -241,6 +342,15 @@ func (p *Pool) healthLoop() {
 func (p *Pool) GetEvents(ctx context.Context, req protocol.GetEventsRequest) (protocol.GetEventsResponse, error) {
 	return poolCall(p, ctx, "getEvents", func(c rpc.Client) (protocol.GetEventsResponse, error) {
 		return c.GetEvents(ctx, req)
+	})
+}
+
+// GetEventsBatch implements rpc.Client. A batch that fails on one endpoint is
+// retried whole on the next: the endpoints share no cursor state, so a
+// half-completed batch cannot be resumed elsewhere.
+func (p *Pool) GetEventsBatch(ctx context.Context, reqs []protocol.GetEventsRequest) ([]protocol.GetEventsResponse, error) {
+	return poolCall(p, ctx, "getEventsBatch", func(c rpc.Client) ([]protocol.GetEventsResponse, error) {
+		return c.GetEventsBatch(ctx, reqs)
 	})
 }
 
@@ -320,7 +430,9 @@ func (p *Pool) markFailure(ep *endpoint, err error) {
 	ep.failures++
 	if rpc.IsRetryable(err) {
 		ep.healthy = false
-		ep.cooldownUntil = time.Now().Add(p.failureCooldown)
+		// The cooldown doubles with each consecutive failure, so a dead
+		// endpoint is probed less and less often until it recovers.
+		ep.cooldownUntil = time.Now().Add(p.backoffDelay(ep.failures))
 	}
 }
 

@@ -1,269 +1,369 @@
 package cli
 
 import (
-	"context"
-	"database/sql"
-	"path/filepath"
+	"bytes"
+	"compress/gzip"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
-
-	_ "github.com/marcboeker/go-duckdb/v2" // reads the CLI's Parquet output back
+	"time"
 
 	"github.com/stellar-optics/stellar-prism/internal/fakerpc"
-	"github.com/stellar-optics/stellar-prism/pkg/sink"
-	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
-// fakeSinkDB stands in for PostgreSQL so the CLI wiring can be exercised end
-// to end without a database.
-type fakeSinkDB struct {
-	mu sync.Mutex
-
-	execs  []string
-	tables []string
-	rows   [][]any
+type webhookRequests struct {
+	mu      sync.Mutex
+	bodies  [][]byte
+	headers []http.Header
 }
 
-func (f *fakeSinkDB) Exec(_ context.Context, sql string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.execs = append(f.execs, sql)
-	return nil
-}
-
-func (f *fakeSinkDB) CopyRows(_ context.Context, table string, _ []string, rows [][]any) (int64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.tables = append(f.tables, table)
-	for _, r := range rows {
-		f.rows = append(f.rows, append([]any(nil), r...))
-	}
-	return int64(len(rows)), nil
-}
-
-// withFakeTimescale swaps the sink constructor for one over db, restoring it
-// when the test finishes.
-func withFakeTimescale(t *testing.T, db *fakeSinkDB) {
-	t.Helper()
-	original := newTimescaleSink
-	newTimescaleSink = func(ctx context.Context, _ string, cfg sink.TimescaleConfig) (stream.Sink, error) {
-		return sink.NewTimescaleWithDatabase(ctx, db, cfg)
-	}
-	t.Cleanup(func() { newTimescaleSink = original })
-}
-
-// parquetKinds reads the kind column back out of every part file in dir, which
-// is how a user queries the archive.
-func parquetKinds(t *testing.T, dir string) []string {
-	t.Helper()
-
-	db, err := sql.Open("duckdb", "")
+func (w *webhookRequests) record(r *http.Request) {
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		t.Fatalf("opening duckdb: %v", err)
+		return
 	}
-	defer func() { _ = db.Close() }()
-
-	pattern := strings.ReplaceAll(filepath.Join(dir, "*.parquet"), "'", "''")
-	rows, err := db.Query("SELECT kind FROM read_parquet('" + pattern + "') ORDER BY id")
-	if err != nil {
-		t.Fatalf("reading parts: %v", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var kinds []string
-	for rows.Next() {
-		var k string
-		if err := rows.Scan(&k); err != nil {
-			t.Fatalf("scanning kind: %v", err)
-		}
-		kinds = append(kinds, k)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterating parts: %v", err)
-	}
-	return kinds
+	w.mu.Lock()
+	w.bodies = append(w.bodies, body)
+	w.headers = append(w.headers, r.Header.Clone())
+	w.mu.Unlock()
 }
 
-// TestEventsCommandParquetSink exercises the flag the way a user would: a
-// stream, a directory, and queryable Parquet at the end.
-func TestEventsCommandParquetSink(t *testing.T) {
-	srv := fakerpc.NewServer(fakerpc.MakeEvents(1000, 4), fakerpc.WithPageLimit(10))
+func (w *webhookRequests) snapshot() ([][]byte, []http.Header) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([][]byte(nil), w.bodies...), append([]http.Header(nil), w.headers...)
+}
+
+func TestWebhookSinkEndToEnd(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(11000, 3), fakerpc.WithPageLimit(10))
 	withFake(t, srv)
 
-	dir := t.TempDir()
-	stdout, _, err := run(t, "events", "--from", "1000", "--parquet-dir", dir,
-		"--batch-size", "3", "--rpc-url", "http://127.0.0.1:1")
+	requests := &webhookRequests{}
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.record(r)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer hook.Close()
+
+	stdout, _, err := run(t, "events", "--from", "11000", "--json",
+		"--webhook-url", hook.URL,
+		"--webhook-secret", "s3cret",
+		"--webhook-batch-size", "2",
+		"--webhook-timeout", "50ms")
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if stdout != "" {
-		t.Errorf("records were also written to stdout:\n%s", stdout)
+	if got := len(nonEmptyLines(stdout)); got != 3 {
+		t.Errorf("stdout has %d records, want 3 alongside the webhook", got)
 	}
 
-	parts, err := filepath.Glob(filepath.Join(dir, "*.parquet"))
-	if err != nil {
-		t.Fatalf("globbing parts: %v", err)
+	bodies, headers := requests.snapshot()
+	if len(bodies) == 0 {
+		t.Fatal("webhook received no requests")
 	}
-	if len(parts) != 2 {
-		t.Fatalf("wrote %d part files, want 2 for 4 records at batch size 3: %v", len(parts), parts)
-	}
-	kinds := parquetKinds(t, dir)
-	if len(kinds) != 4 {
-		t.Fatalf("read back %d rows, want 4", len(kinds))
-	}
-	for _, k := range kinds {
-		if k != "event" {
-			t.Errorf("row kind = %q, want event", k)
+	total := 0
+	for i, body := range bodies {
+		var envelope struct {
+			Delivery string            `json:"delivery"`
+			Records  []json.RawMessage `json:"records"`
+		}
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			t.Fatalf("webhook body is not JSON: %v\n%s", err, body)
+		}
+		total += len(envelope.Records)
+
+		timestamp := headers[i].Get("X-Prism-Timestamp")
+		mac := hmac.New(sha256.New, []byte("s3cret"))
+		mac.Write([]byte(timestamp))
+		mac.Write([]byte("."))
+		mac.Write(body)
+		want := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+		if got := headers[i].Get("X-Prism-Signature"); got != want {
+			t.Errorf("request %d signature = %q, want %q", i, got, want)
 		}
 	}
+	if total != 3 {
+		t.Errorf("webhook delivered %d records across %d requests, want 3", total, len(bodies))
+	}
 }
 
-// TestEventsCommandTimescaleSink covers the same wiring path for the database
-// sink, including the table flag.
-func TestEventsCommandTimescaleSink(t *testing.T) {
-	db := &fakeSinkDB{}
-	withFakeTimescale(t, db)
+func TestCloudSinkEndToEnd(t *testing.T) {
+	t.Setenv(gcsTokenEnvVar, "test-token")
 
-	srv := fakerpc.NewServer(fakerpc.MakeEvents(2000, 3), fakerpc.WithPageLimit(10))
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(12000, 3), fakerpc.WithPageLimit(10))
 	withFake(t, srv)
 
-	stdout, _, err := run(t, "events", "--from", "2000",
-		"--timescale-dsn", "postgres://example/db",
-		"--timescale-table", "analytics.prism",
-		"--rpc-url", "http://127.0.0.1:1")
-	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
+	type upload struct {
+		path        string
+		query       string
+		authorized  string
+		contentType string
+		body        []byte
 	}
-	if stdout != "" {
-		t.Errorf("records were also written to stdout:\n%s", stdout)
-	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if len(db.rows) != 3 {
-		t.Fatalf("wrote %d rows, want 3", len(db.rows))
-	}
-	if len(db.tables) != 1 || db.tables[0] != "analytics.prism" {
-		t.Errorf("copied into %v, want analytics.prism once", db.tables)
-	}
-	if len(db.execs) != 2 {
-		t.Errorf("issued %d schema statements, want 2", len(db.execs))
-	}
-}
-
-// TestEventsCommandClosesSinkOnGap proves the final batch is not lost when the
-// stream ends in an error, which is the path a retention gap takes.
-func TestEventsCommandClosesSinkOnGap(t *testing.T) {
-	srv := fakerpc.NewServer(fakerpc.MakeEvents(5000, 40),
-		fakerpc.WithPageLimit(5),
-		fakerpc.WithScript(map[int]fakerpc.Behaviour{
-			1: {OldestLedger: 9000000},
-		}),
+	var (
+		mu      sync.Mutex
+		uploads []upload
 	)
+	store := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("reading upload: %v", err)
+		}
+		mu.Lock()
+		uploads = append(uploads, upload{
+			path:        r.URL.Path,
+			query:       r.URL.RawQuery,
+			authorized:  r.Header.Get("Authorization"),
+			contentType: r.Header.Get("Content-Type"),
+			body:        body,
+		})
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer store.Close()
+
+	stdout, _, err := run(t, "events", "--from", "12000", "--json",
+		"--cloud-provider", "gcs",
+		"--cloud-url", store.URL,
+		"--cloud-bucket", "archive",
+		"--cloud-prefix", "prism/test",
+		"--cloud-batch-records", "2",
+		"--cloud-compress=false")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := len(nonEmptyLines(stdout)); got != 3 {
+		t.Errorf("stdout has %d records, want 3 alongside the upload", got)
+	}
+
+	mu.Lock()
+	got := append([]upload(nil), uploads...)
+	mu.Unlock()
+
+	if len(got) != 2 {
+		t.Fatalf("got %d uploads, want 2 (a full chunk and the remainder on close)", len(got))
+	}
+	total := 0
+	for i, up := range got {
+		if up.path != "/upload/storage/v1/b/archive/o" {
+			t.Errorf("upload %d path = %q, want the GCS media endpoint", i, up.path)
+		}
+		if !strings.Contains(up.query, "uploadType=media") {
+			t.Errorf("upload %d query = %q, want uploadType=media", i, up.query)
+		}
+		if !strings.Contains(up.query, "prism%2Ftest%2F") {
+			t.Errorf("upload %d query = %q, want the configured key prefix", i, up.query)
+		}
+		if up.authorized != "Bearer test-token" {
+			t.Errorf("upload %d Authorization = %q, want the environment token", i, up.authorized)
+		}
+		if up.contentType != "application/x-ndjson" {
+			t.Errorf("upload %d content type = %q, want application/x-ndjson", i, up.contentType)
+		}
+		total += len(nonEmptyLines(string(up.body)))
+	}
+	if total != 3 {
+		t.Errorf("archived %d records across %d chunks, want 3", total, len(got))
+	}
+}
+
+func TestCloudSinkCompressesByDefault(t *testing.T) {
+	t.Setenv(gcsTokenEnvVar, "test-token")
+
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(12500, 1), fakerpc.WithPageLimit(10))
 	withFake(t, srv)
 
-	dir := t.TempDir()
-	_, _, err := run(t, "events", "--from", "5000", "--parquet-dir", dir,
-		"--page-size", "5", "--rpc-url", "http://127.0.0.1:1")
-	if err == nil {
-		t.Fatal("Execute() error = nil, want a gap failure")
-	}
-	if code, _ := ExitCode(err); code != 2 {
-		t.Errorf("exit code = %d, want 2", code)
+	var (
+		mu          sync.Mutex
+		body        []byte
+		contentType string
+	)
+	store := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("reading upload: %v", err)
+		}
+		mu.Lock()
+		body = raw
+		contentType = r.Header.Get("Content-Type")
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer store.Close()
+
+	if _, _, err := run(t, "events", "--from", "12500", "--json",
+		"--cloud-provider", "gcs",
+		"--cloud-url", store.URL,
+		"--cloud-bucket", "archive"); err != nil {
+		t.Fatalf("Execute() error = %v", err)
 	}
 
-	kinds := parquetKinds(t, dir)
-	if len(kinds) != 5 {
-		t.Errorf("read back %d rows after the gap, want the 5 emitted before it", len(kinds))
+	mu.Lock()
+	compressed := body
+	gotType := contentType
+	mu.Unlock()
+
+	if gotType != "application/gzip" {
+		t.Errorf("content type = %q, want application/gzip", gotType)
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		t.Fatalf("upload is not gzip: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	plain, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("reading gzip: %v", err)
+	}
+	if !strings.Contains(string(plain), `"kind":"event"`) {
+		t.Errorf("decompressed chunk does not contain the record\n%s", plain)
+	}
+}
+
+func TestSyslogSinkEndToEnd(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(13000, 3), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	listener, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	if _, _, err := run(t, "events", "--from", "13000", "--json",
+		"--syslog-address", "udp://"+listener.LocalAddr().String(),
+		"--syslog-facility", "local3"); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if err := listener.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+
+	count := 0
+	buf := make([]byte, 4096)
+	for range 3 {
+		n, _, readErr := listener.ReadFrom(buf)
+		if readErr != nil {
+			t.Fatalf("reading syslog datagram %d: %v", count, readErr)
+		}
+		message := string(buf[:n])
+		// local3 (19) * 8 + info (6) = 158.
+		if !strings.HasPrefix(message, "<158>1 ") {
+			t.Errorf("message %d = %q, want a local3 informational RFC 5424 header", count, message)
+		}
+		if !strings.Contains(message, `"kind":"event"`) {
+			t.Errorf("message %d does not carry the JSON record: %s", count, message)
+		}
+		count++
+	}
+	if count != 3 {
+		t.Errorf("received %d syslog messages, want 3", count)
+	}
+}
+
+func TestMetricsSinkServesAndReportsAddress(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(14000, 1), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	stdout, stderr, err := run(t, "events", "--from", "14000", "--json",
+		"--metrics-addr", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := len(nonEmptyLines(stdout)); got != 1 {
+		t.Errorf("stdout has %d records, want 1", got)
+	}
+	if !strings.Contains(stderr, "serving metrics on http://") || !strings.Contains(stderr, "/metrics") {
+		t.Errorf("stderr does not report the metrics address\n%s", stderr)
 	}
 }
 
 func TestSinkFlagValidation(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(15000, 1), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
 	tests := []struct {
 		name string
 		args []string
-		want string
 	}{
 		{
-			name: "two destinations",
-			args: []string{"events", "--from", "1", "--timescale-dsn", "postgres://x", "--parquet-dir", "out"},
-			want: "cannot be used together",
+			name: "webhook secret without url",
+			args: []string{"events", "--from", "15000", "--webhook-secret", "s"},
 		},
 		{
-			name: "parquet with json",
-			args: []string{"events", "--from", "1", "--parquet-dir", "out", "--json"},
-			want: "stdout output",
+			name: "cloud bucket without url",
+			args: []string{"events", "--from", "15000", "--cloud-bucket", "b"},
 		},
 		{
-			name: "timescale with raw",
-			args: []string{"events", "--from", "1", "--timescale-dsn", "postgres://x", "--raw"},
-			want: "stdout output",
+			name: "unknown cloud provider",
+			args: []string{"events", "--from", "15000",
+				"--cloud-url", "https://example.com", "--cloud-bucket", "b", "--cloud-provider", "ftp"},
 		},
 		{
-			name: "negative batch",
-			args: []string{"events", "--from", "1", "--parquet-dir", "out", "--batch-size", "-1"},
-			want: "--batch-size",
+			name: "unknown syslog format",
+			args: []string{"events", "--from", "15000",
+				"--syslog-address", "udp://127.0.0.1:514", "--syslog-format", "cef"},
 		},
 		{
-			name: "negative flush interval",
-			args: []string{"events", "--from", "1", "--parquet-dir", "out", "--flush-interval", "-1s"},
-			want: "--flush-interval",
+			name: "unknown syslog facility",
+			args: []string{"events", "--from", "15000",
+				"--syslog-address", "udp://127.0.0.1:514", "--syslog-facility", "nowhere"},
 		},
 		{
-			name: "unknown compression",
-			args: []string{"events", "--from", "1", "--parquet-dir", t.TempDir(), "--parquet-compression", "brotli"},
-			want: "compression",
-		},
-		{
-			name: "unusable table name",
-			args: []string{"events", "--from", "1", "--timescale-dsn", "postgres://x", "--timescale-table", "a;drop"},
-			want: "identifier",
+			name: "negative webhook batch",
+			args: []string{"events", "--from", "15000",
+				"--webhook-url", "https://example.com/hook", "--webhook-batch-size", "-1"},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			// The unreachable RPC proves validation happens before any call.
-			args := append(tc.args, "--rpc-url", "http://127.0.0.1:1")
-			_, _, err := run(t, args...)
-			if err == nil {
+			if _, _, err := run(t, tc.args...); err == nil {
 				t.Fatal("Execute() error = nil, want a validation failure")
-			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Errorf("error = %q, want it to mention %q", err, tc.want)
 			}
 		})
 	}
 }
 
-// TestSinkFlagsAppearInHelp keeps the documented flags discoverable.
-func TestSinkFlagsAppearInHelp(t *testing.T) {
+func TestCloudS3NeedsCredentials(t *testing.T) {
+	t.Setenv(awsAccessKeyEnvVar, "")
+	t.Setenv(awsSecretKeyEnvVar, "")
+
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(16000, 1), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	_, _, err := run(t, "events", "--from", "16000",
+		"--cloud-provider", "s3",
+		"--cloud-url", "https://s3.example.com",
+		"--cloud-bucket", "bucket")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want a missing-credentials failure")
+	}
+	if !strings.Contains(err.Error(), awsAccessKeyEnvVar) {
+		t.Errorf("error = %q, want it to name %s", err, awsAccessKeyEnvVar)
+	}
+}
+
+func TestStreamingHelpAdvertisesSinkFlags(t *testing.T) {
 	stdout, _, err := run(t, "events", "--help")
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	for _, want := range []string{
-		"--timescale-dsn", "--timescale-table",
-		"--parquet-dir", "--parquet-compression",
-		"--batch-size", "--flush-interval",
+	for _, flag := range []string{
+		"--webhook-url", "--webhook-secret", "--cloud-provider", "--cloud-bucket",
+		"--metrics-addr", "--syslog-address", "--syslog-format", "--syslog-facility",
 	} {
-		if !strings.Contains(stdout, want) {
-			t.Errorf("help does not mention %q", want)
-		}
-	}
-}
-
-// TestSinkEnabledOnLedgerAndTransactionCommands checks the flags are shared
-// rather than bolted onto one command.
-func TestSinkEnabledOnLedgerAndTransactionCommands(t *testing.T) {
-	for _, command := range []string{"ledgers", "transactions", "events"} {
-		stdout, _, err := run(t, command, "--help")
-		if err != nil {
-			t.Fatalf("%s --help error = %v", command, err)
-		}
-		if !strings.Contains(stdout, "--parquet-dir") {
-			t.Errorf("%s --help does not offer --parquet-dir", command)
+		if !strings.Contains(stdout, flag) {
+			t.Errorf("help does not mention %s", flag)
 		}
 	}
 }

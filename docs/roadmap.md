@@ -13,6 +13,8 @@ Working and tested:
 - `prism completion` and `prism gendocs` — shell completion and reference docs
 - `--color auto|always|never` honoring `NO_COLOR`
 - NDJSON on everything, flushed per record or per `--batch`
+- Optional webhook, S3/GCS, Prometheus and syslog/journald sinks, composed
+  with stdout through a fanout
 - `--from` backfill, draining full pages at network speed, optionally with
   `--backfill-workers`
 - `--since 10m` — relative windows converted to approximate start ledgers
@@ -84,23 +86,11 @@ sinks are unchanged. A good first substantial contribution.
 
 ## Later, and less certain
 
-### Alternative sinks
-
-The `Sink` seam makes these small: a webhook poster, an S3/GCS writer, Kafka.
-Base64 output, PostgreSQL and Parquet now exist; further destinations are worth
-adding when someone actually needs one rather than speculatively — each adds
-configuration surface and failure modes.
-
 ### Horizon as a second backend
 
 Horizon offers SSE streaming for classic operations, which would genuinely be
 push rather than polling. It is a different API shape and a different data
 model, so it would be a second `Source` family rather than a drop-in.
-
-### Prometheus metrics
-
-Only if prism becomes something people run as a daemon. A CLI that exits does
-not need a metrics endpoint.
 
 ## Explicitly not planned
 

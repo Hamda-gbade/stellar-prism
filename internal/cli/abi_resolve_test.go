@@ -611,6 +611,10 @@ func (streamOnlyClient) GetEvents(context.Context, protocol.GetEventsRequest) (p
 	return protocol.GetEventsResponse{}, nil
 }
 
+func (streamOnlyClient) GetEventsBatch(context.Context, []protocol.GetEventsRequest) ([]protocol.GetEventsResponse, error) {
+	return nil, nil
+}
+
 func (streamOnlyClient) GetLedgers(context.Context, protocol.GetLedgersRequest) (protocol.GetLedgersResponse, error) {
 	return protocol.GetLedgersResponse{}, nil
 }

@@ -44,6 +44,8 @@ type streamFlags struct {
 	process          func([]stream.Record) ([]stream.Record, error)
 	filter           stream.RecordFilter
 
+	sinks sinkFlags
+
 	output         string
 	rotateSize     int64
 	rotateInterval time.Duration
@@ -145,6 +147,7 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"drop cursor metadata entries older than this (0 keeps entries regardless of age)")
 	cmd.Flags().StringVar(&s.dlqFile, "dlq-file", "",
 		"append malformed or undeliverable records to this file as NDJSON instead of stopping the stream")
+	s.sinks.register(cmd)
 }
 
 // validate checks the stream options before anything is fetched.
@@ -152,6 +155,9 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 // cmd is required: it is what tells an explicitly-set flag apart from one
 // that is merely carrying its default.
 func (s *streamFlags) validate(cmd *cobra.Command) error {
+	if err := s.sinks.validate(); err != nil {
+		return err
+	}
 	if cmd.Flags().Changed("since") {
 		if s.from != 0 {
 			return fmt.Errorf("--from and --since are mutually exclusive; pass only one")
@@ -270,6 +276,13 @@ func (s *streamFlags) newSink(
 		out = rotator
 	}
 
+	base := out
+	out, err := s.sinks.addTo(base, !s.raw, onBatchError)
+	if err != nil {
+		closeSink(base)
+		return nil, err
+	}
+
 	var dlq *sink.DLQ
 	if s.dlqFile != "" {
 		file, err := os.OpenFile(s.dlqFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -297,7 +310,12 @@ func (s *streamFlags) newSink(
 	batcher := stream.NewBatcher(out, stream.BatcherOptions{
 		MaxRecords: s.batchSize,
 		MaxDelay:   s.batchTimeout,
-		OnError:    onBatchError,
+		OnError: func(err error) {
+			if s.sinks.metrics != nil {
+				s.sinks.metrics.RecordError("sink")
+			}
+			onBatchError(err)
+		},
 	})
 	if dlq == nil {
 		return batcher, nil
@@ -364,6 +382,9 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 		GapStrategy:      strategy,
 		MaxGapRecoveries: s.maxGapRecoveries,
 		OnRetry: func(attempt int, delay time.Duration, err error) {
+			if s.sinks.metrics != nil {
+				s.sinks.metrics.RecordError("rpc")
+			}
 			if showAtLeast(attempt, s.verbosity) {
 				// Reconnection is reported on stderr so it never contaminates a
 				// piped NDJSON stream, and so a stalled tail explains itself
@@ -373,6 +394,9 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 			}
 		},
 		OnGap: func(event stream.GapEvent) {
+			if s.sinks.metrics != nil {
+				s.sinks.metrics.RecordError("gap")
+			}
 			if showAtLeast(1, s.verbosity) && event.Recovered {
 				fmt.Fprintf(stderr,
 					"prism: %v; recovering by resuming at ledger %d\n",
@@ -672,6 +696,11 @@ func runStream(
 	})
 	if err != nil {
 		return err
+	}
+	if sf.sinks.metrics != nil {
+		if addr := sf.sinks.metrics.Addr(); addr != "" {
+			fmt.Fprintf(stderr, "prism: serving metrics on http://%s/metrics\n", addr)
+		}
 	}
 	localOut := out
 	var shutdown func()
