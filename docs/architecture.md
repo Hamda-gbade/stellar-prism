@@ -83,6 +83,7 @@ pkg/sink/
   ndjson.go           NDJSON, one object per line
   human.go            terminal output, payloads via lens
   file_rotator.go     size/time rotating file sink, optional gzip
+  dlq.go              dead letter queue for malformed or undeliverable records
 ```
 
 ## The state machine
@@ -419,6 +420,8 @@ feature adds to the public surface:
 | `stream.Options.OnPage`, `stream.Options.StartCursor` | `pkg/stream/tail.go` |
 | `stream.DrainerConfig.OnPage` | `pkg/stream/drainer.go` |
 | `--state-file`, `--resume`, `--prune-interval`, `--prune-keep`, `--prune-max-age` | every streaming command |
+| `sink.DLQ`, `sink.DLQEntry`, `sink.DLQOptions`, `sink.DLQStats`, `sink.NewDLQ`, `sink.ValidateRecord` | `pkg/sink/dlq.go` |
+| `--dlq-file` | every streaming command |
 
 `stream.Pruner` and `stream.FileMetadataStore` are new types rather than
 changes to existing ones, so a caller that ignores them compiles and behaves
@@ -442,6 +445,68 @@ Rotated files are named `<path>.<UTC timestamp>` (plus `.gz` when
 compressed). Rotation is synchronous; the active file is reopened before
 pruning, so a failed prune cannot stop the stream. `--rotate-*` without
 `--output-file` is rejected.
+
+## Dead letter queue (`--dlq-file`)
+
+A long-running tail must not die because one record is malformed or one write
+fails. `--dlq-file` wraps the chosen sink in `sink.DLQ`, which records the
+failure and keeps the stream running:
+
+```
+                      ┌──────────────┐
+   Tailer ── Record ─►│ sink.DLQ     ├──► chosen sink ──► stdout / --output-file
+                      │              │
+                      │   failure    ├──► --dlq-file (NDJSON, append)
+                      └──────────────┘
+```
+
+The wrapper implements both `stream.Sink` and `stream.BatchSink`, so every
+streaming command gains it without knowing it exists.
+
+| Field | Meaning |
+|---|---|
+| `kind` | always `"dlq"`, so a queue file is distinguishable from stream NDJSON |
+| `stage` | `validation`, `delivery` or `flush` |
+| `error` | the failure that prevented delivery |
+| `failedAt` | UTC timestamp, injectable through `DLQOptions.Now` |
+| `record` | the original record, preserved field-for-field; absent for `flush` |
+
+Two classes of failure are captured:
+
+- **Validation.** `sink.ValidateRecord` checks the structural contract every
+  sink relies on: a non-empty ID, a known `Kind`, and a payload pointer that
+  matches that kind. It deliberately does *not* reject XDR that lens cannot
+  decode — the built-in sinks already report that inline, and treating a
+  display problem as a delivery failure would be wrong.
+- **Delivery.** If the wrapped sink's `Emit` returns an error, the record is
+  written to the queue and the error is swallowed. Only a failure to write the
+  dead letter itself is returned, because at that point the record would vanish
+  with no trace. A primary `Flush` failure is captured as a `flush` entry for
+  the same reason: the per-record failures are already accounted for, and
+  failing the command at shutdown would defeat the queue's purpose.
+
+A captured record counts as delivered, so the tailer advances its cursor past
+it. The queue is the durable copy: replay its `record` field through a sink if
+the primary output must be complete. This is deliberate — blocking the cursor
+on a record the primary can never write would stall the stream forever — and
+it is why the queue is append-only and flushed per entry.
+
+`EmitBatch` validates and delivers one record at a time. A batch sink can fail
+part-way through a batch, after some records were written, so forwarding the
+whole batch again would duplicate them and forwarding nothing would lose them.
+Per-record isolation is what makes every failure attributable; the trade-off
+is that a DLQ-wrapped run does not amortise the wrapped sink's flushes. The
+batcher still controls when the tailer hands records over.
+
+The DLQ starts no goroutines. `Close` flushes the queue, closes the wrapped
+sink when it implements `io.Closer`, and closes the queue writer (when
+`CloseWriter` is set) — so `Ctrl-C`, a failed run and a normal exit all leave
+nothing open behind. It is idempotent, and each `Close` performs the flush it
+needs rather than returning early.
+
+`--dlq-file` is append-only and must differ from `--output-file`. Without
+`--dlq-file` the sink chain is unchanged: nothing is opened and no wrapper is
+inserted.
 
 ## Testing the guarantee
 
@@ -474,6 +539,14 @@ when it does. `internal/cli` runs the whole thing end to end against
 bounded while the stream runs, and a second run that picks up where the
 first stopped.
 
+The dead letter queue is covered at both levels. `pkg/sink` tests every
+validation branch, delivery and flush failures (including a writer that
+fails like a full disk), batch attribution, and idempotent close against a
+real file. `internal/cli` runs `runStream` with a source that emits one valid
+record and one malformed record, then asserts that the valid record reached
+stdout, the malformed one reached `--dlq-file`, and the command exited
+successfully — the end-to-end shape of "a bad record does not crash a tail".
+
 Time is injected via `Clock`, so there are no real sleeps and no wall-clock
 flakiness. Follow-loop tests carry a sleep budget that cancels the context, so
 a regression that stops the tailer terminating **fails** rather than hanging
@@ -493,6 +566,9 @@ The invariants were verified by breaking the code on purpose:
 | Diagnostics written to stderr without serialisation | `TestSyncWriterSerialisesConcurrentWrites` fails with a `DATA RACE` report from the race detector |
 | Prune keeping the oldest entries | `TestFileMetadataStorePruneKeepsTheNewestPerKey` fails |
 | Final compaction at shutdown removed | `TestEventsCommandPrunesTheStateFile` fails: 10 checkpoints left instead of 2 |
+| DLQ swallowing a failure without recording it | `TestDLQCapturesDeliveryFailure` fails: no dead letter on disk |
+| DLQ returning a captured delivery failure | `TestDLQCapturesDeliveryFailure` fails: `Emit()` returned the error |
+| DLQ closing without flushing | `TestDLQClosesWriterAndPrimaryIdempotently` fails: the queue file is empty |
 
 If you change the state machine, re-run that exercise. A test suite that
 cannot fail is not protecting anything.

@@ -424,7 +424,7 @@ func TestEventsHelpAdvertisesStreamOptions(t *testing.T) {
 	}
 	for _, flag := range []string{
 		"--backfill-workers", "--batch", "--batch-size", "--batch-timeout",
-		"--gap-strategy", "--max-gap-recoveries",
+		"--gap-strategy", "--max-gap-recoveries", "--dlq-file",
 	} {
 		if !strings.Contains(stdout, flag) {
 			t.Errorf("help does not mention %s", flag)

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -50,6 +51,10 @@ type streamFlags struct {
 	pruneInterval time.Duration
 	pruneKeep     int
 	pruneMaxAge   time.Duration
+
+	// dlqFile is the optional dead letter queue. When set, records that fail
+	// validation or delivery are written there instead of stopping the run.
+	dlqFile string
 
 	// stateKey identifies this stream inside the cursor metadata file. Two
 	// runs share a key only when they watch the same thing, so a recorded
@@ -110,6 +115,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"keep at most this many cursor metadata entries per stream (0 keeps all)")
 	cmd.Flags().DurationVar(&s.pruneMaxAge, "prune-max-age", 0,
 		"drop cursor metadata entries older than this (0 keeps entries regardless of age)")
+	cmd.Flags().StringVar(&s.dlqFile, "dlq-file", "",
+		"append malformed or undeliverable records to this file as NDJSON instead of stopping the stream")
 }
 
 // validate checks the stream options before anything is fetched.
@@ -139,10 +146,24 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 			return fmt.Errorf("--rotate-* flags require --output-file")
 		}
 	}
+	if s.dlqFile != "" && s.output != "" && samePath(s.dlqFile, s.output) {
+		return fmt.Errorf("--dlq-file must differ from --output-file")
+	}
 	if err := s.validateState(cmd); err != nil {
 		return err
 	}
 	return nil
+}
+
+// samePath reports whether two paths name the same file, even when one is
+// relative and the other absolute.
+func samePath(a, b string) bool {
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	if errA == nil && errB == nil {
+		return absA == absB
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
 }
 
 // validateState checks the cursor metadata options.
@@ -177,9 +198,16 @@ func (s *streamFlags) validateState(cmd *cobra.Command) error {
 //
 // With --output-file the chosen format is built on top of a rotating writer,
 // so every streaming command supports rotation without its own plumbing. When
-// --batch is set the result is wrapped in a batcher that flushes into the
+// --dlq-file is set the result is wrapped in a dead letter queue, so malformed
+// records and delivery failures are recorded instead of ending the stream.
+// When --batch is set the result is wrapped in a batcher that flushes into the
 // underlying sink, so rotation still sees whole batches.
-func (s *streamFlags) newSink(w io.Writer, colorMode string, onBatchError func(error)) (stream.Sink, error) {
+func (s *streamFlags) newSink(
+	w io.Writer,
+	colorMode string,
+	onBatchError func(error),
+	onDeadLetter func(sink.DLQEntry),
+) (stream.Sink, error) {
 	build := func(out io.Writer) stream.Sink {
 		if s.asJSON {
 			return sink.NewNDJSON(out, !s.raw)
@@ -203,14 +231,66 @@ func (s *streamFlags) newSink(w io.Writer, colorMode string, onBatchError func(e
 		out = rotator
 	}
 
+	var dlq *sink.DLQ
+	if s.dlqFile != "" {
+		file, err := os.OpenFile(s.dlqFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			closeSink(out)
+			return nil, fmt.Errorf("opening dead letter queue: %w", err)
+		}
+
+		dlq, err = sink.NewDLQ(out, file, sink.DLQOptions{
+			CloseWriter:  true,
+			OnDeadLetter: onDeadLetter,
+		})
+		if err != nil {
+			_ = file.Close()
+			closeSink(out)
+			return nil, err
+		}
+		out = dlq
+	}
+
 	if !s.batch {
 		return out, nil
 	}
-	return stream.NewBatcher(out, stream.BatcherOptions{
+
+	batcher := stream.NewBatcher(out, stream.BatcherOptions{
 		MaxRecords: s.batchSize,
 		MaxDelay:   s.batchTimeout,
 		OnError:    onBatchError,
-	}), nil
+	})
+	if dlq == nil {
+		return batcher, nil
+	}
+	// Batcher.Close stops its timer and flushes, but it does not close what it
+	// wraps. Without this pairing, a batched run would leave the dead letter
+	// file open and its last buffer unflushed.
+	return &closingSink{
+		Sink: batcher,
+		closeFn: func() error {
+			return errors.Join(batcher.Close(), dlq.Close())
+		},
+	}, nil
+}
+
+// closingSink gives a wrapper without its own Close a teardown path. It is how
+// a sink chain tells runStream that there is more to release than the outermost
+// Batcher knows about.
+type closingSink struct {
+	stream.Sink
+	closeFn func() error
+}
+
+// Close runs the teardown registered by the code that built the chain.
+func (c *closingSink) Close() error { return c.closeFn() }
+
+// closeSink releases a sink that was built before a later construction step
+// failed, so a validation error cannot leak an open file.
+func closeSink(s stream.Sink) {
+	if closer, ok := s.(io.Closer); ok {
+		_ = closer.Close()
+	}
 }
 
 // options builds the tailer options implied by the flags.
@@ -425,6 +505,13 @@ func runStream(
 
 	out, err := sf.newSink(stdout, g.color, func(err error) {
 		fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
+	}, func(entry sink.DLQEntry) {
+		record := "-"
+		if entry.Record != nil {
+			record = entry.Record.ID
+		}
+		fmt.Fprintf(stderr, "prism: dead-lettered record %s (%s): %s\n",
+			record, entry.Stage, entry.Error)
 	})
 	if err != nil {
 		return err
