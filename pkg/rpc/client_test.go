@@ -117,6 +117,57 @@ func TestResolveURL(t *testing.T) {
 	}
 }
 
+func TestResolveURLs(t *testing.T) {
+	tests := []struct {
+		name  string
+		flags []string
+		env   string
+		want  []string
+	}{
+		{
+			name:  "flags win in order",
+			flags: []string{"https://a.example", "https://b.example"},
+			env:   "https://env.example",
+			want:  []string{"https://a.example", "https://b.example"},
+		},
+		{
+			name:  "blank flags are ignored",
+			flags: []string{"", " https://a.example "},
+			env:   "https://env.example",
+			want:  []string{"https://a.example"},
+		},
+		{
+			name: "comma-separated environment",
+			env:  "https://a.example, https://b.example",
+			want: []string{"https://a.example", "https://b.example"},
+		},
+		{
+			name: "default when neither is set",
+			want: []string{rpc.DefaultURL},
+		},
+		{
+			name: "blank environment is ignored",
+			env:  "   ",
+			want: []string{rpc.DefaultURL},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(rpc.URLEnvVar, tc.env)
+			got := rpc.ResolveURLs(tc.flags)
+			if len(got) != len(tc.want) {
+				t.Fatalf("ResolveURLs(%v) = %v, want %v", tc.flags, got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("ResolveURLs(%v)[%d] = %q, want %q", tc.flags, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
 // TestDefaultURLIsTestnet guards the promise that prism works with no
 // configuration, and that it does not default to mainnet.
 func TestDefaultURLIsTestnet(t *testing.T) {

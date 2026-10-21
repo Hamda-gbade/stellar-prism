@@ -306,3 +306,57 @@ func TestSinksRejectUnknownKind(t *testing.T) {
 		t.Error("Human.Emit(unknown kind) error = nil, want an error")
 	}
 }
+
+func TestNDJSONEmitBatch(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	s := sink.NewNDJSON(&buf, true)
+	records := []stream.Record{eventRecord(), eventRecord(), eventRecord()}
+	if err := s.EmitBatch(records); err != nil {
+		t.Fatalf("EmitBatch() error = %v", err)
+	}
+	if got := len(strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")); got != len(records) {
+		t.Fatalf("EmitBatch() emitted %d lines, want %d\n%s", got, len(records), buf.String())
+	}
+}
+
+func TestHumanEmitBatch(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	s := sink.NewHuman(&buf, lensformat.NoColor, true)
+	records := []stream.Record{eventRecord(), eventRecord(), eventRecord()}
+	if err := s.EmitBatch(records); err != nil {
+		t.Fatalf("EmitBatch() error = %v", err)
+	}
+	if got := strings.Count(buf.String(), "ledger 100"); got != len(records) {
+		t.Fatalf("EmitBatch() rendered %d records, want %d\n%s", got, len(records), buf.String())
+	}
+}
+
+func TestEventCallTreeMetadataRendersInHumanAndNDJSON(t *testing.T) {
+	t.Parallel()
+	r := eventRecord()
+	r.Event.CallDepth = 2
+	r.Event.ParentContractID = "CPARENT"
+	r.Event.InvocationPath = []string{"CROUTER", "CPAIR", "CTOKEN"}
+	var human bytes.Buffer
+	if err := sink.NewHuman(&human, lensformat.NoColor, false).Emit(r); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(human.String(), "└─ [call 2]") || !strings.Contains(human.String(), "from CPARENT") {
+		t.Fatalf("human event omitted call tree details:\n%s", human.String())
+	}
+	var ndjson bytes.Buffer
+	if err := sink.NewNDJSON(&ndjson, false).Emit(r); err != nil {
+		t.Fatal(err)
+	}
+	var line map[string]any
+	if err := json.Unmarshal(ndjson.Bytes(), &line); err != nil {
+		t.Fatal(err)
+	}
+	if line["callDepth"] != float64(2) || line["parentContract"] != "CPARENT" {
+		t.Fatalf("NDJSON call tree fields = %v", line)
+	}
+}

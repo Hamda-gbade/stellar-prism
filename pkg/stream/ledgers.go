@@ -17,6 +17,10 @@ const DefaultLedgerPageLimit = 50
 
 // LedgerQuery describes which ledgers to stream.
 type LedgerQuery struct {
+	// Consensus enables signed-value diagnostics and consecutive close deltas.
+	Consensus bool
+	// ExpectedValidators are expected value signers, not a quorum definition.
+	ExpectedValidators []string
 	// StartLedger is where a fresh stream begins. Zero means start from the
 	// server's newest ledger.
 	StartLedger uint32
@@ -26,8 +30,11 @@ type LedgerQuery struct {
 
 // LedgerSource streams ledger close metadata from RPC.
 type LedgerSource struct {
-	client rpc.Client
-	query  LedgerQuery
+	client           rpc.Client
+	query            LedgerQuery
+	previousSequence uint32
+	previousTime     uint64
+	cached           map[uint32]*ConsensusMetrics
 }
 
 // NewLedgerSource returns a Source over the given RPC client.
@@ -40,6 +47,13 @@ func NewLedgerSource(client rpc.Client, q LedgerQuery) *LedgerSource {
 
 // Name implements Source.
 func (s *LedgerSource) Name() string { return "ledgers" }
+
+// Rewind implements Rewinder, repositioning a fresh fetch at ledger.
+func (s *LedgerSource) Rewind(ledger uint32) {
+	s.query.StartLedger = ledger
+	s.previousSequence = 0
+	s.cached = nil
+}
 
 // CursorLedger implements Source. The getLedgers cursor is the ledger
 // sequence in decimal.
@@ -83,7 +97,48 @@ func (s *LedgerSource) Fetch(ctx context.Context, cursor string) (Batch, error) 
 		Full:       uint(len(resp.Ledgers)) >= s.query.PageLimit,
 	}
 	for _, l := range resp.Ledgers {
-		batch.Records = append(batch.Records, ledgerRecord(l))
+		r := ledgerRecord(l)
+		if s.query.Consensus {
+			m, ok := s.cached[l.Sequence]
+			if !ok {
+				m = consensusMetrics(l.LedgerHeader)
+				if m.Error == "" {
+					if s.previousSequence != 0 && s.previousSequence+1 == l.Sequence {
+						delta := int64(m.CloseTime) - int64(s.previousTime)
+						m.CloseDeltaSeconds = &delta
+						if delta > 10 {
+							m.Warnings = append(m.Warnings, "consensus latency spike: close delta exceeds 10s")
+						}
+						if delta < 0 {
+							m.Warnings = append(m.Warnings, "ledger close time moved backwards")
+						}
+					}
+					for _, expected := range s.query.ExpectedValidators {
+						found := false
+						for _, signer := range m.ValueSigners {
+							if expected == signer {
+								found = true
+							}
+						}
+						if !found {
+							m.Warnings = append(m.Warnings, "expected value signer not observed: "+expected)
+						}
+					}
+					if l.Sequence > s.previousSequence {
+						s.previousSequence = l.Sequence
+						s.previousTime = m.CloseTime
+					}
+				}
+			}
+			r.Close.Consensus = m
+		}
+		batch.Records = append(batch.Records, r)
+	}
+	if s.query.Consensus {
+		s.cached = make(map[uint32]*ConsensusMetrics, len(batch.Records))
+		for _, r := range batch.Records {
+			s.cached[r.Sequence] = r.Close.Consensus
+		}
 	}
 	return batch, nil
 }

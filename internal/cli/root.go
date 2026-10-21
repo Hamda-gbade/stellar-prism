@@ -9,7 +9,6 @@
 package cli
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/stellar-optics/stellar-prism/pkg/rpc"
+	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
 // Version is the build version, overridden at release time via ldflags:
@@ -26,26 +26,71 @@ var Version = "dev"
 
 // newClient constructs the RPC client used by every command.
 //
-// It is a variable so tests can substitute an in-memory fake and exercise the
-// commands end to end without a network. Production code never reassigns it.
-var newClient = func(url string, timeout time.Duration) rpc.Client {
-	return rpc.New(url, timeout)
+// More than one URL produces a stream.Pool, so every command gains failover
+// without knowing about it. It is a variable so tests can substitute an
+// in-memory fake and exercise the commands end to end without a network.
+// Production code never reassigns it.
+var newClient = func(urls []string, timeout time.Duration) (rpc.Client, error) {
+	if len(urls) == 1 {
+		return rpc.New(urls[0], timeout), nil
+	}
+	return stream.NewPool(urls, stream.WithClientFactory(func(url string) rpc.Client {
+		return rpc.New(url, timeout)
+	}))
+}
+
+// client resolves the configured endpoints and builds the client every
+// command shares.
+func client(g *globalFlags) (rpc.Client, error) {
+	return newClient(rpc.ResolveURLs(g.rpcURLs), g.timeout)
+}
+
+// openClient resolves the configured endpoints, builds the client and returns
+// the deferrable cleanup every command uses.
+func openClient(g *globalFlags, stderr io.Writer) (rpc.Client, func(), error) {
+	c, err := client(g)
+	if err != nil {
+		return nil, nil, err
+	}
+	return c, func() { closeClient(c, stderr) }, nil
+}
+
+// closeClient releases a client and reports a failure on stderr. Closing a
+// pool stops its health probe; for a single client it simply releases HTTP
+// resources, so the failure is not worth aborting an otherwise finished
+// command over.
+func closeClient(c rpc.Client, stderr io.Writer) {
+	closer, ok := c.(io.Closer)
+	if !ok {
+		return
+	}
+	if err := closer.Close(); err != nil {
+		fmt.Fprintf(stderr, "prism: closing rpc client: %v\n", err)
+	}
 }
 
 // globalFlags holds options shared by every subcommand.
 type globalFlags struct {
+	serveSSE string
+	serveWS  string
 	// color is one of "auto", "always" or "never", matching lens.
 	color string
-	// rpcURL overrides the endpoint; empty falls back to the environment.
-	rpcURL string
+	// rpcURLs overrides the endpoints; empty falls back to the environment.
+	// Repeating the flag builds a failover pool.
+	rpcURLs []string
 	// timeout bounds a single RPC call.
 	timeout time.Duration
 }
 
 // Execute builds and runs the root command, returning an error rather than
 // exiting so main keeps control of the exit code.
-func Execute(args []string, stdout, stderr io.Writer) error {
+//
+// extra commands are attached to the root before execution, which lets the
+// binary add commands whose implementation belongs in package main (such as
+// the documentation generator) without growing this package's dependencies.
+func Execute(args []string, stdout, stderr io.Writer, extra ...*cobra.Command) error {
 	root := newRootCmd(stdout, stderr)
+	root.AddCommand(extra...)
 	root.SetArgs(args)
 	return root.Execute()
 }
@@ -86,6 +131,10 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
   prism tx 3389e9f0...`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			_, err := parseColorMode(g.color)
+			return err
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return cmd.Help()
 		},
@@ -96,17 +145,29 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
 
 	root.PersistentFlags().StringVar(&g.color, "color", "auto",
 		`when to colourise output: "auto", "always" or "never"`)
-	root.PersistentFlags().StringVar(&g.rpcURL, "rpc-url", "",
-		"Soroban RPC endpoint (default $"+rpc.URLEnvVar+", else "+rpc.DefaultURL+")")
+	root.PersistentFlags().StringArrayVar(&g.rpcURLs, "rpc-url", nil,
+		"Soroban RPC endpoint; repeat for a failover pool (default $"+rpc.URLEnvVar+", else "+rpc.DefaultURL+")")
 	root.PersistentFlags().DurationVar(&g.timeout, "rpc-timeout", 30*time.Second,
 		"timeout for a single RPC call")
+	registerFlagCompletion(root, "color", string(colorAuto), string(colorAlways), string(colorNever))
 
+	root.PersistentFlags().StringVar(&g.serveSSE, "serve-sse", "", "broadcast SSE at this listen address (/events); retains 1024 records for replay")
+	root.PersistentFlags().StringVar(&g.serveSSE, "sse", "", "alias for --serve-sse")
+	root.PersistentFlags().StringVar(&g.serveWS, "ws", "", "broadcast WebSocket events at this listen address (/events or /ws)")
 	root.AddCommand(
+		newServeCmd(g, stdout, stderr),
 		newEventsCmd(g, stdout, stderr),
 		newLedgersCmd(g, stdout, stderr),
 		newTransactionsCmd(g, stdout, stderr),
-		newTxCmd(g, stdout),
+		newOperationsCmd(g, stdout, stderr),
+		newSimulateCmd(g, stdout, stderr),
+		newABICmd(g, stdout, stderr),
+		newStorageCmd(g, stdout, stderr),
+		newWASMCmd(g, stdout, stderr),
+		newHealthCmd(g, stdout, stderr),
+		newTxCmd(g, stdout, stderr),
 		newVersionCmd(stdout),
+		newCompletionCmd(stdout),
 	)
 	return root
 }
@@ -123,27 +184,8 @@ func newVersionCmd(stdout io.Writer) *cobra.Command {
 	}
 }
 
-// exitError carries an explicit process exit code.
-type exitError struct {
-	code int
-	msg  string
-}
-
-func (e *exitError) Error() string { return e.msg }
-
 // ExitCode maps an error to a process exit code, and reports whether it
 // should be printed.
-//
 // The meanings match lens: 0 success, 1 error, 2 a specific negative outcome
 // the caller may want to branch on. Here 2 means the stream gapped, which is
 // distinguishable from an ordinary failure so CI can treat it differently.
-func ExitCode(err error) (code int, printable bool) {
-	if err == nil {
-		return 0, false
-	}
-	var ee *exitError
-	if errors.As(err, &ee) {
-		return ee.code, false
-	}
-	return 1, true
-}

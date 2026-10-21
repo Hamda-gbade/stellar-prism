@@ -21,7 +21,7 @@ import (
 func withFake(t *testing.T, srv *fakerpc.Server) {
 	t.Helper()
 	original := newClient
-	newClient = func(string, time.Duration) rpc.Client { return srv }
+	newClient = func([]string, time.Duration) (rpc.Client, error) { return srv, nil }
 	t.Cleanup(func() { newClient = original })
 }
 
@@ -329,4 +329,305 @@ func nonEmptyLines(s string) []string {
 		}
 	}
 	return out
+}
+
+func TestEventsCommandGapResume(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(6000, 35),
+		fakerpc.WithPageLimit(5),
+		fakerpc.WithScript(map[int]fakerpc.Behaviour{
+			1: {OldestLedger: 6010},
+		}),
+	)
+	withFake(t, srv)
+
+	stdout, stderr, err := run(t, "events", "--from", "6000", "--json",
+		"--page-size", "5", "--gap-strategy", "resume")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	lines := nonEmptyLines(stdout)
+	if len(lines) != 30 {
+		t.Fatalf("emitted %d records after resuming, want 30\n%s", len(lines), stdout)
+	}
+	if !strings.Contains(stderr, "recovering by resuming at ledger 6010") {
+		t.Errorf("stderr does not explain the recovery\n%s", stderr)
+	}
+}
+
+func TestEventsCommandBackfillWorkers(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(9000, 30), fakerpc.WithPageLimit(5))
+	withFake(t, srv)
+
+	stdout, _, err := run(t, "events", "--from", "9000", "--json", "--page-size", "5", "--backfill-workers", "3")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := len(nonEmptyLines(stdout)); got != 30 {
+		t.Errorf("emitted %d records with backfill workers, want 30\n%s", got, stdout)
+	}
+}
+
+func TestEventsCommandBatching(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(10000, 20), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	stdout, _, err := run(t, "events", "--from", "10000", "--json",
+		"--batch", "--batch-size", "3", "--batch-timeout", "20ms", "--limit", "7")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := len(nonEmptyLines(stdout)); got != 7 {
+		t.Errorf("emitted %d batched records, want 7\n%s", got, stdout)
+	}
+}
+
+func TestEventsCommandRejectsInvalidStreamOptions(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(100, 2))
+	withFake(t, srv)
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "unknown gap strategy",
+			args: []string{"events", "--from", "100", "--gap-strategy", "skip"},
+		},
+		{
+			name: "backfill workers below one",
+			args: []string{"events", "--from", "100", "--backfill-workers", "0"},
+		},
+		{
+			name: "batching without a threshold",
+			args: []string{"events", "--from", "100", "--batch", "--batch-size", "0", "--batch-timeout", "0"},
+		},
+		{
+			name: "negative batch size",
+			args: []string{"events", "--from", "100", "--batch", "--batch-size", "-1"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := run(t, tc.args...); err == nil {
+				t.Fatal("Execute() error = nil, want a validation failure")
+			}
+		})
+	}
+}
+
+func TestEventsHelpAdvertisesStreamOptions(t *testing.T) {
+	stdout, _, err := run(t, "events", "--help")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	for _, flag := range []string{
+		"--backfill-workers", "--batch", "--batch-size", "--batch-timeout",
+		"--gap-strategy", "--max-gap-recoveries", "--dlq-file",
+	} {
+		if !strings.Contains(stdout, flag) {
+			t.Errorf("help does not mention %s", flag)
+		}
+	}
+}
+
+// TestEventsCommandSince converts a relative window into an approximate
+// start ledger against the fake's head, covering the whole flag path.
+func TestEventsCommandSince(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(2026, 3), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	stdout, stderr, err := run(t, "events", "--since", "1m", "--json")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	// The fake's head is ledger 2028, so --since 1m resolves to 2028 - 12
+	// = 2016, and all three events qualify.
+	if got := len(nonEmptyLines(stdout)); got != 3 {
+		t.Errorf("emitted %d records with --since 1m, want 3\n%s", got, stdout)
+	}
+	for _, want := range []string{"--since 1m", "start ledger"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr does not mention %q\n%s", want, stderr)
+		}
+	}
+}
+
+// TestEventsCommandSinceRejects checks the guard rails: --since and --from
+// cannot mix, a negative window is refused, and both before any network call
+// beyond the head lookup a lone --since needs.
+func TestEventsCommandSinceRejects(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(100, 2), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "together with --from",
+			args: []string{"events", "--from", "100", "--since", "1m"},
+			want: "mutually exclusive",
+		},
+		{
+			name: "negative window",
+			args: []string{"events", "--since", "-5m"},
+			want: "--since must not be negative",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := run(t, tc.args...)
+			if err == nil {
+				t.Fatal("Execute() error = nil, want a rejection")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to mention %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+// TestLedgersCommandSince checks the flag is shared by the streaming
+// commands, not welded to events.
+func TestLedgersCommandSince(t *testing.T) {
+	srv := fakerpc.NewLedgerServer(fakerpc.MakeLedgers(7000, 3), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	// Head is 7002 here, so --since 1m starts from 6990 and all three
+	// ledgers qualify.
+	stdout, _, err := run(t, "ledgers", "--since", "1m", "--json")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := len(nonEmptyLines(stdout)); got != 3 {
+		t.Errorf("emitted %d ledger records with --since 1m, want 3\n%s", got, stdout)
+	}
+}
+
+// TestEventsCommandTopicPattern covers the client-side filter end to end:
+// matching patterns pass records, non-matching ones suppress them, and a
+// malformed pattern fails the whole command at construction time.
+func TestEventsCommandTopicPattern(t *testing.T) {
+	contract := "CBGSBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKKY3"
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(4000, 4), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	// Every fixture topic is the u32 value 7, so the decoded-text pattern
+	// "7" passes everything and "nope" passes nothing.
+	for _, tc := range []struct {
+		name string
+		pat  string
+		want int
+	}{
+		{name: "numeric leaf matches", pat: "7", want: 4},
+		{name: "non-matching pattern", pat: "nope", want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withFake(t, srv)
+			stdout, _, err := run(t, "events", "--from", "4000", "--topic-pattern", tc.pat, "--json")
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			if got := len(nonEmptyLines(stdout)); got != tc.want {
+				t.Errorf("pattern %q emitted %d lines, want %d\n%s", tc.pat, got, tc.want, stdout)
+			}
+		})
+	}
+
+	withFake(t, srv)
+	_, _, err := run(t, "events", "--from", "4000", "--topic-pattern", "re:[")
+	if err == nil {
+		t.Fatal("Execute() with an invalid regex error = nil, want a compile failure")
+	}
+	if strings.Contains(err.Error(), contract) {
+		t.Errorf("error needlessly quotes the contract id: %q", err.Error())
+	}
+}
+
+// TestEventsCommandFanoutDir checks the per-contract NDJSON wiring: one file
+// per contract, carrying exactly the stream's events, while stdout keeps the
+// combined output.
+func TestEventsCommandFanoutDir(t *testing.T) {
+	dir := t.TempDir()
+	contract := fakerpc.MakeEvents(6000, 1)[0].ContractID
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(6000, 3), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	stdout, _, err := run(t, "events", "--from", "6000", "--json", "--fanout-dir", dir)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got, want := len(nonEmptyLines(stdout)), 3; got != want {
+		t.Errorf("stdout carried %d lines, want %d\n%s", got, want, stdout)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("fanout wrote %d files, want 1", len(entries))
+	}
+	wantName := contract + ".ndjson"
+	if entries[0].Name() != wantName {
+		t.Errorf("fanout file named %q, want %q", entries[0].Name(), wantName)
+	}
+
+	b, err := os.ReadFile(filepath.Join(dir, wantName))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	lines := nonEmptyLines(string(b))
+	if len(lines) != 3 {
+		t.Fatalf("fanout file has %d lines, want 3: %s", len(lines), lines)
+	}
+	for i, line := range lines {
+		var rec struct {
+			Kind     string `json:"kind"`
+			ID       string `json:"id"`
+			Contract string `json:"contract"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("line %d is not valid JSON: %v\n%s", i, err, line)
+		}
+		if rec.Kind != "event" || rec.Contract != contract {
+			t.Errorf("line %d = kind %q contract %q, want event/%s", i, rec.Kind, rec.Contract, contract)
+		}
+	}
+}
+
+// TestEventsCommandFanoutDirRejectsBadDirectory checks a misconfigured
+// directory fails before streaming instead of per record.
+func TestEventsCommandFanoutDirRejectsBadDirectory(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(7000, 1), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	// A file, not a directory: mkdir fails on the spot.
+	file := filepath.Join(t.TempDir(), "plain.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	_, _, err := run(t, "events", "--from", "7000", "--fanout-dir", file)
+	if err == nil {
+		t.Fatal("Execute() error = nil, want a directory failure")
+	}
+}
+
+// TestEventsCommandAdaptiveFlagRuns checks the adaptive switch wires through
+// the opts without disturbing the drain path a non-follow run takes.
+func TestEventsCommandAdaptiveFlagRuns(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(8000, 5), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	stdout, _, err := run(t, "events", "--from", "8000", "--json", "--adaptive")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got, want := len(nonEmptyLines(stdout)), 5; got != want {
+		t.Errorf("emitted %d records with --adaptive, want %d", got, want)
+	}
 }
