@@ -212,6 +212,28 @@ func (s *WASMSource) hostFunctionEvent(fn *xdr.HostFunction) (*WASMEvent, bool, 
 		}
 		return s.createEvent(args.ContractIdPreimage, args.Executable)
 
+	case xdr.HostFunctionTypeHostFunctionTypeInvokeContract:
+		args := fn.InvokeContract
+		if args == nil || string(args.FunctionName) != "update_wasm" {
+			return nil, false, nil
+		}
+		contract, ok := args.ContractAddress.GetContractId()
+		if !ok {
+			return nil, false, fmt.Errorf("update_wasm target is not a contract")
+		}
+		contractID, err := strkey.Encode(strkey.VersionByteContract, contract[:])
+		if err != nil {
+			return nil, false, fmt.Errorf("encoding contract address: %w", err)
+		}
+		if len(args.Args) == 0 {
+			return nil, false, fmt.Errorf("update_wasm has no wasm hash argument")
+		}
+		hash, ok := args.Args[0].GetBytes()
+		if !ok || len(hash) != 32 {
+			return nil, false, fmt.Errorf("update_wasm has invalid wasm hash")
+		}
+		return &WASMEvent{Action: "upgrade", ContractID: contractID, WASMHash: hex.EncodeToString(hash)}, true, nil
+
 	default:
 		return nil, false, nil
 	}

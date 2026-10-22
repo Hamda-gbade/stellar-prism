@@ -17,6 +17,7 @@ import (
 // process listing or shell history.
 const (
 	webhookSecretEnvVar = "PRISM_WEBHOOK_SECRET"
+	esAPIKeyEnvVar      = "PRISM_ES_API_KEY"
 	gcsTokenEnvVar      = "GOOGLE_OAUTH_ACCESS_TOKEN"
 	awsAccessKeyEnvVar  = "AWS_ACCESS_KEY_ID"
 	awsSecretKeyEnvVar  = "AWS_SECRET_ACCESS_KEY"
@@ -46,6 +47,18 @@ type sinkFlags struct {
 	syslogFormat     string
 	syslogFacility   string
 	syslogAppName    string
+	esURL            string
+	esIndex          string
+	esUsername       string
+	esPassword       string
+	esAPIKey         string
+	esBatchSize      int
+	esFlushInterval  time.Duration
+	natsURL          string
+	natsSubject      string
+	natsJetStream    bool
+	zmqEndpoint      string
+	zmqTopic         string
 	metrics          *sink.Prometheus
 	constructedSinks []io.Closer
 }
@@ -94,6 +107,18 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 		"syslog facility (local0..local7, user, daemon, ...)")
 	flags.StringVar(&s.syslogAppName, "syslog-app", "prism",
 		"syslog APP-NAME / SYSLOG_IDENTIFIER")
+	flags.StringVar(&s.esURL, "sink-es-url", "", "Elasticsearch or OpenSearch endpoint for bulk ingestion")
+	flags.StringVar(&s.esIndex, "sink-es-index", "stellar-events", "base Elasticsearch index; records roll over daily")
+	flags.StringVar(&s.esUsername, "sink-es-username", "", "Elasticsearch basic-auth username")
+	flags.StringVar(&s.esPassword, "sink-es-password", "", "Elasticsearch basic-auth password (prefer $"+esAPIKeyEnvVar+" for API keys)")
+	flags.StringVar(&s.esAPIKey, "sink-es-api-key", "", "Elasticsearch API key (default $"+esAPIKeyEnvVar+")")
+	flags.IntVar(&s.esBatchSize, "sink-es-batch-size", 100, "records per Elasticsearch bulk request")
+	flags.DurationVar(&s.esFlushInterval, "sink-es-flush-interval", time.Second, "flush a partial Elasticsearch bulk request after this interval")
+	flags.StringVar(&s.natsURL, "sink-nats", "", "NATS server URL")
+	flags.StringVar(&s.natsSubject, "nats-subject", "stellar.events.{{.ContractID}}", "NATS subject template using .ContractID, .Topic0, .ID or .Ledger")
+	flags.BoolVar(&s.natsJetStream, "nats-jetstream", false, "wait for JetStream publish acknowledgements")
+	flags.StringVar(&s.zmqEndpoint, "sink-zmq", "", "ZeroMQ PUB endpoint")
+	flags.StringVar(&s.zmqTopic, "zmq-topic", "stellar.events.{{.ContractID}}", "ZeroMQ topic template using .ContractID, .Topic0, .ID or .Ledger")
 
 	registerFlagCompletion(cmd, "cloud-provider", "s3", "gcs")
 	registerFlagCompletion(cmd, "syslog-format", string(sink.SyslogRFC5424), string(sink.SyslogJournald))
@@ -153,6 +178,18 @@ func (s *sinkFlags) validate() error {
 		if _, err := sink.ParseSyslogFacility(s.syslogFacility); err != nil {
 			return err
 		}
+	}
+	if s.esURL == "" && (s.esUsername != "" || s.esPassword != "" || s.esAPIKey != "") {
+		return fmt.Errorf("elasticsearch credentials require --sink-es-url")
+	}
+	if s.esURL != "" && s.esBatchSize <= 0 {
+		return fmt.Errorf("--sink-es-batch-size must be greater than zero")
+	}
+	if s.esFlushInterval < 0 {
+		return fmt.Errorf("--sink-es-flush-interval must not be negative")
+	}
+	if s.natsURL == "" && s.natsJetStream {
+		return fmt.Errorf("--nats-jetstream requires --sink-nats")
 	}
 	return nil
 }
@@ -266,10 +303,39 @@ func (s *sinkFlags) addTo(base stream.Sink, raw bool, onAsyncError func(error)) 
 		sinks = append(sinks, logSink)
 	}
 
+	if s.esURL != "" {
+		apiKey := s.esAPIKey
+		if apiKey == "" {
+			apiKey = os.Getenv(esAPIKeyEnvVar)
+		}
+		es, esErr := sink.NewElasticsearchSink(sink.ElasticsearchOptions{URL: s.esURL, Index: s.esIndex, Username: s.esUsername, Password: s.esPassword, APIKey: apiKey, BatchSize: s.esBatchSize, MaxDelay: s.esFlushInterval, Decode: !raw})
+		if esErr != nil {
+			return nil, esErr
+		}
+		s.constructedSinks = append(s.constructedSinks, es)
+		sinks = append(sinks, es)
+	}
+	if s.natsURL != "" {
+		natsSink, natsErr := sink.NewNATSSink(sink.NATSOptions{URL: s.natsURL, Subject: s.natsSubject, JetStream: s.natsJetStream, Decode: !raw})
+		if natsErr != nil {
+			return nil, natsErr
+		}
+		s.constructedSinks = append(s.constructedSinks, natsSink)
+		sinks = append(sinks, natsSink)
+	}
+	if s.zmqEndpoint != "" {
+		zmqSink, zmqErr := sink.NewZeroMQSink(sink.ZeroMQOptions{Endpoint: s.zmqEndpoint, Topic: s.zmqTopic, Decode: !raw})
+		if zmqErr != nil {
+			return nil, zmqErr
+		}
+		s.constructedSinks = append(s.constructedSinks, zmqSink)
+		sinks = append(sinks, zmqSink)
+	}
+
 	if len(sinks) == 1 {
 		return base, nil
 	}
-	return sink.NewFanout(sinks...), nil
+	return sink.NewMultiSink(sinks, sink.MultiSinkOptions{Policy: sink.MultiSinkAbortAll})
 }
 
 func (s *sinkFlags) objectStore() (sink.ObjectStore, error) {

@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -10,8 +11,8 @@ import (
 	"github.com/stellar-optics/stellar-prism/pkg/rpc"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
-
 	"github.com/stellar/go-stellar-sdk/toid"
+	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
 // DefaultTransactionPageLimit is the page size requested for transaction streams.
@@ -131,19 +132,23 @@ func (s *TransactionSource) Fetch(ctx context.Context, cursor string) (Batch, er
 
 // transactionRecord converts an RPC transaction into a neutral Record.
 func transactionRecord(tx protocol.TransactionInfo) Record {
+	transaction := &Transaction{
+		Hash:          tx.TransactionHash,
+		Index:         uint32(tx.ApplicationOrder),
+		Successful:    tx.Status == protocol.TransactionStatusSuccess,
+		EnvelopeXDR:   tx.EnvelopeXDR,
+		ResultXDR:     tx.ResultXDR,
+		ResultMetaXDR: tx.ResultMetaXDR,
+	}
+	if !transaction.Successful {
+		transaction.ErrorCode, transaction.FailureReason, transaction.FailedOpIndex, transaction.FailedOpType = failureSummary(tx.ResultXDR)
+	}
 	r := Record{
-		ID:       fmt.Sprintf("%010d-%04d", tx.Ledger, tx.ApplicationOrder),
-		Sequence: tx.Ledger,
-		Time:     time.Unix(tx.LedgerCloseTime, 0).UTC(),
-		Kind:     KindTransaction,
-		Transaction: &Transaction{
-			Hash:          tx.TransactionHash,
-			Index:         uint32(tx.ApplicationOrder),
-			Successful:    tx.Status == protocol.TransactionStatusSuccess,
-			EnvelopeXDR:   tx.EnvelopeXDR,
-			ResultXDR:     tx.ResultXDR,
-			ResultMetaXDR: tx.ResultMetaXDR,
-		},
+		ID:          fmt.Sprintf("%010d-%04d", tx.Ledger, tx.ApplicationOrder),
+		Sequence:    tx.Ledger,
+		Time:        time.Unix(tx.LedgerCloseTime, 0).UTC(),
+		Kind:        KindTransaction,
+		Transaction: transaction,
 	}
 	if memo, err := DecodeMemo(tx.EnvelopeXDR); err == nil {
 		r.Transaction.Memo = &memo
@@ -152,3 +157,114 @@ func transactionRecord(tx protocol.TransactionInfo) Record {
 	}
 	return r
 }
+
+// failureSummary extracts the failed transaction or operation code without
+// making malformed optional result XDR fatal to the stream.
+func failureSummary(resultXDR string) (code, detail string, opIndex *uint32, opType string) {
+	if resultXDR == "" {
+		return
+	}
+	var result xdr.TransactionResult
+	if err := xdr.SafeUnmarshalBase64(resultXDR, &result); err != nil {
+		return
+	}
+	resultCode := normalizedCode(result.Result.Code.String())
+	var operationResults *[]xdr.OperationResult
+	if result.Result.Results != nil {
+		operationResults = result.Result.Results
+	}
+	if result.Result.Code == xdr.TransactionResultCodeTxFeeBumpInnerFailed && result.Result.InnerResultPair != nil {
+		inner := result.Result.InnerResultPair.Result
+		resultCode = normalizedCode(inner.Result.Code.String())
+		operationResults = inner.Result.Results
+	}
+	code, detail = resultCode, humanizeCode(resultCode)
+	if operationResults == nil {
+		return
+	}
+	for i, operation := range *operationResults {
+		if operation.Code != xdr.OperationResultCodeOpInner || operation.Tr == nil {
+			if operation.Code != xdr.OperationResultCodeOpInner {
+				n := uint32(i)
+				opIndex = &n
+				code = normalizedCode(operation.Code.String())
+				detail = humanizeCode(code)
+			}
+			if opIndex != nil {
+				return
+			}
+			continue
+		}
+		tr := operation.Tr
+		raw := operationErrorCode(tr)
+		if raw != "" && !strings.HasSuffix(raw, "Success") {
+			n := uint32(i)
+			opIndex = &n
+			opType = strings.TrimPrefix(strings.ToLower(tr.Type.String()), "operationtype")
+			code = normalizedCode(raw)
+			detail = humanizeCode(code)
+			return
+		}
+	}
+	return
+}
+
+func operationErrorCode(tr *xdr.OperationResultTr) string {
+	if tr == nil {
+		return ""
+	}
+	name, ok := tr.ArmForSwitch(int32(tr.Type))
+	if !ok || name == "" {
+		return ""
+	}
+	value := reflect.ValueOf(tr).Elem().FieldByName(name)
+	if !value.IsValid() || value.IsNil() {
+		return ""
+	}
+	code := value.Elem().FieldByName("Code")
+	if !code.IsValid() || !code.CanInterface() {
+		return ""
+	}
+	stringer, ok := code.Interface().(fmt.Stringer)
+	if !ok {
+		return ""
+	}
+	return stringer.String()
+}
+
+func normalizedCode(raw string) string {
+	prefix := ""
+	if i := strings.Index(raw, "ResultCode"); i >= 0 {
+		enumName := raw[:i]
+		raw = raw[i+len("ResultCode"):]
+		switch enumName {
+		case "Transaction":
+			prefix = "tx_"
+		case "Operation":
+			prefix = "op_"
+		default:
+			prefix = camelSnake(enumName) + "_"
+		}
+		raw = strings.TrimPrefix(raw, enumName)
+		if enumName == "Transaction" {
+			raw = strings.TrimPrefix(raw, "Tx")
+		}
+		if enumName == "Operation" {
+			raw = strings.TrimPrefix(raw, "Op")
+		}
+	}
+	return prefix + camelSnake(raw)
+}
+
+func camelSnake(raw string) string {
+	var b strings.Builder
+	for i, r := range raw {
+		if i > 0 && r >= 'A' && r <= 'Z' {
+			b.WriteByte('_')
+		}
+		b.WriteRune(r)
+	}
+	return strings.ToLower(b.String())
+}
+
+func humanizeCode(code string) string { return strings.ReplaceAll(code, "_", " ") }

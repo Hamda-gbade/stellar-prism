@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -629,5 +632,137 @@ func TestEventsCommandAdaptiveFlagRuns(t *testing.T) {
 	}
 	if got, want := len(nonEmptyLines(stdout)), 5; got != want {
 		t.Errorf("emitted %d records with --adaptive, want %d", got, want)
+	}
+}
+
+// safeBuffer is a buffer that may be read while a command is still writing
+// to it, which is what a test that interrupts a running command needs.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// waitForOutput waits until the buffer holds want, or the test gives up.
+func waitForOutput(t *testing.T, b *safeBuffer, want string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(b.String(), want) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("the output never contained %q\n%s", want, b.String())
+}
+
+// TestEventsCommandShutsDownCleanlyOnSignal covers the graceful drain: a
+// SIGTERM stops the fetching, the records still in memory are flushed, the
+// final cursor is committed, and the command exits cleanly.
+func TestEventsCommandShutsDownCleanlyOnSignal(t *testing.T) {
+	// The signal is delivered to this process, so its disposition is
+	// claimed before anything else happens: without a handler the runtime
+	// would terminate the test binary.
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, syscall.SIGTERM)
+	defer signal.Stop(interrupts)
+
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(1000, 3), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	stdout := &safeBuffer{}
+	stderr := &safeBuffer{}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Execute([]string{
+			"events",
+			"--from", "1000",
+			"--json",
+			"--follow",
+			"--poll", "10ms",
+			"--state-file", stateFile,
+		}, stdout, stderr)
+	}()
+
+	// The first record proves the command is running, and therefore that
+	// its signal handler is already in place.
+	waitForOutput(t, stdout, `"ledger":1000`)
+
+	// Interrupt the run the way an orchestrator does.
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("Kill() error = %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Execute() error = %v, want a clean shutdown", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the command did not stop after the signal")
+	}
+
+	// Every record the server had must be on stdout, and every line must
+	// be whole: a shutdown must not leave a half-written record behind.
+	lines := nonEmptyLines(stdout.String())
+	if len(lines) != 3 {
+		t.Errorf("stdout has %d records, want 3\n%s", len(lines), stdout.String())
+	}
+	for i, line := range lines {
+		var rec struct {
+			Kind   string `json:"kind"`
+			Ledger uint32 `json:"ledger"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Errorf("line %d is not valid JSON: %v\n%s", i, err, line)
+			continue
+		}
+		if rec.Kind != "event" {
+			t.Errorf("line %d kind = %q, want %q", i, rec.Kind, "event")
+		}
+	}
+
+	if !strings.Contains(stderr.String(), "draining") {
+		t.Errorf("stderr does not report the drain\n%s", stderr.String())
+	}
+
+	// The final cursor must be committed, or the next run starts over
+	// instead of where this one stopped.
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("reading the state file: %v", err)
+	}
+	var found bool
+	for _, line := range nonEmptyLines(string(data)) {
+		var meta struct {
+			Cursor string `json:"cursor"`
+			Ledger uint32 `json:"ledger"`
+		}
+		if err := json.Unmarshal([]byte(line), &meta); err != nil {
+			t.Errorf("the state file holds an unreadable entry: %v\n%s", err, line)
+			continue
+		}
+		if meta.Cursor != "" {
+			found = true
+			if meta.Ledger != 1002 {
+				t.Errorf("the committed cursor is at ledger %d, want 1002", meta.Ledger)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("the state file holds no cursor\n%s", data)
 	}
 }
