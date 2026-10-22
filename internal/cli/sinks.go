@@ -180,7 +180,7 @@ func (s *sinkFlags) validate() error {
 		}
 	}
 	if s.esURL == "" && (s.esUsername != "" || s.esPassword != "" || s.esAPIKey != "") {
-		return fmt.Errorf("Elasticsearch credentials require --sink-es-url")
+		return fmt.Errorf("elasticsearch credentials require --sink-es-url")
 	}
 	if s.esURL != "" && s.esBatchSize <= 0 {
 		return fmt.Errorf("--sink-es-batch-size must be greater than zero")

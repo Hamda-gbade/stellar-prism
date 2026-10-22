@@ -140,7 +140,10 @@ func (s *ElasticsearchSink) postBulk(records []stream.Record) error {
 		if day.IsZero() {
 			day = s.now()
 		}
-		meta, _ := json.Marshal(map[string]any{"index": map[string]any{"_index": s.opts.Index + "-" + day.UTC().Format("2006.01.02"), "_id": r.ID}})
+		meta, err := json.Marshal(map[string]any{"index": map[string]any{"_index": s.opts.Index + "-" + day.UTC().Format("2006.01.02"), "_id": r.ID}})
+		if err != nil {
+			return fmt.Errorf("elasticsearch: marshal bulk action: %w", err)
+		}
 		doc, err := MarshalRecord(r, s.opts.Decode)
 		if err != nil {
 			return fmt.Errorf("elasticsearch: marshal record: %w", err)
@@ -165,7 +168,10 @@ func (s *ElasticsearchSink) postBulk(records []stream.Record) error {
 		return fmt.Errorf("elasticsearch: bulk request: %w", err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return fmt.Errorf("elasticsearch: reading bulk response: %w", err)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return fmt.Errorf("elasticsearch: bulk request returned %s: %s", resp.Status, strings.TrimSpace(string(data)))
 	}

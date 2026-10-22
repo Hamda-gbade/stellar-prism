@@ -7,6 +7,7 @@ import (
 	"text/template"
 
 	"github.com/nats-io/nats.go"
+
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 

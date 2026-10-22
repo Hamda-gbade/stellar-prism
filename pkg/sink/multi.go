@@ -72,12 +72,12 @@ func (m *MultiSink) Emit(r stream.Record) error {
 	}
 	err := errors.Join(failures...)
 	if m.opts.Policy == MultiSinkContinueAndDLQ && m.opts.OnFailure != nil {
-		if dlqErr := m.opts.OnFailure(r, err); dlqErr == nil {
+		dlqErr := m.opts.OnFailure(r, err)
+		if dlqErr == nil {
 			delete(m.pending, key)
 			return nil
-		} else {
-			return errors.Join(err, fmt.Errorf("dead letter queue: %w", dlqErr))
 		}
+		return errors.Join(err, fmt.Errorf("dead letter queue: %w", dlqErr))
 	}
 	m.pending[key] = pending
 	return fmt.Errorf("multi sink: %w", err)

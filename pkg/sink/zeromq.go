@@ -8,6 +8,7 @@ import (
 	"text/template"
 
 	"github.com/go-zeromq/zmq4"
+
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 

@@ -4,7 +4,9 @@ go 1.25
 
 require (
 	github.com/fsnotify/fsnotify v1.9.0
+	github.com/go-zeromq/zmq4 v0.17.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/nats-io/nats.go v1.47.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stellar-optics/stellar-xdr-lens v0.2.0
 	github.com/stellar/go-stellar-sdk v0.7.3
@@ -16,10 +18,8 @@ require (
 	github.com/creachadair/jrpc2 v1.2.0 // indirect
 	github.com/creachadair/mds v0.13.4 // indirect
 	github.com/go-zeromq/goczmq/v4 v4.2.2 // indirect
-	github.com/go-zeromq/zmq4 v0.17.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
-	github.com/nats-io/nats.go v1.47.0 // indirect
 	github.com/nats-io/nkeys v0.4.11 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
