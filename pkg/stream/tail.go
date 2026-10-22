@@ -18,6 +18,8 @@ const DefaultPollInterval = 5 * time.Second
 type Stats struct {
 	// Emitted counts records handed to the Sink.
 	Emitted int
+	// Filtered counts records rejected by a configured client-side filter.
+	Filtered int
 	// Duplicates counts records the server re-sent that were suppressed.
 	// A non-zero value after a reconnect is expected and healthy.
 	Duplicates int
@@ -31,6 +33,24 @@ type Stats struct {
 	Recovered int
 }
 
+// Page describes the progress of one page that was emitted in full.
+//
+// It carries the position a later run could resume from, which is what makes
+// a durable cursor possible without the tailer knowing anything about
+// storage.
+type Page struct {
+	// Source names the stream that produced the page.
+	Source string
+	// Cursor is the position to resume from after this page. It is empty
+	// when the source offers no further position.
+	Cursor string
+	// Ledger is the ledger the cursor refers to, or zero when the source
+	// cannot say.
+	Ledger uint32
+	// Records counts the records emitted in the page.
+	Records int
+}
+
 // Options configures a Tailer.
 type Options struct {
 	// Follow keeps the stream open, polling for new records. When false the
@@ -38,6 +58,9 @@ type Options struct {
 	Follow bool
 	// Limit stops the stream after this many records. Zero means unlimited.
 	Limit int
+	// Filter runs before the sink. Rejected records still advance the source
+	// cursor, but do not count toward Limit or Emitted.
+	Filter RecordFilter
 	// PollInterval is the wait between polls once caught up.
 	PollInterval time.Duration
 	// Backoff governs retry delays after a failed fetch.
@@ -46,8 +69,27 @@ type Options struct {
 	// means retry indefinitely, which is usually what a long-running tail
 	// wants.
 	MaxRetries int
+	// Adaptive switches the follow loop's poll wait to the adaptive poller in
+	// backoff.go, which tunes the interval from how many new ledgers close
+	// during each wait instead of holding PollInterval fixed. With it on,
+	// PollInterval is not consulted; the bounds below are.
+	Adaptive bool
+	// AdaptiveMin and AdaptiveMax bound the tuned interval. Zero values fall
+	// back to DefaultAdaptiveMinPoll and DefaultAdaptiveMaxPoll, and a Max
+	// below Min is pulled back up, so out-of-range configuration degrades to
+	// clamping rather than failing the stream mid-flight.
+	AdaptiveMin time.Duration
+	// AdaptiveMax is the longest interval the poller may take.
+	AdaptiveMax time.Duration
 	// Clock is injectable for tests. Defaults to RealClock.
 	Clock Clock
+	// StartCursor resumes the stream from a position an earlier run
+	// recorded. The empty value means "start where the Source was
+	// configured to start".
+	//
+	// A resumed stream is gap-checked like any other, because the cursor is
+	// a real position and the server may have pruned past it.
+	StartCursor string
 	// OnRetry, when set, is called before each backoff wait so the CLI can
 	// tell the user what is happening rather than appearing to hang.
 	OnRetry func(attempt int, delay time.Duration, err error)
@@ -69,6 +111,60 @@ type Options struct {
 	MaxGapRecoveries int
 	// OnGap, when set, is called for every detected gap.
 	OnGap func(GapEvent)
+	// Process transforms a complete ledger's records before they are emitted.
+	// It is used by derived streams such as footprint conflict detection.
+	Process func([]Record) ([]Record, error)
+	// OnPage, when set, is called after every page that was emitted in
+	// full, with the position to resume from.
+	//
+	// A page that was only partly emitted — because the limit was reached
+	// or the sink failed — does not produce a callback, so a recorded
+	// position always refers to records that were actually delivered.
+	OnPage func(Page)
+	// OnProgress, when set, is called after every successful fetch with
+	// how far the stream has got and how far the server has got. It is
+	// what the health endpoints report stream lag from.
+	OnProgress func(Progress)
+	// Leader, when set, gates the stream on a distributed lease: the
+	// tailer only fetches while this instance holds the lease, so a
+	// standby never emits records the leader is already emitting.
+	//
+	// A nil Leader leaves the stream ungated, which is what a single
+	// instance wants.
+	Leader *LeaderElection
+	// LeaderResume, when set, is called when this instance takes the
+	// lease and returns the cursor to resume from. It is how a standby
+	// picks up the work the previous leader committed rather than
+	// starting from wherever its own fetch cursor had reached.
+	//
+	// An empty cursor means "keep the current position".
+	LeaderResume func(ctx context.Context) (string, error)
+	// DrainTimeout bounds how long the final flush may take when the run
+	// stops.
+	//
+	// It is the grace period an orchestrator gives the process before it
+	// kills it, so a flush that overruns it is abandoned rather than
+	// waited out. Zero means the flush is waited for as long as it takes.
+	DrainTimeout time.Duration
+}
+
+// Progress reports how far a stream has got relative to the server's head.
+//
+// The difference between the two is the stream's lag: how many ledgers have
+// closed that the stream has not emitted yet.
+type Progress struct {
+	// CurrentLedger is the newest ledger the stream has emitted.
+	CurrentLedger uint32
+	// LatestLedger is the newest ledger the server has.
+	LatestLedger uint32
+}
+
+// Lag reports how many ledgers the stream is behind the server.
+func (p Progress) Lag() uint32 {
+	if p.LatestLedger <= p.CurrentLedger {
+		return 0
+	}
+	return p.LatestLedger - p.CurrentLedger
 }
 
 // Tailer drives a Source, emitting records to a Sink.
@@ -95,6 +191,9 @@ type Options struct {
 //     emit — but true exactly-once would need a transaction spanning the sink
 //     and the store, which a CLI writing to stdout cannot have. Consumers
 //     that care should key off Record.ID.
+//     re-emit on restart. Options.StartCursor and Options.OnPage checkpoint
+//     fully delivered pages; pages still held by the reorder buffer may be
+//     replayed. Consumers that care should key off Record.ID.
 type Tailer struct {
 	src  Source
 	sink Sink
@@ -117,6 +216,41 @@ type Tailer struct {
 
 	stats    Stats
 	recovery GapRecovery
+	reorder  *ReorderBuffer
+	// Checkpoints wait until all records through their page have left the
+	// reorder buffer and reached the sink. The fetch cursor can run ahead.
+	pages           []pendingPage
+	deliveredCursor string
+
+	// adaptive is non-nil only when Options.Adaptive is set, and then drives
+	// the wait between polls instead of the fixed interval.
+	adaptive *AdaptivePoller
+	// latestSeen tracks the head the previous poll reported, so the adaptive
+	// poller can count how many ledgers closed during each wait.
+	latestSeen uint32
+	// currentLedger is the newest ledger the stream has emitted, which is
+	// what the lag reported to the health endpoints is measured from.
+	currentLedger uint32
+	// leading records that this instance holds the lease, so a change of
+	// leadership can be told from an ordinary poll.
+	leading bool
+	// leaderEpoch is the lease epoch this instance led in. A different
+	// epoch means the lease changed hands, so the work in flight belongs
+	// to a term that has ended and has to be discarded.
+	leaderEpoch uint64
+	// flushGate admits one flush at a time. A flush that overran its
+	// deadline is abandoned, and a second one must not start alongside
+	// it: a sink that buffers would otherwise write the same batch
+	// twice.
+	flushGate chan struct{}
+}
+
+type pendingPage struct {
+	page   Page
+	lastID string
+	// records identifies the unique records first seen on this page, so
+	// client-side rejections can be removed from its delivered count.
+	records map[string]struct{}
 }
 
 // NewTailer returns a Tailer wired to src and sink.
@@ -134,16 +268,55 @@ func NewTailer(src Source, sink Sink, opts Options) *Tailer {
 	if err != nil {
 		strategy = GapFail
 	}
-	return &Tailer{
-		src:  src,
-		sink: sink,
-		opts: opts,
+	t := &Tailer{
+		src:             src,
+		sink:            sink,
+		opts:            opts,
+		cursor:          opts.StartCursor,
+		deliveredCursor: opts.StartCursor,
 		recovery: GapRecovery{
 			Strategy:      strategy,
 			MaxRecoveries: opts.MaxGapRecoveries,
 			OnGap:         opts.OnGap,
 		},
+		reorder:   NewReorderBuffer(),
+		flushGate: make(chan struct{}, 1),
 	}
+	if opts.Adaptive {
+		t.adaptive = NewAdaptivePoller(opts.AdaptiveMin, opts.AdaptiveMax, 2)
+	}
+	return t
+}
+
+// wait returns how long to hold before the next poll, given what the last
+// batch reported. The fixed interval is the default; the adaptive poller
+// replaces it by observing how many new ledgers closed during the previous
+// wait.
+func (t *Tailer) wait(b Batch) time.Duration {
+	if t.adaptive == nil {
+		return t.opts.PollInterval
+	}
+	return t.adaptive.Observe(t.newLedgers(b))
+}
+
+// newLedgers reports how many ledgers closed since the previous poll, or
+// zero when the head did not advance or was reported out of order by a
+// lagging backend, which is both indistinguishable from idle for tuning
+// purposes and safe to treat as such.
+func (t *Tailer) newLedgers(b Batch) int {
+	if b.Latest == 0 || t.latestSeen == 0 || b.Latest <= t.latestSeen {
+		t.latestSeen = b.Latest
+		return 0
+	}
+	n := int64(b.Latest) - int64(t.latestSeen)
+	t.latestSeen = b.Latest
+	// The delta is only consumed against thresholds, so saturate at int32 to
+	// stay portable without losing the decision.
+	const int32Max = int64(1)<<31 - 1
+	if n > int32Max {
+		n = int32Max
+	}
+	return int(n)
 }
 
 // Stats returns a snapshot of what the run has done so far.
@@ -151,18 +324,22 @@ func (t *Tailer) Stats() Stats { return t.stats }
 
 // Cursor returns the position the stream has reached, suitable for resuming
 // a later run.
-func (t *Tailer) Cursor() string { return t.cursor }
+func (t *Tailer) Cursor() string { return t.deliveredCursor }
 
 // Run drives the stream until it completes, hits an error, or ctx is
 // cancelled.
 //
 // Cancellation is a clean stop, not a failure: Run flushes the sink and
 // returns nil so that Ctrl-C on a tail does not look like a crash.
-func (t *Tailer) Run(ctx context.Context) error {
+func (t *Tailer) Run(ctx context.Context) (err error) {
 	defer func() {
-		// Best-effort flush; a flush error on an already-failing path should
-		// not mask the original cause.
-		_ = t.sink.Flush()
+		// The records still in the sink's buffer are flushed on the way
+		// out. A failure there is reported when the run otherwise
+		// succeeded, and is left out when it did not: the cause of the
+		// failure is the more useful of the two.
+		if flushErr := t.flushOutput(context.WithoutCancel(ctx)); flushErr != nil && err == nil {
+			err = fmt.Errorf("flushing output: %w", flushErr)
+		}
 	}()
 
 	if err := t.restore(ctx); err != nil {
@@ -174,6 +351,17 @@ func (t *Tailer) Run(ctx context.Context) error {
 
 	for {
 		if err := ctx.Err(); err != nil {
+			return t.finish(nil)
+		}
+
+		// A standby must not fetch. It would emit the same records as the
+		// leader and fight it for the cursor, which is the duplication the
+		// lease exists to prevent.
+		leading, err := t.leadership(ctx)
+		if err != nil {
+			return err
+		}
+		if !leading {
 			return t.finish(nil)
 		}
 
@@ -199,15 +387,29 @@ func (t *Tailer) Run(ctx context.Context) error {
 		}
 
 		done, err := t.emit(ctx, batch)
+		t.queuePage(batch)
+		done, _, err := t.emit(batch)
 		if err != nil {
 			if IsCancellation(err) {
 				return t.finish(nil)
 			}
 			return err
 		}
+		t.reportProgress(batch)
+		// A bounded follow has all it needs once the available pages are
+		// drained and the buffered suffix satisfies the limit. Do not wait
+		// for another ledger just to finish an explicitly bounded request.
+		if !done && !batch.Full && t.opts.Limit > 0 && t.stats.Emitted+len(t.reorder.pending) >= t.opts.Limit {
+			done, _, err = t.emitReady(t.reorder.Flush())
+			if err != nil {
+				return err
+			}
+		}
 		if done {
 			return t.finish(nil)
 		}
+
+		t.reportReadyPages()
 
 		// Advance only after a fully successful emit. If emitting failed we
 		// return above with the cursor untouched, so a caller retrying the
@@ -236,19 +438,186 @@ func (t *Tailer) Run(ctx context.Context) error {
 			return t.finish(nil)
 		}
 
-		if err := t.opts.Clock.Sleep(ctx, t.opts.PollInterval); err != nil {
+		if err := t.opts.Clock.Sleep(ctx, t.wait(batch)); err != nil {
 			return t.finish(nil)
 		}
 	}
 }
 
-// finish flushes and returns err, converting a flush failure into the error
-// when there is no more pressing one to report.
-func (t *Tailer) finish(err error) error {
-	if flushErr := t.sink.Flush(); flushErr != nil && err == nil {
-		return fmt.Errorf("flushing output: %w", flushErr)
+// leadership waits until this instance holds the lease and reports whether
+// the stream may continue.
+//
+// The first time leadership is taken the stream is rewound to the cursor
+// the previous leader committed, so a standby that takes over picks up the
+// work that was left behind instead of continuing from its own fetch
+// cursor, which may be ahead of what was actually delivered.
+//
+// The same happens after a handover in the other direction: an instance that
+// was fenced and later takes the lease back starts a new term, so it
+// rewinds again rather than continuing from a cursor the new leader has
+// already moved past.
+func (t *Tailer) leadership(ctx context.Context) (bool, error) {
+	if t.opts.Leader == nil {
+		return true, nil
 	}
+	leader, err := t.opts.Leader.Ensure(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !leader {
+		return false, nil
+	}
+	epoch := t.opts.Leader.Epoch()
+	if t.leading && epoch == t.leaderEpoch {
+		return true, nil
+	}
+	t.leading = true
+	t.leaderEpoch = epoch
+	// The pages queued before the handover describe work the previous
+	// leader did, so they are dropped rather than committed.
+	t.pages = nil
+	if t.opts.LeaderResume == nil {
+		return true, nil
+	}
+	cursor, err := t.opts.LeaderResume(ctx)
+	if err != nil {
+		return false, fmt.Errorf("resuming from the committed cursor: %w", err)
+	}
+	if cursor != "" {
+		t.cursor = cursor
+		t.deliveredCursor = cursor
+	}
+	return true, nil
+}
+
+// reportProgress tells the caller how far the stream has got.
+func (t *Tailer) reportProgress(b Batch) {
+	for _, r := range b.Records {
+		if r.Sequence > t.currentLedger {
+			t.currentLedger = r.Sequence
+		}
+	}
+	if t.opts.OnProgress == nil {
+		return
+	}
+	t.opts.OnProgress(Progress{
+		CurrentLedger: t.currentLedger,
+		LatestLedger:  b.Latest,
+	})
+}
+
+// Drain flushes everything the stream is holding and stops cleanly.
+//
+// It is what a graceful shutdown calls. The records still held in the
+// reorder buffer are written to the sink, the sink is flushed, and the
+// pages that were delivered are reported, so the final cursor is committed
+// before the process goes away.
+//
+// The timeout bounds how long the drain may take. A drain that overruns it
+// is reported as a failure rather than waited out: a process that is about
+// to be killed cannot be helped by a longer flush.
+//
+// Drain must be called after the run has stopped. It is not safe to call
+// while the tailer is still fetching.
+func (t *Tailer) Drain(ctx context.Context, timeout time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- t.drain(ctx)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("draining the stream: %w", ctx.Err())
+	}
+}
+
+// drain performs the flush without a deadline of its own.
+//
+// It runs on its own goroutine so that Drain can honour its timeout: a sink
+// that is stuck on a slow network cannot be interrupted, but the process
+// waiting for it can give up.
+//
+// A configured limit is respected: the records the limit left buffered are
+// dropped rather than emitted, because a request for N records must not
+// quietly become N plus whatever the run happened to be holding.
+func (t *Tailer) drain(ctx context.Context) error {
+	if t.opts.Limit == 0 || t.stats.Emitted < t.opts.Limit {
+		if _, _, err := t.emitReady(t.reorder.Flush()); err != nil {
+			return err
+		}
+	}
+	t.reportReadyPages()
+	if err := t.flushOutput(ctx); err != nil {
+		return fmt.Errorf("flushing output: %w", err)
+	}
+	return nil
+}
+
+// finish emits whatever the stream is still holding and commits the final
+// cursor.
+//
+// The sink is not flushed here: Run flushes it once, on the way out, so a
+// run that ends flushes exactly once whatever path it ended by.
+func (t *Tailer) finish(err error) error {
+	if err == nil && (t.opts.Limit == 0 || t.stats.Emitted < t.opts.Limit) {
+		if _, _, flushErr := t.emitReady(t.reorder.Flush()); flushErr != nil {
+			return flushErr
+		}
+	}
+	t.reportReadyPages()
 	return err
+}
+
+// flushOutput flushes the sink.
+//
+// Only one flush runs at a time. A flush that overran its deadline is
+// abandoned, and a second one waits for it rather than starting alongside
+// it: a sink that buffers would otherwise write the same batch twice.
+//
+// The whole operation, waiting included, is bounded by Options.DrainTimeout
+// when one is configured.
+func (t *Tailer) flushOutput(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if t.opts.DrainTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, t.opts.DrainTimeout)
+		defer cancel()
+	}
+
+	select {
+	case t.flushGate <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for the output to flush: %w", ctx.Err())
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		// The gate is released by the goroutine that holds it, so an
+		// abandoned flush keeps it and no second flush starts until it
+		// is done.
+		defer func() { <-t.flushGate }()
+		done <- t.sink.Flush()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // fetchWithRetry calls the Source, retrying transient failures with backoff
@@ -365,7 +734,78 @@ func (t *Tailer) storeKey() string {
 // emit writes a batch's records, suppressing any the server replayed, and
 // reports whether the configured limit has been reached.
 func (t *Tailer) emit(ctx context.Context, b Batch) (done bool, err error) {
+// reportsPage reports whether a page moved the stream forward.
+//
+// An empty page that leaves the cursor where it was says nothing new, and
+// reporting it would fill a cursor journal with duplicates of the position
+// already recorded.
+func (t *Tailer) reportsPage(b Batch) bool {
+	return len(b.Records) > 0 || (b.NextCursor != "" && b.NextCursor != t.cursor)
+}
+
+// queuePage remembers a fetched position without publishing it before the
+// reorder buffer has delivered that page, including earlier pending pages.
+func (t *Tailer) queuePage(b Batch) {
+	if !t.reportsPage(b) {
+		return
+	}
+	p := pendingPage{
+		page:    Page{Source: t.src.Name(), Cursor: b.NextCursor},
+		lastID:  t.lastID,
+		records: make(map[string]struct{}),
+	}
+	if len(t.pages) > 0 {
+		p.lastID = t.pages[len(t.pages)-1].lastID
+	}
+	seen := make(map[string]bool)
 	for _, r := range b.Records {
+		if r.ID > p.lastID {
+			p.lastID = r.ID
+		}
+		_, buffered := t.reorder.seen[r.ID]
+		if r.ID > t.lastID && !buffered && !seen[r.ID] {
+			p.page.Records++
+			p.records[r.ID] = struct{}{}
+		}
+		seen[r.ID] = true
+	}
+	if ledger, ok := t.src.CursorLedger(b.NextCursor); ok {
+		p.page.Ledger = ledger
+	}
+	t.pages = append(t.pages, p)
+}
+
+func (t *Tailer) reportReadyPages() {
+	for len(t.pages) > 0 && t.pages[0].lastID <= t.lastID {
+		p := t.pages[0].page
+		t.pages[0] = pendingPage{}
+		t.pages = t.pages[1:]
+		if p.Cursor != "" {
+			t.deliveredCursor = p.Cursor
+		}
+		if t.opts.OnPage != nil {
+			t.opts.OnPage(p)
+		}
+	}
+}
+
+// emit writes a batch's records, suppressing any the server replayed, and
+// reports whether the configured limit has been reached and records written.
+func (t *Tailer) emit(b Batch) (done bool, emitted int, err error) {
+	return t.emitReady(t.reorder.Add(b.Records))
+}
+
+func (t *Tailer) emitReady(records []Record) (done bool, emitted int, err error) {
+	if len(records) == 0 {
+		return false, 0, nil
+	}
+	if t.opts.Process != nil {
+		records, err = t.opts.Process(records)
+		if err != nil {
+			return false, 0, err
+		}
+	}
+	for _, r := range records {
 		// IDs are fixed-width and zero-padded, so this comparison is a
 		// chronological one. Anything at or before the high-water mark is a
 		// replay after a reconnect, or an out-of-order server response.
@@ -373,12 +813,33 @@ func (t *Tailer) emit(ctx context.Context, b Batch) (done bool, err error) {
 			t.stats.Duplicates++
 			continue
 		}
+		if t.opts.Filter != nil {
+			matched, err := t.opts.Filter.Match(r)
+			if err != nil {
+				return false, emitted, fmt.Errorf("filtering record %s: %w", r.ID, err)
+			}
+			if !matched {
+				t.lastID = r.ID
+				t.stats.Filtered++
+				for i := range t.pages {
+					if _, ok := t.pages[i].records[r.ID]; ok {
+						t.pages[i].page.Records--
+						delete(t.pages[i].records, r.ID)
+						break
+					}
+				}
+				t.reportReadyPages()
+				continue
+			}
+		}
 
 		if err := t.sink.Emit(r); err != nil {
-			return false, fmt.Errorf("writing record %s: %w", r.ID, err)
+			return false, emitted, fmt.Errorf("writing record %s: %w", r.ID, err)
 		}
 		t.lastID = r.ID
 		t.stats.Emitted++
+		emitted++
+		t.reportReadyPages()
 
 		// Persist at the cursor the record was fetched from: the record is
 		// out, and the next run must both resume at or before it and know
@@ -388,8 +849,8 @@ func (t *Tailer) emit(ctx context.Context, b Batch) (done bool, err error) {
 		}
 
 		if t.opts.Limit > 0 && t.stats.Emitted >= t.opts.Limit {
-			return true, nil
+			return true, emitted, nil
 		}
 	}
-	return false, nil
+	return false, emitted, nil
 }

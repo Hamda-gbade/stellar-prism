@@ -28,6 +28,7 @@ import (
 )
 
 func main() {
+	cli.InitSIGQUIT()
 	err := cli.Execute(os.Args[1:], os.Stdout, os.Stderr)
 	code, printable := cli.ExitCode(err)
 	if printable {

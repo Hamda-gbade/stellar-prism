@@ -10,11 +10,9 @@ import (
 
 	"github.com/stellar-optics/stellar-xdr-lens/pkg/lens"
 	lensformat "github.com/stellar-optics/stellar-xdr-lens/pkg/lens/format"
-
-	"github.com/stellar-optics/stellar-prism/pkg/rpc"
 )
 
-func newTxCmd(g *globalFlags, stdout io.Writer) *cobra.Command {
+func newTxCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	var (
 		asJSON    bool
 		verbose   bool
@@ -34,7 +32,11 @@ without the copy-and-paste.`,
   prism tx 3389e9f0a1b2c3... --fail-on-error`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client := newClient(rpc.ResolveURL(g.rpcURL), g.timeout)
+			client, closeClient, err := openClient(g, stderr)
+			if err != nil {
+				return err
+			}
+			defer closeClient()
 
 			resp, err := client.GetTransaction(cmd.Context(),
 				protocol.GetTransactionRequest{Hash: args[0]})
@@ -64,8 +66,12 @@ without the copy-and-paste.`,
 					return fmt.Errorf("encoding summary: %w", err)
 				}
 			} else {
+				color, err := parseColorMode(g.color)
+				if err != nil {
+					return err
+				}
 				f := lensformat.NewSummaryFormatter(
-					lensformat.WithSummaryPalette(lensformat.PaletteFor(stdout, g.color)),
+					lensformat.WithSummaryPalette(color.palette(stdout)),
 					lensformat.WithVerbose(verbose),
 				)
 				if err := f.Format(stdout, summary); err != nil {
@@ -74,7 +80,7 @@ without the copy-and-paste.`,
 			}
 
 			if failOnErr && summary.Outcome != nil && !summary.Outcome.Success {
-				return &exitError{code: 2, msg: "transaction failed"}
+				return fmt.Errorf("transaction failed")
 			}
 			return nil
 		},

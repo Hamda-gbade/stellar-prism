@@ -10,6 +10,7 @@ package fakerpc
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sort"
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
+	"github.com/stellar/go-stellar-sdk/strkey"
+	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
 // ErrDropped simulates a connection failure. It matches prism's retryable
@@ -70,8 +73,33 @@ type Server struct {
 
 	// tx maps a hash to a canned transaction response.
 	tx map[string]protocol.GetTransactionResponse
-	// txs is the canned response for getTransactions.
+	// transactions is the ordered universe served by a transaction fake.
+	transactions []protocol.TransactionInfo
+	// txs is a canned response for getTransactions, used when transactions
+	// is empty.
 	txs protocol.GetTransactionsResponse
+	// entries maps an encoded ledger key to its canned result.
+	entries         map[string]protocol.LedgerEntryResult
+	simulations     []protocol.SimulateTransactionResponse
+	simulationCalls int
+
+	// health is the explicit getHealth response; healthSet distinguishes it
+	// from an unconfigured zero value.
+	health      protocol.GetHealthResponse
+	healthSet   bool
+	healthErr   error
+	healthCalls int
+	// healthScript stages a sequence of responses for periodic-check tests.
+	healthScript []HealthBehaviour
+}
+
+// HealthBehaviour scripts one getHealth response. A non-nil Err takes
+// precedence over Response.
+type HealthBehaviour struct {
+	// Response is returned as-is when Err is nil.
+	Response protocol.GetHealthResponse
+	// Err is returned instead of Response.
+	Err error
 }
 
 // Option configures a Server.
@@ -92,6 +120,41 @@ func WithRetention(oldest uint32) Option {
 	return func(s *Server) { s.oldest = oldest }
 }
 
+// WithHealthResponse makes GetHealth return resp.
+func WithHealthResponse(resp protocol.GetHealthResponse) Option {
+	return func(s *Server) {
+		s.health = resp
+		s.healthSet = true
+		s.healthErr = nil
+		s.healthScript = nil
+	}
+}
+
+// WithHealthError makes GetHealth return err. A nil error is ignored, so a
+// table-driven test can pass an empty failure without clearing its response.
+func WithHealthError(err error) Option {
+	return func(s *Server) {
+		if err == nil {
+			return
+		}
+		s.healthErr = err
+		s.healthSet = false
+		s.healthScript = nil
+	}
+}
+
+// WithHealthScript installs getHealth behaviours keyed by zero-based call
+// index. The final entry repeats once the script is exhausted, which makes a
+// periodic test terminate without timing guesswork.
+func WithHealthScript(script []HealthBehaviour) Option {
+	return func(s *Server) {
+		s.healthScript = make([]HealthBehaviour, len(script))
+		copy(s.healthScript, script)
+		s.healthSet = false
+		s.healthErr = nil
+	}
+}
+
 // NewServer returns a fake serving the given events.
 func NewServer(events []protocol.EventInfo, opts ...Option) *Server {
 	s := &Server{
@@ -99,6 +162,7 @@ func NewServer(events []protocol.EventInfo, opts ...Option) *Server {
 		pageLimit: 100,
 		script:    map[int]Behaviour{},
 		tx:        map[string]protocol.GetTransactionResponse{},
+		entries:   map[string]protocol.LedgerEntryResult{},
 	}
 	for _, o := range opts {
 		o(s)
@@ -112,6 +176,27 @@ func NewServer(events []protocol.EventInfo, opts ...Option) *Server {
 	return s
 }
 
+// NewTransactionServer returns a fake serving the given transactions with the
+// same cursor semantics as the real getTransactions endpoint.
+func NewTransactionServer(txs []protocol.TransactionInfo, opts ...Option) *Server {
+	s := &Server{
+		transactions: txs,
+		pageLimit:    100,
+		script:       map[int]Behaviour{},
+		tx:           map[string]protocol.GetTransactionResponse{},
+	}
+	for _, o := range opts {
+		o(s)
+	}
+	if len(txs) > 0 {
+		s.latest = txs[len(txs)-1].Ledger
+		if s.oldest == 0 {
+			s.oldest = txs[0].Ledger
+		}
+	}
+	return s
+}
+
 // NewLedgerServer returns a fake serving the given ledgers.
 func NewLedgerServer(ledgers []protocol.LedgerInfo, opts ...Option) *Server {
 	s := &Server{
@@ -119,6 +204,7 @@ func NewLedgerServer(ledgers []protocol.LedgerInfo, opts ...Option) *Server {
 		pageLimit: 100,
 		script:    map[int]Behaviour{},
 		tx:        map[string]protocol.GetTransactionResponse{},
+		entries:   map[string]protocol.LedgerEntryResult{},
 	}
 	for _, o := range opts {
 		o(s)
@@ -144,6 +230,141 @@ func (s *Server) SetTransactions(resp protocol.GetTransactionsResponse) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.txs = resp
+}
+
+// SetSimulations installs responses returned in order by simulateTransaction.
+// The final response is reused after the sequence is exhausted.
+func (s *Server) SetSimulations(responses []protocol.SimulateTransactionResponse) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.simulations = append([]protocol.SimulateTransactionResponse(nil), responses...)
+	s.simulationCalls = 0
+}
+
+// SetLedgerEntries installs canned results keyed by encoded ledger key.
+func (s *Server) SetLedgerEntries(entries map[string]protocol.LedgerEntryResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries = entries
+}
+
+// SetHealth installs an explicit getHealth response.
+func (s *Server) SetHealth(resp protocol.GetHealthResponse) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.health = resp
+	s.healthSet = true
+	s.healthErr = nil
+	s.healthScript = nil
+}
+
+// SetHealthError makes every subsequent GetHealth call fail with err.
+func (s *Server) SetHealthError(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.healthErr = err
+	s.healthSet = false
+	s.healthScript = nil
+}
+
+// HealthCalls reports how many getHealth calls the fake has served.
+func (s *Server) HealthCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.healthCalls
+}
+
+// SetContractWasm installs the instance and code entries for a contract whose
+// WASM bytecode is wasm. It is the fixture that lets ABI resolution be tested
+// without a network.
+func (s *Server) SetContractWasm(contractID string, wasm []byte) error {
+	entries, err := ContractWasmEntries(contractID, wasm)
+	if err != nil {
+		return err
+	}
+	s.SetLedgerEntries(entries)
+	return nil
+}
+
+// ContractWasmEntries builds the two ledger entries a contract ABI resolver
+// reads: the instance entry naming the WASM hash, and the code entry carrying
+// the bytecode.
+func ContractWasmEntries(contractID string, wasm []byte) (map[string]protocol.LedgerEntryResult, error) {
+	raw, err := strkey.Decode(strkey.VersionByteContract, contractID)
+	if err != nil {
+		return nil, fmt.Errorf("decoding contract ID: %w", err)
+	}
+	if len(raw) != len(xdr.Hash{}) {
+		return nil, fmt.Errorf("contract ID decodes to %d bytes, want %d", len(raw), len(xdr.Hash{}))
+	}
+
+	var id xdr.ContractId
+	copy(id[:], raw)
+	address := xdr.ScAddress{Type: xdr.ScAddressTypeScAddressTypeContract, ContractId: &id}
+	hash := xdr.Hash(sha256.Sum256(wasm))
+
+	instance := xdr.LedgerEntry{
+		Data: xdr.LedgerEntryData{
+			Type: xdr.LedgerEntryTypeContractData,
+			ContractData: &xdr.ContractDataEntry{
+				Contract:   address,
+				Key:        xdr.ScVal{Type: xdr.ScValTypeScvLedgerKeyContractInstance},
+				Durability: xdr.ContractDataDurabilityPersistent,
+				Val: xdr.ScVal{
+					Type: xdr.ScValTypeScvContractInstance,
+					Instance: &xdr.ScContractInstance{
+						Executable: xdr.ContractExecutable{
+							Type:     xdr.ContractExecutableTypeContractExecutableWasm,
+							WasmHash: &hash,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	code := xdr.LedgerEntry{
+		Data: xdr.LedgerEntryData{
+			Type: xdr.LedgerEntryTypeContractCode,
+			ContractCode: &xdr.ContractCodeEntry{
+				Hash: hash,
+				Code: wasm,
+			},
+		},
+	}
+
+	instanceKey := xdr.LedgerKey{
+		Type: xdr.LedgerEntryTypeContractData,
+		ContractData: &xdr.LedgerKeyContractData{
+			Contract:   address,
+			Key:        xdr.ScVal{Type: xdr.ScValTypeScvLedgerKeyContractInstance},
+			Durability: xdr.ContractDataDurabilityPersistent,
+		},
+	}
+	codeKey := xdr.LedgerKey{
+		Type:         xdr.LedgerEntryTypeContractCode,
+		ContractCode: &xdr.LedgerKeyContractCode{Hash: hash},
+	}
+
+	entries := make(map[string]protocol.LedgerEntryResult, 2)
+	for _, item := range []struct {
+		key   xdr.LedgerKey
+		entry xdr.LedgerEntry
+	}{
+		{key: instanceKey, entry: instance},
+		{key: codeKey, entry: code},
+	} {
+		keyXDR, err := xdr.MarshalBase64(item.key)
+		if err != nil {
+			return nil, fmt.Errorf("encoding ledger key: %w", err)
+		}
+		dataXDR, err := xdr.MarshalBase64(item.entry)
+		if err != nil {
+			return nil, fmt.Errorf("encoding ledger entry: %w", err)
+		}
+		entries[keyXDR] = protocol.LedgerEntryResult{KeyXDR: keyXDR, DataXDR: dataXDR}
+	}
+	return entries, nil
 }
 
 // Calls reports how many stream calls have been made, so tests can assert on
@@ -252,6 +473,112 @@ func (s *Server) GetEvents(ctx context.Context, req protocol.GetEventsRequest) (
 	return respond(out), nil
 }
 
+// GetEventsBatch implements rpc.Client, serving every request in order and
+// stopping at the first scripted failure — the responses gathered before it
+// are returned with the error so the caller can see how far the batch got.
+func (s *Server) GetEventsBatch(ctx context.Context, reqs []protocol.GetEventsRequest) ([]protocol.GetEventsResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(reqs) == 0 {
+		return nil, nil
+	}
+
+	responses := make([]protocol.GetEventsResponse, 0, len(reqs))
+	for _, req := range reqs {
+		// Each entry in the batch is one call as far as the script is
+		// concerned, so the indices advance in step with the requests.
+		call := s.calls
+		s.calls++
+		b := s.script[call]
+
+		if b.Err != nil {
+			return responses, b.Err
+		}
+
+		hasCursor := req.Pagination != nil && req.Pagination.Cursor != nil
+		if hasCursor && req.StartLedger != 0 {
+			return responses, errors.New("ledger ranges and cursor cannot both be set")
+		}
+
+		oldest, latest := s.oldest, s.latest
+		if b.OldestLedger != 0 {
+			oldest = b.OldestLedger
+		}
+		if b.LatestLedger != 0 {
+			latest = b.LatestLedger
+		}
+
+		respond := func(page []protocol.EventInfo) protocol.GetEventsResponse {
+			s.lastEvents = page
+			resp := protocol.GetEventsResponse{
+				Events:       page,
+				LatestLedger: latest,
+				OldestLedger: oldest,
+			}
+			if len(page) > 0 {
+				resp.Cursor = page[len(page)-1].ID
+			} else if hasCursor {
+				resp.Cursor = req.Pagination.Cursor.String()
+			}
+			return resp
+		}
+
+		if b.Empty {
+			responses = append(responses, respond(nil))
+			continue
+		}
+		if b.ReplayLast {
+			responses = append(responses, respond(s.lastEvents))
+			continue
+		}
+
+		// Select everything strictly after the cursor, or from the start ledger.
+		var out []protocol.EventInfo
+		for _, e := range s.events {
+			if hasCursor {
+				if e.ID > req.Pagination.Cursor.String() {
+					out = append(out, e)
+				}
+				continue
+			}
+			if req.StartLedger == 0 || uint32(e.Ledger) >= req.StartLedger { //nolint:gosec // test data
+				out = append(out, e)
+			}
+		}
+
+		limit := s.pageLimit
+		if req.Pagination != nil && req.Pagination.Limit > 0 && int(req.Pagination.Limit) < limit {
+			limit = int(req.Pagination.Limit)
+		}
+		if len(out) > limit {
+			out = out[:limit]
+		}
+
+		if b.Reorder {
+			reversed := make([]protocol.EventInfo, len(out))
+			copy(reversed, out)
+			sort.Slice(reversed, func(i, j int) bool { return reversed[i].ID > reversed[j].ID })
+			// Cursor still reflects the true high-water mark; only the page order
+			// is wrong, which is exactly the hazard being simulated.
+			s.lastEvents = reversed
+			resp := protocol.GetEventsResponse{
+				Events:       reversed,
+				LatestLedger: latest,
+				OldestLedger: oldest,
+			}
+			if len(out) > 0 {
+				resp.Cursor = out[len(out)-1].ID
+			}
+			responses = append(responses, resp)
+			continue
+		}
+
+		responses = append(responses, respond(out))
+	}
+	return responses, nil
+}
+
 // GetLedgers implements rpc.Client.
 func (s *Server) GetLedgers(ctx context.Context, req protocol.GetLedgersRequest) (protocol.GetLedgersResponse, error) {
 	s.mu.Lock()
@@ -358,7 +685,139 @@ func (s *Server) GetTransactions(ctx context.Context, req protocol.GetTransactio
 	if err := ctx.Err(); err != nil {
 		return protocol.GetTransactionsResponse{}, err
 	}
-	return s.txs, nil
+	if len(s.transactions) == 0 {
+		return s.txs, nil
+	}
+
+	call := s.calls
+	s.calls++
+	b := s.script[call]
+	if b.Err != nil {
+		return protocol.GetTransactionsResponse{}, b.Err
+	}
+
+	oldest, latest := s.oldest, s.latest
+	if b.OldestLedger != 0 {
+		oldest = b.OldestLedger
+	}
+	if b.LatestLedger != 0 {
+		latest = b.LatestLedger
+	}
+
+	hasCursor := req.Pagination != nil && req.Pagination.Cursor != ""
+
+	respond := func(page []protocol.TransactionInfo) protocol.GetTransactionsResponse {
+		resp := protocol.GetTransactionsResponse{
+			Transactions: page,
+			LatestLedger: latest,
+			OldestLedger: oldest,
+		}
+		if len(page) > 0 {
+			resp.Cursor = transactionCursor(page[len(page)-1])
+		} else if hasCursor {
+			resp.Cursor = req.Pagination.Cursor
+		}
+		return resp
+	}
+
+	if b.Empty {
+		return respond(nil), nil
+	}
+
+	var out []protocol.TransactionInfo
+	for _, tx := range s.transactions {
+		if hasCursor {
+			if transactionCursor(tx) > req.Pagination.Cursor {
+				out = append(out, tx)
+			}
+			continue
+		}
+		if req.StartLedger == 0 || tx.Ledger >= req.StartLedger {
+			out = append(out, tx)
+		}
+	}
+
+	limit := s.pageLimit
+	if req.Pagination != nil && req.Pagination.Limit > 0 && int(req.Pagination.Limit) < limit {
+		limit = int(req.Pagination.Limit)
+	}
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return respond(out), nil
+}
+
+func transactionCursor(tx protocol.TransactionInfo) string {
+	return fmt.Sprintf("%010d-%06d", tx.Ledger, tx.ApplicationOrder)
+}
+
+// GetLedgerEntries implements rpc.LedgerEntriesClient.
+func (s *Server) GetLedgerEntries(ctx context.Context, req protocol.GetLedgerEntriesRequest) (protocol.GetLedgerEntriesResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return protocol.GetLedgerEntriesResponse{}, err
+	}
+
+	resp := protocol.GetLedgerEntriesResponse{LatestLedger: s.latest}
+	for _, key := range req.Keys {
+		entry, ok := s.entries[key]
+		if !ok {
+			continue
+		}
+		resp.Entries = append(resp.Entries, entry)
+	}
+	return resp, nil
+}
+
+// GetHealth implements rpc.HealthClient.
+//
+// Without an explicit response or script it derives a healthy answer from the
+// fake's ledger data, so a test that only cares about a transport failure does
+// not have to construct the full response.
+func (s *Server) GetHealth(ctx context.Context) (protocol.GetHealthResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return protocol.GetHealthResponse{}, err
+	}
+
+	call := s.healthCalls
+	s.healthCalls++
+
+	if len(s.healthScript) > 0 {
+		index := call
+		if index >= len(s.healthScript) {
+			index = len(s.healthScript) - 1
+		}
+		behaviour := s.healthScript[index]
+		if behaviour.Err != nil {
+			return protocol.GetHealthResponse{}, behaviour.Err
+		}
+		return behaviour.Response, nil
+	}
+	if s.healthErr != nil {
+		return protocol.GetHealthResponse{}, s.healthErr
+	}
+	if s.healthSet {
+		return s.health, nil
+	}
+
+	now := time.Now()
+	var retention uint32
+	if s.latest >= s.oldest {
+		retention = s.latest - s.oldest
+	}
+	return protocol.GetHealthResponse{
+		Status:                "healthy",
+		LatestLedger:          s.latest,
+		LatestLedgerCloseTime: now.Unix(),
+		OldestLedger:          s.oldest,
+		OldestLedgerCloseTime: now.Add(-time.Duration(retention) * 5 * time.Second).Unix(),
+		LedgerRetentionWindow: retention,
+	}, nil
 }
 
 // GetLatestLedger implements rpc.Client.
@@ -370,6 +829,24 @@ func (s *Server) GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerR
 		return protocol.GetLatestLedgerResponse{}, err
 	}
 	return protocol.GetLatestLedgerResponse{Sequence: s.latest}, nil
+}
+
+// SimulateTransaction implements rpc.Client.
+func (s *Server) SimulateTransaction(ctx context.Context, req protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return protocol.SimulateTransactionResponse{}, err
+	}
+	if len(s.simulations) == 0 {
+		return protocol.SimulateTransactionResponse{}, nil
+	}
+	index := s.simulationCalls
+	if index >= len(s.simulations) {
+		index = len(s.simulations) - 1
+	}
+	s.simulationCalls++
+	return s.simulations[index], nil
 }
 
 // MakeEvents builds a contiguous run of events, one per ledger starting at
