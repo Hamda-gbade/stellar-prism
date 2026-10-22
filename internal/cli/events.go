@@ -28,6 +28,9 @@ type streamFlags struct {
 	since            time.Duration
 	limit            int
 	asJSON           bool
+	format           string
+	csvFields        string
+	tsv              bool
 	raw              bool
 	compact          bool
 	poll             time.Duration
@@ -125,6 +128,9 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"stop after this many records (0 means unlimited)")
 	cmd.Flags().BoolVar(&s.asJSON, "json", false,
 		"emit NDJSON, one record per line")
+	cmd.Flags().StringVar(&s.format, "format", "", "output format: csv or tsv (default is human-readable; --json remains supported)")
+	cmd.Flags().StringVar(&s.csvFields, "csv-fields", "", "comma-separated CSV/TSV columns: id,ledger,time,kind,contract,tx,topic0,value")
+	cmd.Flags().BoolVar(&s.tsv, "tsv", false, "write tab-separated output (equivalent to --format tsv)")
 	cmd.Flags().BoolVar(&s.raw, "raw", false,
 		"leave XDR base64-encoded instead of decoding it")
 	cmd.Flags().BoolVar(&s.compact, "compact", false,
@@ -207,6 +213,19 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 func (s *streamFlags) validate(cmd *cobra.Command) error {
 	if err := s.sinks.validate(); err != nil {
 		return err
+	}
+	format := strings.ToLower(s.format)
+	if format != "" && format != "csv" && format != "tsv" {
+		return fmt.Errorf(`invalid --format %q: want "csv" or "tsv"`, s.format)
+	}
+	if s.tsv && format != "" && format != "tsv" {
+		return fmt.Errorf("--tsv conflicts with --format csv")
+	}
+	if (format != "" || s.tsv || s.csvFields != "") && s.asJSON {
+		return fmt.Errorf("CSV/TSV output conflicts with --json")
+	}
+	if s.csvFields != "" && format == "" && !s.tsv {
+		return fmt.Errorf("--csv-fields requires --format csv or --format tsv")
 	}
 	if cmd.Flags().Changed("since") {
 		if s.from != 0 {
@@ -393,6 +412,21 @@ func (s *streamFlags) newSink(
 	onDeadLetter func(sink.DLQEntry),
 ) (stream.Sink, error) {
 	build := func(out io.Writer) stream.Sink {
+		format := strings.ToLower(s.format)
+		if s.tsv {
+			format = "tsv"
+		}
+		if format == "csv" || format == "tsv" {
+			fields := []string(nil)
+			if s.csvFields != "" {
+				fields = strings.Split(s.csvFields, ",")
+			}
+			csv, err := sink.NewCSVSink(out, sink.CSVOptions{Fields: fields, Delimiter: map[bool]rune{true: '\t', false: ','}[format == "tsv"]})
+			if err != nil {
+				return errorSink{err: err}
+			}
+			return csv
+		}
 		if s.asJSON {
 			return sink.NewNDJSON(out, !s.raw)
 		}
@@ -469,6 +503,11 @@ func (s *streamFlags) newSink(
 		},
 	}, nil
 }
+
+type errorSink struct{ err error }
+
+func (s errorSink) Emit(stream.Record) error { return s.err }
+func (s errorSink) Flush() error             { return s.err }
 
 // closingSink gives a wrapper without its own Close a teardown path. It is how
 // a sink chain tells runStream that there is more to release than the outermost

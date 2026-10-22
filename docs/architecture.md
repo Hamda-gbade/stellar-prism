@@ -1024,9 +1024,10 @@ returning an error, so one malformed value cannot kill a long-running tail.
 
 Every streaming command accepts the same optional output flags. They are off
 unless set, so the default path still touches nothing but RPC and stdout. When
-one or more are enabled, `pkg/sink.Fanout` delivers each record to the normal
-output first and then to each extra sink in order; the first failure ends the
-stream rather than silently dropping records. `Close` flushes buffered
+one or more are enabled, `pkg/sink.MultiSink` delivers each record to the
+normal output and every extra sink. It records acknowledgements per sink, so a
+retry does not repeat a delivery that already succeeded; any unresolved
+failure ends the stream rather than silently dropping records. `Close` flushes buffered
 batches, stops timers and closes listeners and sockets, so a finished stream
 leaves nothing running.
 
@@ -1122,6 +1123,34 @@ Structured-data values escape `\`, `"` and `]` per RFC 5424.
 as the address. `DialSyslog` also accepts `unix://`, `udp://`, `tcp://` and a
 bare socket path; `--syslog-facility` accepts any POSIX facility name and
 defaults to `local0`.
+
+#### Elasticsearch/OpenSearch (`--sink-es-url`, `pkg/sink/elasticsearch.go`)
+
+Records are written through the bulk API in NDJSON pairs: an `index` action
+followed by the same JSON document emitted by `--json`. The record ID is the
+Elasticsearch document ID, so retrying a buffered batch overwrites the same
+documents rather than creating duplicates. `--sink-es-index` is the base name;
+the actual index is `<base>-YYYY.MM.DD`, derived from each record's UTC close
+time. `--sink-es-batch-size` and `--sink-es-flush-interval` bound the in-memory
+batch. Authenticate with `--sink-es-api-key` (or `PRISM_ES_API_KEY`) or basic
+credentials.
+
+#### NATS and JetStream (`--sink-nats`, `pkg/sink/nats.go`)
+
+Each record is published as the regular `--json` document to a subject rendered
+from `--nats-subject`; the template may use `.ContractID`, `.Topic0`, `.ID` and
+`.Ledger`. The default is `stellar.events.{{.ContractID}}`. A rendered subject
+must contain nonempty publish tokens. Core NATS flushes after each publish;
+`--nats-jetstream` waits for a JetStream publish acknowledgement.
+
+#### ZeroMQ PUB (`--sink-zmq`, `pkg/sink/zeromq.go`)
+
+The ZeroMQ sink connects a PUB socket to `--sink-zmq` and sends each record as
+a multipart `[topic, JSON]` message. `--zmq-topic` uses the same template data
+as `--nats-subject`, which gives subscribers an efficient prefix-filterable
+first frame. PUB delivery is intentionally best-effort: a slow or disconnected
+subscriber can miss messages under ZeroMQ's high-water-mark semantics. Use
+NATS JetStream when publisher acknowledgements are required.
 
 #### Configuration rules
 
