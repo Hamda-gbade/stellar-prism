@@ -257,14 +257,14 @@ func (n *NDJSON) encode(r stream.Record) error {
 	switch r.Kind {
 	case stream.KindEvent:
 		line := eventLine{
-			Kind:    string(r.Kind),
-			ID:      r.ID,
-			Ledger:  r.Sequence,
-			Time:    formatTime(r.Time),
-			TxIndex: r.Event.TxIndex,
-			OpIndex: r.Event.OpIndex,
+			Kind:   string(r.Kind),
+			ID:     r.ID,
+			Ledger: r.Sequence,
+			Time:   formatTime(r.Time),
 		}
 		if r.Event != nil {
+			line.TxIndex = r.Event.TxIndex
+			line.OpIndex = r.Event.OpIndex
 			line.Type = r.Event.Type
 			line.ContractID = r.Event.ContractID
 			line.TxHash = r.Event.TxHash

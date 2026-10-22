@@ -160,6 +160,9 @@ emits:
 | `--cloud-bucket` + `--cloud-provider` | Gzipped NDJSON chunks in S3 or GCS |
 | `--metrics-addr` | Prometheus `/metrics` (throughput, ledger latency, errors) |
 | `--syslog-address` | RFC 5424 syslog or systemd-journald native fields |
+| `--sink-es-url` | Elasticsearch/OpenSearch bulk indexing, partitioned into a daily index |
+| `--sink-nats` | NATS core publish or JetStream acknowledgements (`--nats-jetstream`) |
+| `--sink-zmq` | ZeroMQ PUB messages with templated topic and JSON payload frames |
 
 ```sh
 # Fan a live stream out to a receiver and to S3-compatible storage
@@ -175,9 +178,21 @@ prism events --follow --json --metrics-addr 127.0.0.1:9090
 prism events --follow --json \
   --syslog-address unixgram:///run/systemd/journal/socket \
   --syslog-format journald
+
+# Index records by day in Elasticsearch or OpenSearch
+prism events --follow --sink-es-url https://search.example.com \
+  --sink-es-index prism-events
+
+# Publish each event using its contract as a NATS subject token
+prism events --follow --sink-nats nats://127.0.0.1:4222 \
+  --nats-subject 'stellar.events.{{.ContractID}}'
+
+# Broadcast multipart [topic, JSON] messages over ZeroMQ PUB
+prism events --follow --sink-zmq tcp://127.0.0.1:5556 \
+  --zmq-topic 'stellar.events.{{.ContractID}}'
 ```
 
-Credentials come from the environment (`PRISM_WEBHOOK_SECRET`,
+Credentials come from the environment (`PRISM_WEBHOOK_SECRET`, `PRISM_ES_API_KEY`,
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `GOOGLE_OAUTH_ACCESS_TOKEN`) so
 they do not appear in `ps` output. Delivery to webhooks and object storage is
 at-least-once: a batch is retried until acknowledged and uses a stable key or

@@ -95,6 +95,119 @@ func TestWebhookSinkEndToEnd(t *testing.T) {
 	}
 }
 
+func TestElasticsearchSinkEndToEnd(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(11100, 3), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	var (
+		mu     sync.Mutex
+		bodies [][]byte
+	)
+	es := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/_bulk" {
+			t.Errorf("path = %q, want /_bulk", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "ApiKey test-key" {
+			t.Errorf("Authorization = %q", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("reading request: %v", err)
+		}
+		mu.Lock()
+		bodies = append(bodies, body)
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"errors":false}`))
+	}))
+	defer es.Close()
+
+	stdout, _, err := run(t, "events", "--from", "11100", "--json", "--raw",
+		"--sink-es-url", es.URL, "--sink-es-index", "prism-test",
+		"--sink-es-api-key", "test-key", "--sink-es-batch-size", "2")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := len(nonEmptyLines(stdout)); got != 3 {
+		t.Errorf("stdout has %d records, want 3", got)
+	}
+
+	mu.Lock()
+	gotBodies := append([][]byte(nil), bodies...)
+	mu.Unlock()
+	if len(gotBodies) != 2 {
+		t.Fatalf("bulk requests = %d, want 2", len(gotBodies))
+	}
+	indexed := 0
+	for _, body := range gotBodies {
+		lines := nonEmptyLines(string(body))
+		if len(lines)%2 != 0 {
+			t.Fatalf("bulk body has %d lines, want action/document pairs: %q", len(lines), body)
+		}
+		for i := 0; i < len(lines); i += 2 {
+			var action struct {
+				Index struct {
+					ID    string `json:"_id"`
+					Index string `json:"_index"`
+				} `json:"index"`
+			}
+			if err := json.Unmarshal([]byte(lines[i]), &action); err != nil {
+				t.Fatal(err)
+			}
+			if action.Index.ID == "" || !strings.HasPrefix(action.Index.Index, "prism-test-") {
+				t.Errorf("bulk action = %+v", action)
+			}
+			var record map[string]any
+			if err := json.Unmarshal([]byte(lines[i+1]), &record); err != nil {
+				t.Fatal(err)
+			}
+			if record["id"] != action.Index.ID {
+				t.Errorf("document id = %v, action id = %q", record["id"], action.Index.ID)
+			}
+			indexed++
+		}
+	}
+	if indexed != 3 {
+		t.Errorf("indexed %d records, want 3", indexed)
+	}
+}
+
+func TestCSVOutputEndToEnd(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(11150, 2), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	stdout, _, err := run(t, "events", "--from", "11150", "--format", "csv",
+		"--csv-fields", "id,ledger,contract")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	lines := nonEmptyLines(stdout)
+	if len(lines) != 3 {
+		t.Fatalf("CSV lines = %d, want header plus 2 records: %q", len(lines), stdout)
+	}
+	if lines[0] != "id,ledger,contract" {
+		t.Errorf("header = %q", lines[0])
+	}
+	if !strings.Contains(lines[1], ",11150,") || !strings.Contains(lines[2], ",11151,") {
+		t.Errorf("rows do not carry the expected ledgers: %q", stdout)
+	}
+}
+
+func TestDelimitedOutputFlagValidation(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(11175, 1), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	for _, args := range [][]string{
+		{"events", "--from", "11175", "--format", "json"},
+		{"events", "--from", "11175", "--format", "csv", "--json"},
+		{"events", "--from", "11175", "--csv-fields", "id,ledger"},
+		{"events", "--from", "11175", "--format", "csv", "--csv-fields", "id,unknown"},
+	} {
+		if _, _, err := run(t, args...); err == nil {
+			t.Errorf("run(%q) error = nil, want validation failure", args)
+		}
+	}
+}
+
 func TestCloudSinkEndToEnd(t *testing.T) {
 	t.Setenv(gcsTokenEnvVar, "test-token")
 
@@ -323,6 +436,18 @@ func TestSinkFlagValidation(t *testing.T) {
 			args: []string{"events", "--from", "15000",
 				"--webhook-url", "https://example.com/hook", "--webhook-batch-size", "-1"},
 		},
+		{
+			name: "Elasticsearch credentials without URL",
+			args: []string{"events", "--from", "15000", "--sink-es-api-key", "key"},
+		},
+		{
+			name: "nonpositive Elasticsearch batch",
+			args: []string{"events", "--from", "15000", "--sink-es-url", "https://example.com", "--sink-es-batch-size", "0"},
+		},
+		{
+			name: "JetStream without NATS",
+			args: []string{"events", "--from", "15000", "--nats-jetstream"},
+		},
 	}
 
 	for _, tc := range tests {
@@ -361,6 +486,7 @@ func TestStreamingHelpAdvertisesSinkFlags(t *testing.T) {
 	for _, flag := range []string{
 		"--webhook-url", "--webhook-secret", "--cloud-provider", "--cloud-bucket",
 		"--metrics-addr", "--syslog-address", "--syslog-format", "--syslog-facility",
+		"--sink-es-url", "--sink-es-index", "--sink-nats", "--nats-subject", "--sink-zmq", "--zmq-topic",
 	} {
 		if !strings.Contains(stdout, flag) {
 			t.Errorf("help does not mention %s", flag)
