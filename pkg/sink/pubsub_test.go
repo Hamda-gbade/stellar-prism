@@ -1,10 +1,12 @@
 package sink
 
 import (
-	"cloud.google.com/go/pubsub"
 	"context"
-	"github.com/stellar-optics/stellar-prism/pkg/stream"
 	"testing"
+
+	"cloud.google.com/go/pubsub/v2"
+
+	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
 type fakePublishResult struct{}

@@ -4,7 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"cloud.google.com/go/pubsub"
+	"cloud.google.com/go/pubsub/v2"
+
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
@@ -16,14 +17,16 @@ type PubSubPublisher interface {
 type PublishResult interface {
 	Get(context.Context) (string, error)
 }
-type pubsubAdapter struct{ topic *pubsub.Topic }
+type pubsubAdapter struct{ publisher *pubsub.Publisher }
 type pubsubResult struct{ result *pubsub.PublishResult }
 
 func (a pubsubAdapter) Publish(ctx context.Context, m *pubsub.Message) PublishResult {
-	return pubsubResult{a.topic.Publish(ctx, m)}
+	return pubsubResult{a.publisher.Publish(ctx, m)}
 }
 func (r pubsubResult) Get(ctx context.Context) (string, error) { return r.result.Get(ctx) }
-func AdaptPubSubTopic(topic *pubsub.Topic) PubSubPublisher     { return pubsubAdapter{topic} }
+func AdaptPubSubPublisher(publisher *pubsub.Publisher) PubSubPublisher {
+	return pubsubAdapter{publisher}
+}
 
 type PubSubSink struct {
 	publisher PubSubPublisher
@@ -53,4 +56,9 @@ func (s *PubSubSink) Emit(r stream.Record) error {
 	return nil
 }
 func (*PubSubSink) Flush() error { return nil }
-func (*PubSubSink) Close() error { return nil }
+func (s *PubSubSink) Close() error {
+	if publisher, ok := s.publisher.(interface{ Stop() }); ok {
+		publisher.Stop()
+	}
+	return nil
+}

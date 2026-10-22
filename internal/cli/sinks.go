@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"cloud.google.com/go/pubsub"
+	"cloud.google.com/go/pubsub/v2"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -391,7 +391,7 @@ func (s *sinkFlags) addTo(base stream.Sink, raw bool, onAsyncError func(error)) 
 			_ = client.Close()
 			return nil, fmt.Errorf("--sink-pubsub-topic must be projects/PROJECT/topics/TOPIC")
 		}
-		p, e := sink.NewPubSubSink(sink.AdaptPubSubTopic(client.Topic(parts[1])), !raw)
+		p, e := sink.NewPubSubSink(sink.AdaptPubSubPublisher(client.Publisher(s.pubsubTopic)), !raw)
 		if e != nil {
 			_ = client.Close()
 			return nil, e

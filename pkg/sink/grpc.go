@@ -27,11 +27,12 @@ func (s *GRPCSink) Emit(r stream.Record) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var clients map[uint64]chan stream.Record
-	if r.Kind == stream.KindEvent {
+	switch r.Kind {
+	case stream.KindEvent:
 		clients = s.events
-	} else if r.Kind == stream.KindLedger {
+	case stream.KindLedger:
 		clients = s.ledgers
-	} else {
+	default:
 		return nil
 	}
 	for _, ch := range clients {

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/parquet-go/parquet-go"
+
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
