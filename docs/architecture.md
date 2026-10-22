@@ -58,6 +58,7 @@ internal/cli/         cobra commands — thin wrappers over pkg/stream
   completion.go       bash/zsh/fish/powershell script generation
   abi_resolve.go      contract WASM lookup and embedded-spec parsing
   state.go            the cursor journal, the pruner, and the resume point
+  runtime.go          the health server, the lease and the state key source
   syncwriter.go       serialised stderr, for the diagnostics several goroutines write
 internal/fakerpc/     scriptable in-memory RPC for tests
 pkg/rpc/              the Client interface + SDK adapter
@@ -85,6 +86,11 @@ pkg/stream/
   gap_recovery.go     GapStrategy, Rewinder and gap handling
   pruning.go          CursorMetadata, MetadataStore, Pruner
   cursor_store.go     file-backed cursor metadata journal
+  ha.go               lease-based leader election (active-passive)
+  ha_lock_unix.go     flock(2) primitives for the lease
+  health.go           the liveness/readiness probe server and its monitor
+  crypto_state.go     AES-256-GCM encrypted cursor journal
+  kms.go              AWS and GCP key management clients
   context.go          TaskGroup and cancellation helpers
   clock.go            Clock and Backoff, both injectable
   topic_pattern.go    client-side topic matching over decoded text
@@ -494,6 +500,145 @@ existing flag are unchanged. New exported surface:
 | `SDKClient.GetHealth`, `Pool.GetHealth` | `pkg/rpc/client.go`, `pkg/stream/pool.go` |
 | `--follow`, `--interval`, `--health-timeout`, `--max-ledger-age`, `--fail-after`, `--json` | `prism health` |
 | `fakerpc.WithHealthResponse`, `WithHealthError`, `WithHealthScript`, `fakerpc.HealthBehaviour` | `internal/fakerpc` |
+
+## Active-passive high availability (`pkg/stream/ha.go`)
+
+A single prism instance is a single point of failure, and two instances
+streaming the same contract emit the same records twice and fight over the
+cursor file. `--ha-lease-file` makes a pair **active-passive**: the leader
+streams, the standby waits and takes over.
+
+Two mechanisms cooperate, because each covers a failure the other cannot.
+
+- **An advisory lock on the lease file** (`flock(2)`) is held for the whole of
+  a leader's term. The kernel drops it the moment the process dies, so a
+  crashed leader is replaced at once — no TTL to wait out.
+- **A lease record beside it** (`<path>.lease`) carries the holder, an
+  expiry and an **epoch**. It covers the case the lock cannot: a leader that
+  is alive but partitioned, and so neither renews nor exits. Its lease
+  expires, a standby fences it by claiming a higher epoch, and the old leader
+  notices on its next renewal that it has been replaced and stops.
+
+The epoch is the fencing token. It increases every time the lease changes
+hands, so a leader that was slow, paused or partitioned can tell that its
+term has ended and step down instead of continuing to emit alongside the new
+leader. The tailer compares the epoch on every poll: a change means the
+pages queued so far describe work the previous leader did, so they are
+dropped rather than committed, and the stream rewinds to the cursor the
+previous leader committed.
+
+```
+  leader                              standby
+  ──────                              ───────
+  flock(lease)  ──► held
+  write record {holder, epoch: 7, expires}
+                    renew every --ha-heartbeat
+                                         flock(lease)  ──► busy, lease live
+                                         ...lease expires...
+                                         write record {holder, epoch: 8}
+  renew ──► epoch 8 > 7, fenced
+  release the term                     flock(lease)  ──► held
+                                       write record {holder, epoch: 9}
+```
+
+The lease file must be on a file system that supports advisory locking (a
+shared NFS mount, for instance) so every instance sees the same lock. On a
+platform without `flock`, `lockFile` returns an error rather than pretending
+the lease works — the alternative would produce exactly the duplicate events
+the lease exists to prevent.
+
+A standby is alive but not ready: it is waiting for the lease, not serving.
+The health monitor is told about the change through the election's `OnChange`
+callback, so `/healthz` keeps answering 200 while `/readyz` answers 503.
+
+## Liveness and readiness probes (`pkg/stream/health.go`)
+
+`--health-port` serves the three endpoints a container orchestrator asks
+for. The state behind them is a `HealthMonitor`, fed by the tailer:
+
+| Endpoint | Answers |
+|---|---|
+| `/healthz` | 200 while the process is running and still making progress; 503 when it is stuck |
+| `/readyz` | 200 when the RPC is answering, the stream has not gapped, and the lag is within `--max-lag`; 503 otherwise |
+| `/metrics` | The same state in the Prometheus exposition format |
+
+The tailer reports progress after every successful fetch through
+`Options.OnProgress`, so the lag is the real distance between the stream's
+position and the server's head rather than a guess. A failed fetch marks the
+endpoint unreachable; a detected gap marks the stream gapped. Both make the
+stream not ready, because neither is a state a consumer should be sent into.
+
+Liveness is a staleness check: the monitor records when it was last updated,
+and a process that has not reported for `StaleAfter` (30s by default) is
+considered stuck. A standby is exempt — it is waiting for the lease, not
+wedged.
+
+## Graceful drain (`Tailer.Drain`)
+
+On SIGTERM or Ctrl-C, prism stops scheduling new RPC calls and then gives
+the sinks and the state store a bounded window to finish:
+
+```sh
+prism events --follow --drain-timeout 15s
+```
+
+`Tailer.Drain(ctx, timeout)` writes out the records still held in the reorder
+buffer, flushes the sink and reports the pages that were delivered, which is
+what commits the final cursor. The timeout bounds the whole operation, and a
+drain that overruns it is reported rather than waited out: a process that is
+about to be killed cannot be helped by a longer flush.
+
+Two details make the drain safe rather than merely best-effort:
+
+- **Only one flush runs at a time.** `flushOutput` admits one flush through a
+  gate; a flush that overran its deadline is abandoned, and a second one
+  waits for it rather than starting alongside it. A sink that buffers would
+  otherwise write the same batch twice.
+- **The cursor is committed only for delivered pages.** A page that was
+  partly emitted is not reported, so a drain that fails half-way leaves the
+  cursor where it was and the next run re-emits the records that were not
+  delivered.
+
+The CLI runs the drain inside its own deadline and joins any error with the
+run's own, so a drain failure is reported rather than swallowed.
+
+## Encrypted state files (`pkg/stream/crypto_state.go`)
+
+The cursor journal holds stream metadata, and on a shared file system or in a
+cloud bucket that is worth encrypting. `--state-passphrase-env` (or
+`--state-passphrase-file`, or a key management service) makes prism write an
+encrypted journal instead.
+
+The file is a header line followed by one envelope per entry:
+
+```
+{"version":1,"alg":"aes-256-gcm","key":{"kdf":"pbkdf2-hmac-sha256", ...}}
+{"version":1,"nonce":"...","ciphertext":"..."}
+```
+
+Each entry is sealed with authenticated **AES-256-GCM** under a fresh random
+nonce, with a fixed label as additional authenticated data so a ciphertext
+cannot be moved from one file into another. A file that was tampered with,
+truncated or written with a different key fails the authentication tag and is
+rejected with a clear error rather than being read as if it were intact.
+
+The key comes from exactly one place, decided by the flags and validated
+before anything is fetched. A passphrase is stretched into a key with
+PBKDF2-HMAC-SHA256 over a random salt, and the salt and iteration count are
+recorded in the header so the file stays readable by a future version; a key
+management service generates the data key and keeps the wrapped form, so the
+plaintext key never reaches the disk.
+
+| Source | Flag |
+|---|---|
+| Environment variable | `--state-passphrase-env NAME` |
+| File | `--state-passphrase-file PATH` |
+| AWS KMS | `--state-kms-provider aws --state-kms-key-id ARN` |
+| GCP KMS | `--state-kms-provider gcp --state-kms-key-id NAME` |
+
+Passing more than one source is an error rather than a silently ignored flag:
+an operator who believes the file is encrypted with a passphrase must never
+end up with a file encrypted with something else.
 
 ## Derived transaction streams
 
@@ -950,9 +1095,10 @@ returning an error, so one malformed value cannot kill a long-running tail.
 
 Every streaming command accepts the same optional output flags. They are off
 unless set, so the default path still touches nothing but RPC and stdout. When
-one or more are enabled, `pkg/sink.Fanout` delivers each record to the normal
-output first and then to each extra sink in order; the first failure ends the
-stream rather than silently dropping records. `Close` flushes buffered
+one or more are enabled, `pkg/sink.MultiSink` delivers each record to the
+normal output and every extra sink. It records acknowledgements per sink, so a
+retry does not repeat a delivery that already succeeded; any unresolved
+failure ends the stream rather than silently dropping records. `Close` flushes buffered
 batches, stops timers and closes listeners and sockets, so a finished stream
 leaves nothing running.
 
@@ -1048,6 +1194,34 @@ Structured-data values escape `\`, `"` and `]` per RFC 5424.
 as the address. `DialSyslog` also accepts `unix://`, `udp://`, `tcp://` and a
 bare socket path; `--syslog-facility` accepts any POSIX facility name and
 defaults to `local0`.
+
+#### Elasticsearch/OpenSearch (`--sink-es-url`, `pkg/sink/elasticsearch.go`)
+
+Records are written through the bulk API in NDJSON pairs: an `index` action
+followed by the same JSON document emitted by `--json`. The record ID is the
+Elasticsearch document ID, so retrying a buffered batch overwrites the same
+documents rather than creating duplicates. `--sink-es-index` is the base name;
+the actual index is `<base>-YYYY.MM.DD`, derived from each record's UTC close
+time. `--sink-es-batch-size` and `--sink-es-flush-interval` bound the in-memory
+batch. Authenticate with `--sink-es-api-key` (or `PRISM_ES_API_KEY`) or basic
+credentials.
+
+#### NATS and JetStream (`--sink-nats`, `pkg/sink/nats.go`)
+
+Each record is published as the regular `--json` document to a subject rendered
+from `--nats-subject`; the template may use `.ContractID`, `.Topic0`, `.ID` and
+`.Ledger`. The default is `stellar.events.{{.ContractID}}`. A rendered subject
+must contain nonempty publish tokens. Core NATS flushes after each publish;
+`--nats-jetstream` waits for a JetStream publish acknowledgement.
+
+#### ZeroMQ PUB (`--sink-zmq`, `pkg/sink/zeromq.go`)
+
+The ZeroMQ sink connects a PUB socket to `--sink-zmq` and sends each record as
+a multipart `[topic, JSON]` message. `--zmq-topic` uses the same template data
+as `--nats-subject`, which gives subscribers an efficient prefix-filterable
+first frame. PUB delivery is intentionally best-effort: a slow or disconnected
+subscriber can miss messages under ZeroMQ's high-water-mark semantics. Use
+NATS JetStream when publisher acknowledgements are required.
 
 #### Configuration rules
 

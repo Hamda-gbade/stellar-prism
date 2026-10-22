@@ -64,6 +64,10 @@ returns — there is no polling loop, no cursor advancement, no reconnection, an
 | **NDJSON for pipelines** | ❌ | ✅ |
 | **Per-contract fan-out** | ❌ | ✅ (`--fanout-dir`) |
 | **Gap detection** | ❌ | ✅ |
+| **Active-passive HA** | ❌ | ✅ (`--ha-lease-file`) |
+| **Health/readiness probes** | ❌ | ✅ (`--health-port`) |
+| **Graceful drain on SIGTERM** | ❌ | ✅ (`--drain-timeout`) |
+| **Encrypted state file** | ❌ | ✅ (`--state-passphrase-env`) |
 | Ledger streaming | ❌ | ✅ |
 | Database / Parquet ingestion | ❌ | ✅ |
 | Contract-spec-decoded payloads | ✅ **better** | ❌ ([roadmap](docs/roadmap.md)) |
@@ -157,6 +161,9 @@ emits:
 | `--cloud-bucket` + `--cloud-provider` | Gzipped NDJSON chunks in S3 or GCS |
 | `--metrics-addr` | Prometheus `/metrics` (throughput, ledger latency, errors) |
 | `--syslog-address` | RFC 5424 syslog or systemd-journald native fields |
+| `--sink-es-url` | Elasticsearch/OpenSearch bulk indexing, partitioned into a daily index |
+| `--sink-nats` | NATS core publish or JetStream acknowledgements (`--nats-jetstream`) |
+| `--sink-zmq` | ZeroMQ PUB messages with templated topic and JSON payload frames |
 
 ```sh
 # Fan a live stream out to a receiver and to S3-compatible storage
@@ -172,9 +179,21 @@ prism events --follow --json --metrics-addr 127.0.0.1:9090
 prism events --follow --json \
   --syslog-address unixgram:///run/systemd/journal/socket \
   --syslog-format journald
+
+# Index records by day in Elasticsearch or OpenSearch
+prism events --follow --sink-es-url https://search.example.com \
+  --sink-es-index prism-events
+
+# Publish each event using its contract as a NATS subject token
+prism events --follow --sink-nats nats://127.0.0.1:4222 \
+  --nats-subject 'stellar.events.{{.ContractID}}'
+
+# Broadcast multipart [topic, JSON] messages over ZeroMQ PUB
+prism events --follow --sink-zmq tcp://127.0.0.1:5556 \
+  --zmq-topic 'stellar.events.{{.ContractID}}'
 ```
 
-Credentials come from the environment (`PRISM_WEBHOOK_SECRET`,
+Credentials come from the environment (`PRISM_WEBHOOK_SECRET`, `PRISM_ES_API_KEY`,
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `GOOGLE_OAUTH_ACCESS_TOKEN`) so
 they do not appear in `ps` output. Delivery to webhooks and object storage is
 at-least-once: a batch is retried until acknowledged and uses a stable key or
@@ -231,6 +250,115 @@ position it reached, and a page the `--limit` cut short is not reported at all.
 
 This narrows the restart window from "the whole run" to "one record". It is
 not exactly-once — see [What prism guarantees](#what-prism-guarantees).
+
+### Running two instances without duplicating records
+
+A single prism instance is a single point of failure, and two instances
+streaming the same contract produce duplicate downstream events and fight
+over the cursor file. `--ha-lease-file` makes the pair **active-passive**: one
+instance holds the lease and streams, the other waits and takes over if the
+leader stops.
+
+```sh
+# Both instances share the lease file; only the leader streams
+prism events --contract CDLZF... --follow \
+  --ha-lease-file /shared/nfs/prism.lock --ha-heartbeat 5s
+```
+
+The lease is a file lock plus a record of who holds it, kept beside the lock
+in `<path>.lease`:
+
+- The leader holds an exclusive `flock` on the lease file for its whole term,
+  and renews the lease every `--ha-heartbeat` (5s by default).
+- A standby watches for the lease to expire and takes it over. `--ha-ttl`
+  (15s by default) is how long a lease stays valid without a renewal; it must
+  be at least twice the heartbeat.
+- A crashed leader is replaced at once, because the kernel drops the lock when
+  the process dies. A leader that is alive but partitioned is replaced when
+  its lease expires.
+- Every handover bumps an **epoch**, the fencing token. A leader that was
+  fenced notices on its next renewal and stops, rather than continuing to
+  emit alongside the new leader.
+- A new leader resumes from the cursor the previous one committed, so the
+  takeover continues the stream instead of starting a second one.
+
+The lease file must live on a file system that supports advisory locking — a
+shared NFS mount, for instance — so every instance sees the same lock. On a
+platform without `flock`, prism refuses to start rather than pretending the
+lease works.
+
+A standby is alive but **not ready**: it is waiting for the lease, not
+serving, and it must not be sent traffic.
+
+### Health and readiness probes
+
+`--health-port` serves the endpoints a container orchestrator asks for:
+
+```sh
+prism events --contract CDLZF... --follow --health-port 8086 --max-lag 100
+```
+
+| Endpoint | Answers |
+|---|---|
+| `/healthz` | 200 while the process is running and making progress; 503 when the stream is stuck |
+| `/readyz` | 200 when the RPC is answering, the stream has not gapped, and the lag is within `--max-lag`; 503 otherwise |
+| `/metrics` | The same state in the Prometheus exposition format |
+
+`--max-lag` is how many ledgers the stream may be behind the server's head
+before it stops being ready; 0 means no limit. The lag is measured from the
+stream's own progress, so it is the real distance to the head and not a guess.
+
+A standby answers `/healthz` with 200 — it is waiting, not stuck — and
+`/readyz` with 503, so the orchestrator keeps traffic away from it.
+
+### Graceful drain
+
+Kubernetes gives a pod a grace period (30s by default) after SIGTERM before
+it sends SIGKILL. prism uses it:
+
+```sh
+prism events --contract CDLZF... --follow --drain-timeout 15s
+```
+
+On SIGTERM or Ctrl-C, prism stops scheduling new RPC calls, then gives the
+sinks and the state store up to `--drain-timeout` (15s by default) to flush
+the records still in memory and commit the final cursor. It exits 0 when
+every flush confirmed success.
+
+A drain that overruns its deadline is reported rather than waited out: a
+process that is about to be killed cannot be helped by a longer flush. The
+records that were not delivered are re-emitted on the next run, because the
+cursor is only committed for pages that were actually delivered.
+
+### Encrypting the state file
+
+A cursor journal holds stream metadata, and on a shared file system or in a
+cloud bucket that is worth encrypting:
+
+```sh
+prism events --contract CDLZF... --follow \
+  --state-file state.enc --state-passphrase-env PRISM_STATE_KEY
+```
+
+The state file is encrypted with authenticated **AES-256-GCM**, and every
+update uses a fresh nonce. A file that was tampered with, truncated or
+written with a different key is rejected with a clear authentication error
+rather than being read as if it were intact.
+
+The key comes from exactly one place:
+
+| Flag | Key source |
+|---|---|
+| `--state-passphrase-env` | A passphrase in an environment variable |
+| `--state-passphrase-file` | A passphrase in a file |
+| `--state-kms-provider aws` + `--state-kms-key-id` | An AWS KMS key |
+| `--state-kms-provider gcp` + `--state-kms-key-id` | A GCP KMS key |
+
+With a key management service the data key is generated and wrapped by the
+service, so the plaintext key never reaches the disk. Passing more than one
+key source is an error rather than a silently ignored flag: an operator who
+believes the file is encrypted with a passphrase must never end up with a
+file encrypted with something else.
 
 ### `prism transactions` — successes, failures, traps and fee bumps
 
@@ -305,6 +433,33 @@ Operations (4)
 $ prism ledgers --follow --compact
 2026-08-04T14:35:53Z  ledger 3966820  e68b8…0c1e
 ```
+
+### Fee market, contract lifecycle and trades
+
+```sh
+# Ledger fee market and moving transaction fee averages
+prism fee-stats --follow
+
+# Follow contract storage, TTL expiry and deployment or upgrade activity
+prism contracts --watch CDLZF...CYSC --follow
+
+# Stream completed classic path-payment executions
+prism trades --pair XLM/USDC --follow
+```
+
+`fee-stats` reports base fee and reserve, fee pool, circulating coins,
+Soroban resource fees, and rolling 10 and 50 ledger transaction fee averages.
+`contracts` reports ledger-key TTL and warns below 1,000 remaining ledgers;
+RPC does not associate TTL key hashes with contract IDs, so TTL changes are
+included even when `--watch` selects contracts. `trades` normalizes classic
+strict-send and strict-receive path payments from transaction results. It also
+recognizes Soroban swap events using `swap`, trader, input asset and output
+asset topics with input and output amounts in the event value. Soroban amounts
+remain raw token units because each contract defines its own decimal scale.
+
+Failed transaction streams include the transaction or operation result code
+inline, for example `failed at op 1 (payment): payment_underfunded`; NDJSON
+records carry `error_code` and `error_detail` fields.
 
 ### `prism operations` - stream transaction operations
 

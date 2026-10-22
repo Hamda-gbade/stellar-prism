@@ -19,7 +19,7 @@ import (
 // exists — the metadata has to be compacted while the stream is still going,
 // not only when it stops.
 type cursorState struct {
-	store  *stream.FileMetadataStore
+	store  stream.MetadataStore
 	pruner *stream.Pruner
 	key    string
 	cursor string
@@ -64,14 +64,33 @@ func eventsStateKey(contractIDs, topics, eventTypes []string) string {
 //
 // It returns nil when no --state-file was given, which every caller reads as
 // "no metadata and no pruning".
+//
+// The file is encrypted when a key was configured: the passphrase or the key
+// management service decides how the checkpoints are sealed, and the key
+// itself never reaches the disk.
 func openCursorState(ctx context.Context, sf *streamFlags, key string, stderr io.Writer) (*cursorState, error) {
 	if sf.stateFile == "" {
 		return nil, nil
 	}
 
-	store, err := stream.NewFileMetadataStore(sf.stateFile)
+	source, err := stateKeySource(sf)
 	if err != nil {
 		return nil, err
+	}
+
+	var store stream.MetadataStore
+	if source != nil {
+		encrypted, err := stream.NewEncryptedStateStore(sf.stateFile, source)
+		if err != nil {
+			return nil, err
+		}
+		store = encrypted
+	} else {
+		plain, err := stream.NewFileMetadataStore(sf.stateFile)
+		if err != nil {
+			return nil, err
+		}
+		store = plain
 	}
 	state := &cursorState{store: store, key: key}
 
@@ -117,6 +136,11 @@ func openCursorState(ctx context.Context, sf *streamFlags, key string, stderr io
 // A failure here is reported rather than fatal: the stream is still
 // delivering records, and a journal that lags behind only means a later run
 // resumes a little further back than it could have.
+//
+// The context is stripped of its cancellation, because the most important
+// checkpoint of all is the last one: it is written while the process is
+// shutting down, and a checkpoint that is dropped there is exactly the one
+// the next run needs.
 func (s *cursorState) record(ctx context.Context, page stream.Page) error {
 	if s == nil || s.store == nil {
 		return nil
@@ -127,7 +151,7 @@ func (s *cursorState) record(ctx context.Context, page stream.Page) error {
 		// checkpoint out of reach.
 		return nil
 	}
-	return s.store.Append(ctx, stream.CursorMetadata{
+	return s.store.Append(context.WithoutCancel(ctx), stream.CursorMetadata{
 		Key:        s.key,
 		Cursor:     page.Cursor,
 		Ledger:     page.Ledger,

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,6 +28,9 @@ type streamFlags struct {
 	since            time.Duration
 	limit            int
 	asJSON           bool
+	format           string
+	csvFields        string
+	tsv              bool
 	raw              bool
 	compact          bool
 	poll             time.Duration
@@ -57,6 +61,42 @@ type streamFlags struct {
 	pruneInterval time.Duration
 	pruneKeep     int
 	pruneMaxAge   time.Duration
+
+	// statePassphraseEnv names the environment variable holding the
+	// passphrase that encrypts the state file.
+	statePassphraseEnv string
+	// statePassphraseFile names the file holding the passphrase that
+	// encrypts the state file.
+	statePassphraseFile string
+	// stateKMSProvider is "aws" or "gcp": the key management service that
+	// holds the key of the state file.
+	stateKMSProvider string
+	// stateKMSKeyID identifies the key in the key management service.
+	stateKMSKeyID string
+	// stateKMSRegion is the region of the AWS key.
+	stateKMSRegion string
+	// stateKMSTokenEnv names the environment variable holding the token
+	// used to reach the GCP key service.
+	stateKMSTokenEnv string
+
+	// haLeaseFile is the lease file of the active-passive election. When
+	// it is set, only the instance holding the lease streams.
+	haLeaseFile string
+	// haHeartbeat is how often the leader renews the lease.
+	haHeartbeat time.Duration
+	// haTTL is how long the lease stays valid without a renewal.
+	haTTL time.Duration
+
+	// healthPort is the port the liveness and readiness probes are served
+	// on. Zero leaves them off.
+	healthPort int
+	// maxLag is how many ledgers the stream may be behind before it stops
+	// being ready.
+	maxLag uint32
+
+	// drainTimeout bounds how long a shutdown may take to flush the
+	// records in memory and commit the final cursor.
+	drainTimeout time.Duration
 
 	// dlqFile is the optional dead letter queue. When set, records that fail
 	// validation or delivery are written there instead of stopping the run.
@@ -99,6 +139,9 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"stop after this many records (0 means unlimited)")
 	cmd.Flags().BoolVar(&s.asJSON, "json", false,
 		"emit NDJSON, one record per line")
+	cmd.Flags().StringVar(&s.format, "format", "", "output format: csv or tsv (default is human-readable; --json remains supported)")
+	cmd.Flags().StringVar(&s.csvFields, "csv-fields", "", "comma-separated CSV/TSV columns: id,ledger,time,kind,contract,tx,topic0,value")
+	cmd.Flags().BoolVar(&s.tsv, "tsv", false, "write tab-separated output (equivalent to --format tsv)")
 	cmd.Flags().BoolVar(&s.raw, "raw", false,
 		"leave XDR base64-encoded instead of decoding it")
 	cmd.Flags().BoolVar(&s.compact, "compact", false,
@@ -145,6 +188,30 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"keep at most this many cursor metadata entries per stream (0 keeps all)")
 	cmd.Flags().DurationVar(&s.pruneMaxAge, "prune-max-age", 0,
 		"drop cursor metadata entries older than this (0 keeps entries regardless of age)")
+	cmd.Flags().StringVar(&s.statePassphraseEnv, "state-passphrase-env", "",
+		"encrypt the state file with a passphrase read from this environment variable")
+	cmd.Flags().StringVar(&s.statePassphraseFile, "state-passphrase-file", "",
+		"encrypt the state file with a passphrase read from this file")
+	cmd.Flags().StringVar(&s.stateKMSProvider, "state-kms-provider", "",
+		`encrypt the state file with a key management service: "aws" or "gcp"`)
+	cmd.Flags().StringVar(&s.stateKMSKeyID, "state-kms-key-id", "",
+		"the key to use in the key management service (an ARN for AWS, a resource name for GCP)")
+	cmd.Flags().StringVar(&s.stateKMSRegion, "state-kms-region", "",
+		"region of the AWS key (default us-east-1, else $AWS_REGION)")
+	cmd.Flags().StringVar(&s.stateKMSTokenEnv, "state-kms-token-env", gcsTokenEnvVar,
+		"environment variable holding the OAuth token used to reach the GCP key service")
+	cmd.Flags().StringVar(&s.haLeaseFile, "ha-lease-file", "",
+		"run as an active-passive pair, taking this lease file as the lock; only the leader streams")
+	cmd.Flags().DurationVar(&s.haHeartbeat, "ha-heartbeat", stream.DefaultHAHeartbeat,
+		"how often the leader renews the lease")
+	cmd.Flags().DurationVar(&s.haTTL, "ha-ttl", stream.DefaultHATTL,
+		"how long the lease stays valid without a renewal")
+	cmd.Flags().IntVar(&s.healthPort, "health-port", 0,
+		"serve /healthz, /readyz and /metrics on this port (0 disables the health server)")
+	cmd.Flags().Uint32Var(&s.maxLag, "max-lag", 0,
+		"ledgers the stream may be behind before /readyz reports a failure (0 means no limit)")
+	cmd.Flags().DurationVar(&s.drainTimeout, "drain-timeout", DefaultDrainTimeout,
+		"how long a shutdown may take to flush records and commit the final cursor")
 	cmd.Flags().StringVar(&s.dlqFile, "dlq-file", "",
 		"append malformed or undeliverable records to this file as NDJSON instead of stopping the stream")
 	s.sinks.register(cmd)
@@ -157,6 +224,19 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 func (s *streamFlags) validate(cmd *cobra.Command) error {
 	if err := s.sinks.validate(); err != nil {
 		return err
+	}
+	format := strings.ToLower(s.format)
+	if format != "" && format != "csv" && format != "tsv" {
+		return fmt.Errorf(`invalid --format %q: want "csv" or "tsv"`, s.format)
+	}
+	if s.tsv && format != "" && format != "tsv" {
+		return fmt.Errorf("--tsv conflicts with --format csv")
+	}
+	if (format != "" || s.tsv || s.csvFields != "") && s.asJSON {
+		return fmt.Errorf("CSV/TSV output conflicts with --json")
+	}
+	if s.csvFields != "" && format == "" && !s.tsv {
+		return fmt.Errorf("--csv-fields requires --format csv or --format tsv")
 	}
 	if cmd.Flags().Changed("since") {
 		if s.from != 0 {
@@ -197,6 +277,36 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	if err := s.validateState(cmd); err != nil {
 		return err
 	}
+	if err := s.validateRuntime(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateRuntime checks the high availability, health and drain options.
+//
+// A zero heartbeat or lease lifetime means "use the default", so it is
+// accepted rather than rejected: the election fills the documented defaults
+// in, and a caller that never set the flags gets the same behaviour as one
+// that set them to their default.
+func (s *streamFlags) validateRuntime() error {
+	if s.haHeartbeat < 0 {
+		return fmt.Errorf("--ha-heartbeat must not be negative")
+	}
+	if s.haTTL < 0 {
+		return fmt.Errorf("--ha-ttl must not be negative")
+	}
+	if s.haHeartbeat > 0 && s.haTTL > 0 && s.haTTL < 2*s.haHeartbeat {
+		// A lease that expires before the leader could renew it would be
+		// handed away while the leader was still working on it.
+		return fmt.Errorf("--ha-ttl must be at least twice --ha-heartbeat")
+	}
+	if s.healthPort < 0 || s.healthPort > 65535 {
+		return fmt.Errorf("--health-port must be between 0 and 65535")
+	}
+	if s.drainTimeout < 0 {
+		return fmt.Errorf("--drain-timeout must not be negative")
+	}
 	return nil
 }
 
@@ -225,6 +335,9 @@ func (s *streamFlags) validateState(cmd *cobra.Command) error {
 	if s.pruneMaxAge < 0 {
 		return fmt.Errorf("--prune-max-age must not be negative")
 	}
+	if err := s.validateStateEncryption(cmd); err != nil {
+		return err
+	}
 	if s.stateFile != "" {
 		return nil
 	}
@@ -232,6 +345,62 @@ func (s *streamFlags) validateState(cmd *cobra.Command) error {
 		return fmt.Errorf("--resume requires --state-file")
 	}
 	for _, name := range []string{"prune-interval", "prune-keep", "prune-max-age"} {
+		if cmd.Flags().Changed(name) {
+			return fmt.Errorf("--%s requires --state-file", name)
+		}
+	}
+	return nil
+}
+
+// validateStateEncryption checks the state file encryption options.
+//
+// The key comes from exactly one place, so asking for two of them is an
+// error rather than a silently ignored flag: an operator who believes the
+// file is encrypted with a passphrase must never end up with a file that is
+// encrypted with something else.
+func (s *streamFlags) validateStateEncryption(cmd *cobra.Command) error {
+	sources := 0
+	if s.statePassphraseEnv != "" {
+		sources++
+	}
+	if s.statePassphraseFile != "" {
+		sources++
+	}
+	if s.stateKMSProvider != "" {
+		sources++
+	}
+	if sources > 1 {
+		return fmt.Errorf("only one of --state-passphrase-env, --state-passphrase-file and --state-kms-provider may be given")
+	}
+	if s.stateKMSProvider != "" {
+		provider := strings.ToLower(s.stateKMSProvider)
+		if provider != "aws" && provider != "gcp" {
+			return fmt.Errorf(`invalid --state-kms-provider %q: want "aws" or "gcp"`, s.stateKMSProvider)
+		}
+		if s.stateKMSKeyID == "" {
+			return fmt.Errorf("--state-kms-provider requires --state-kms-key-id")
+		}
+	} else if s.stateKMSKeyID != "" {
+		return fmt.Errorf("--state-kms-key-id requires --state-kms-provider")
+	}
+	if s.stateKMSRegion != "" && s.stateKMSProvider == "" {
+		return fmt.Errorf("--state-kms-region requires --state-kms-provider")
+	}
+	if s.stateKMSTokenEnv != "" && cmd.Flags().Changed("state-kms-token-env") && s.stateKMSProvider == "" {
+		return fmt.Errorf("--state-kms-token-env requires --state-kms-provider")
+	}
+
+	if s.stateFile != "" {
+		return nil
+	}
+	for _, name := range []string{
+		"state-passphrase-env",
+		"state-passphrase-file",
+		"state-kms-provider",
+		"state-kms-key-id",
+		"state-kms-region",
+		"state-kms-token-env",
+	} {
 		if cmd.Flags().Changed(name) {
 			return fmt.Errorf("--%s requires --state-file", name)
 		}
@@ -254,6 +423,21 @@ func (s *streamFlags) newSink(
 	onDeadLetter func(sink.DLQEntry),
 ) (stream.Sink, error) {
 	build := func(out io.Writer) stream.Sink {
+		format := strings.ToLower(s.format)
+		if s.tsv {
+			format = "tsv"
+		}
+		if format == "csv" || format == "tsv" {
+			fields := []string(nil)
+			if s.csvFields != "" {
+				fields = strings.Split(s.csvFields, ",")
+			}
+			csv, err := sink.NewCSVSink(out, sink.CSVOptions{Fields: fields, Delimiter: map[bool]rune{true: '\t', false: ','}[format == "tsv"]})
+			if err != nil {
+				return errorSink{err: err}
+			}
+			return csv
+		}
 		if s.asJSON {
 			return sink.NewNDJSON(out, !s.raw)
 		}
@@ -331,6 +515,11 @@ func (s *streamFlags) newSink(
 	}, nil
 }
 
+type errorSink struct{ err error }
+
+func (s errorSink) Emit(stream.Record) error { return s.err }
+func (s errorSink) Flush() error             { return s.err }
+
 // closingSink gives a wrapper without its own Close a teardown path. It is how
 // a sink chain tells runStream that there is more to release than the outermost
 // Batcher knows about.
@@ -375,6 +564,10 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 		Filter:       s.filter,
 		PollInterval: s.poll,
 		MaxRetries:   s.retries,
+		// DrainTimeout bounds the final flush, so a sink that cannot be
+		// written does not hold the process past the grace period an
+		// orchestrator gives it.
+		DrainTimeout: s.drainTimeout,
 		// Adaptive switches the follow loop to the adaptive poller. Its bounds
 		// stay zero so the tailer fills the documented defaults in; the CLI
 		// keeps its flag surface to one switch.
@@ -666,10 +859,6 @@ func runStream(
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// Ctrl-C ends the stream cleanly rather than killing it mid-record, so a
-	// partially written line never reaches a downstream consumer.
-	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	defer func() {
@@ -683,6 +872,22 @@ func runStream(
 	// compacted. The writer is serialised so those lines cannot interleave
 	// and so a test's stderr buffer cannot race.
 	stderr = newSyncWriter(stderr)
+
+	// Ctrl-C ends the stream cleanly rather than killing it mid-record, so a
+	// partially written line never reaches a downstream consumer. The signal
+	// stops the fetching; the drain at the end of the run flushes what is
+	// left and commits the final cursor before the process goes away.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	go func() {
+		select {
+		case <-signals:
+			fmt.Fprintf(stderr, "prism: interrupted; draining for up to %s\n", sf.drainTimeout)
+			cancel(nil)
+		case <-ctx.Done():
+		}
+	}()
 
 	out, err := sf.newSink(stdout, g.color, func(err error) {
 		fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
@@ -703,6 +908,21 @@ func runStream(
 		}
 	}
 	localOut := out
+	// The output is closed exactly once, whether the run ends normally, is
+	// interrupted or fails: the drain closes it, and the deferred teardown
+	// closes it when the drain never ran. A second close would report a
+	// file that is already closed as an error.
+	var closeOutOnce once
+	closeOut := func() error {
+		if !closeOutOnce.claim() {
+			return nil
+		}
+		closer, ok := localOut.(io.Closer)
+		if !ok {
+			return nil
+		}
+		return closer.Close()
+	}
 	var shutdown func()
 	out, shutdown, err = startBroadcasts(ctx, g, out, stderr, cancel)
 	if err != nil {
@@ -712,14 +932,12 @@ func runStream(
 		return err
 	}
 	defer shutdown()
-	if closer, ok := localOut.(io.Closer); ok {
-		defer func() {
-			// A failure to close the output is joined with whatever else
-			// went wrong rather than replacing it: two causes are more
-			// useful than one, and neither is worth losing.
-			err = errors.Join(err, closer.Close())
-		}()
-	}
+	defer func() {
+		// A failure to close the output is joined with whatever else
+		// went wrong rather than replacing it: two causes are more
+		// useful than one, and neither is worth losing.
+		err = errors.Join(err, closeOut())
+	}()
 
 	// The de-duplicator sits between the tailer and the output shaping, so
 	// a re-polled event is suppressed for every sink downstream — including
@@ -761,10 +979,17 @@ func runStream(
 	if err != nil {
 		return err
 	}
-	defer func() {
+	var closeStateOnce once
+	closeState := func() error {
+		if !closeStateOnce.claim() {
+			return nil
+		}
 		// The context may already be cancelled by an interrupt, but the
 		// final compaction is local work that should still happen.
-		err = errors.Join(err, state.close(context.WithoutCancel(ctx)))
+		return state.close(context.WithoutCancel(ctx))
+	}
+	defer func() {
+		err = errors.Join(err, closeState())
 	}()
 
 	opts, err := sf.options(stderr, sf.quiet)
@@ -772,6 +997,69 @@ func runStream(
 		return err
 	}
 	opts.Process = sf.process
+
+	// The health server is started before the stream so the probes answer
+	// from the first moment, rather than only once the stream is running.
+	healthServer, health, err := startHealthServer(ctx, sf, stderr)
+	if err != nil {
+		return err
+	}
+	if healthServer != nil {
+		defer func() {
+			err = errors.Join(err, healthServer.Close())
+		}()
+	}
+	if health != nil {
+		onRetry := opts.OnRetry
+		opts.OnRetry = func(attempt int, delay time.Duration, retryErr error) {
+			// A failed call is proof that the endpoint did not answer.
+			health.SetRPCReachable(false)
+			if onRetry != nil {
+				onRetry(attempt, delay, retryErr)
+			}
+		}
+		onGap := opts.OnGap
+		opts.OnGap = func(event stream.GapEvent) {
+			health.SetGapped(true)
+			if onGap != nil {
+				onGap(event)
+			}
+		}
+		opts.OnProgress = func(progress stream.Progress) {
+			health.RecordProgress(progress)
+		}
+	}
+
+	// The lease makes this instance the leader or a standby. Only the leader
+	// fetches, so two instances sharing a state file never emit the same
+	// records twice.
+	election, err := leaderElection(ctx, sf, health, stderr)
+	if err != nil {
+		return err
+	}
+	if election != nil {
+		defer func() {
+			// Releasing the lease lets a standby take over at once
+			// instead of waiting out the TTL.
+			err = errors.Join(err, election.Close())
+		}()
+		opts.Leader = election
+		if state != nil {
+			// The cursor the previous leader committed is where this
+			// one picks the stream up.
+			opts.LeaderResume = func(resumeCtx context.Context) (string, error) {
+				meta, found, err := state.store.Latest(resumeCtx, state.key)
+				if err != nil {
+					return "", err
+				}
+				if !found {
+					return "", nil
+				}
+				return meta.Cursor, nil
+			}
+		}
+	}
+
 	// --since is an explicit position like --from, so it is resolved here and
 	// overrides whatever the caller passed.
 	since, err := sf.resolveSince(cmd, client, stderr)
@@ -854,7 +1142,32 @@ func runStream(
 		return err
 	}
 	tailer := stream.NewTailer(src, out, opts)
-	return reportStreamError(tailer.Run(ctx), stderr)
+	runErr := tailer.Run(ctx)
+
+	// The stream has stopped fetching, either because it finished or
+	// because it was interrupted. Everything it is still holding is
+	// flushed now, within the drain timeout, so the final cursor is
+	// committed before the process goes away.
+	drainErr := runWithTimeout(sf.drainTimeout, func() error {
+		var errs []error
+		if err := tailer.Drain(context.WithoutCancel(ctx), sf.drainTimeout); err != nil {
+			errs = append(errs, err)
+		}
+		if err := closeOut(); err != nil {
+			errs = append(errs, err)
+		}
+		if err := closeState(); err != nil {
+			errs = append(errs, err)
+		}
+		return errors.Join(errs...)
+	})
+	if drainErr != nil {
+		fmt.Fprintf(stderr, "prism: draining the stream: %v\n", drainErr)
+		if runErr == nil {
+			runErr = drainErr
+		}
+	}
+	return reportStreamError(runErr, stderr)
 }
 
 func reportStreamError(err error, stderr io.Writer) error {
