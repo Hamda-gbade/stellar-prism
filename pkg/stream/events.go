@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,6 +33,9 @@ type EventQuery struct {
 	// ContractIDs restricts the stream to these contracts. At most
 	// MaxContractIDs are allowed by the server.
 	ContractIDs []string
+	// Watchlist, when set, supplies a live contract set and may contain more
+	// addresses than the RPC's per-request limit.
+	Watchlist ContractWatchlist
 	// Topics are server-side topic filters. Each is a comma-separated list of
 	// base64 ScVal segments, where "*" matches exactly one segment and "**"
 	// matches zero or more and must come last.
@@ -92,6 +96,38 @@ type EventSource struct {
 	query  EventQuery
 }
 
+// InvocationFrame is one contract in a transaction's nested invocation trace.
+type InvocationFrame struct {
+	ContractID string
+	Function   string
+}
+
+// ApplyInvocationTrace annotates an event from an ordered root-to-leaf call
+// trace. A trace must come from transaction metadata that preserves invocation
+// nesting; the getEvents RPC response itself does not currently include it.
+func ApplyInvocationTrace(event *Event, trace []InvocationFrame) {
+	if event == nil || len(trace) == 0 {
+		return
+	}
+	leaf := -1
+	for i, frame := range trace {
+		if frame.ContractID == event.ContractID {
+			leaf = i
+		}
+	}
+	if leaf < 0 {
+		return
+	}
+	event.CallDepth = leaf
+	event.InvocationPath = make([]string, leaf+1)
+	for i := 0; i <= leaf; i++ {
+		event.InvocationPath[i] = trace[i].ContractID
+	}
+	if leaf > 0 {
+		event.ParentContractID = trace[leaf-1].ContractID
+	}
+}
+
 // NewEventSource returns a Source over the given RPC client.
 func NewEventSource(client rpc.Client, q EventQuery) (*EventSource, error) {
 	if err := q.Validate(); err != nil {
@@ -133,8 +169,65 @@ func (s *EventSource) CursorLedger(cursor string) (uint32, bool) {
 // The RPC rejects a request carrying both a ledger range and a cursor, so the
 // first call uses StartLedger and every later one uses the cursor alone.
 func (s *EventSource) Fetch(ctx context.Context, cursor string) (Batch, error) {
+	ids := append([]string(nil), s.query.ContractIDs...)
+	if s.query.Watchlist != nil {
+		ids = s.query.Watchlist.ContractIDs()
+		if len(ids) == 0 {
+			return Batch{Records: []Record{}, NextCursor: cursor}, nil
+		}
+	}
+	groups := splitContractIDs(ids)
+	merged := Batch{Records: []Record{}}
+	seen := make(map[string]struct{})
+	for _, group := range groups {
+		batch, err := s.fetchGroup(ctx, cursor, group)
+		if err != nil {
+			return Batch{}, err
+		}
+		if batch.Latest > merged.Latest {
+			merged.Latest = batch.Latest
+		}
+		if merged.Oldest == 0 || (batch.Oldest > 0 && batch.Oldest < merged.Oldest) {
+			merged.Oldest = batch.Oldest
+		}
+		merged.Full = merged.Full || batch.Full
+		for _, record := range batch.Records {
+			if _, ok := seen[record.ID]; ok {
+				continue
+			}
+			seen[record.ID] = struct{}{}
+			merged.Records = append(merged.Records, record)
+		}
+		if batch.NextCursor != "" && (merged.NextCursor == "" || batch.NextCursor < merged.NextCursor) {
+			merged.NextCursor = batch.NextCursor
+		}
+	}
+	sort.Slice(merged.Records, func(i, j int) bool { return merged.Records[i].ID < merged.Records[j].ID })
+	if merged.NextCursor == "" {
+		merged.NextCursor = cursor
+	}
+	return merged, nil
+}
+
+func splitContractIDs(ids []string) [][]string {
+	if len(ids) == 0 {
+		return [][]string{nil}
+	}
+	groups := make([][]string, 0, (len(ids)+MaxContractIDs-1)/MaxContractIDs)
+	for len(ids) > 0 {
+		n := len(ids)
+		if n > MaxContractIDs {
+			n = MaxContractIDs
+		}
+		groups = append(groups, append([]string(nil), ids[:n]...))
+		ids = ids[n:]
+	}
+	return groups
+}
+
+func (s *EventSource) fetchGroup(ctx context.Context, cursor string, contractIDs []string) (Batch, error) {
 	req := protocol.GetEventsRequest{
-		Filters: s.filters(),
+		Filters: s.filters(contractIDs),
 		Pagination: &protocol.PaginationOptions{
 			Limit: s.query.PageLimit,
 		},
@@ -187,10 +280,19 @@ func eventRecord(e protocol.EventInfo) Record {
 			TxHash:     e.TransactionHash,
 			TxIndex:    e.TxIndex,
 			OpIndex:    e.OpIndex,
+			EventIndex: eventIndex(e.ID),
 			TopicXDR:   e.TopicXDR,
 			ValueXDR:   e.ValueXDR,
 		},
 	}
+}
+
+func eventIndex(id string) uint32 {
+	c, err := protocol.ParseCursor(id)
+	if err != nil {
+		return 0
+	}
+	return c.Event
 }
 
 // filters builds the single server-side filter prism uses.
@@ -198,10 +300,10 @@ func eventRecord(e protocol.EventInfo) Record {
 // The RPC supports several filter objects, but combining contract IDs and
 // topics into one filter matches what `stellar events` does and keeps the
 // matching semantics identical between the two tools.
-func (s *EventSource) filters() []protocol.EventFilter {
+func (s *EventSource) filters(contractIDs []string) []protocol.EventFilter {
 	f := protocol.EventFilter{}
-	if len(s.query.ContractIDs) > 0 {
-		f.ContractIDs = s.query.ContractIDs
+	if len(contractIDs) > 0 {
+		f.ContractIDs = contractIDs
 	}
 	if len(s.query.EventTypes) > 0 {
 		set := protocol.EventTypeSet{}

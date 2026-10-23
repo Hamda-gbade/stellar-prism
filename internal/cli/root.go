@@ -71,6 +71,8 @@ func closeClient(c rpc.Client, stderr io.Writer) {
 
 // globalFlags holds options shared by every subcommand.
 type globalFlags struct {
+	serveSSE string
+	serveWS  string
 	// color is one of "auto", "always" or "never", matching lens.
 	color string
 	// rpcURLs overrides the endpoints; empty falls back to the environment.
@@ -143,14 +145,27 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
 		"timeout for a single RPC call")
 	registerFlagCompletion(root, "color", string(colorAuto), string(colorAlways), string(colorNever))
 
+	root.PersistentFlags().StringVar(&g.serveSSE, "serve-sse", "", "broadcast SSE at this listen address (/events); retains 1024 records for replay")
+	root.PersistentFlags().StringVar(&g.serveSSE, "sse", "", "alias for --serve-sse")
+	root.PersistentFlags().StringVar(&g.serveWS, "ws", "", "broadcast WebSocket events at this listen address (/events or /ws)")
 	root.AddCommand(
+		newServeCmd(g, stdout, stderr),
 		newEventsCmd(g, stdout, stderr),
 		newLedgersCmd(g, stdout, stderr),
 		newTransactionsCmd(g, stdout, stderr),
+		newOperationsCmd(g, stdout, stderr),
+		newSimulateCmd(g, stdout, stderr),
 		newABICmd(g, stdout, stderr),
 		newStorageCmd(g, stdout, stderr),
 		newWASMCmd(g, stdout, stderr),
+		newFeeStatsCmd(g, stdout, stderr),
+		newContractsCmd(g, stdout, stderr),
+		newTradesCmd(g, stdout, stderr),
+		newHealthCmd(g, stdout, stderr),
 		newTxCmd(g, stdout, stderr),
+		newDiffCmd(g, stdout, stderr),
+		newGenerateTypesCmd(g, stdout, stderr),
+		newAuditCmd(g, stdout, stderr),
 		newVersionCmd(stdout),
 		newCompletionCmd(stdout),
 	)

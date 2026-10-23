@@ -27,7 +27,11 @@ data, the contract and durability. State-only entries are omitted: they record
 what a transaction read, not what it changed.
 
 Contract code and TTL entries are not tied to a contract address, so --contract
-omits them and shows only that contract's data.`,
+omits them and shows only that contract's data.
+
+With --state-file the position reached is recorded after every page, and a
+background pruner keeps that file from growing without bound. Add --resume to
+start the next run where the last one stopped.`,
 		Example: `  # Follow every contract storage mutation
   prism storage --follow
 
@@ -38,7 +42,7 @@ omits them and shows only that contract's data.`,
   prism storage --entry contract_code --entry ttl --json | jq -r '.wasmHash'`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := sf.validate(); err != nil {
+			if err := sf.validate(cmd); err != nil {
 				return err
 			}
 
@@ -48,14 +52,10 @@ omits them and shows only that contract's data.`,
 			}
 			defer closeClient()
 
-			from := sf.from
-			if from == 0 {
-				latest, err := latestLedger(cmd.Context(), client)
-				if err != nil {
-					return err
-				}
-				from = latest
-			}
+			sf.stateKey = stateKey("storage",
+				filterPart("contract", contractIDs),
+				filterPart("change", changeTypes),
+				filterPart("entry", entryTypes))
 
 			newSource := func(startLedger uint32) (stream.Source, error) {
 				return stream.NewStorageChangeSource(client, stream.StorageChangeQuery{
@@ -66,7 +66,7 @@ omits them and shows only that contract's data.`,
 					EntryTypes:  entryTypes,
 				})
 			}
-			return runStream(cmd.Context(), newSource, from, &sf, g, stdout, stderr)
+			return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)
 		},
 	}
 

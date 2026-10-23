@@ -25,6 +25,8 @@ type DrainerConfig struct {
 	NewSource SourceFactory
 	// Sink receives records in ascending ID order. Required.
 	Sink Sink
+	// Filter optionally rejects records before they reach Sink.
+	Filter RecordFilter
 	// From is the first ledger to drain. Required.
 	From uint32
 	// Until is the last ledger to drain. Zero means the server's latest
@@ -51,6 +53,15 @@ type DrainerConfig struct {
 	OnRetry func(attempt int, delay time.Duration, err error)
 	// OnGap, when set, is called for every detected retention gap.
 	OnGap func(GapEvent)
+	// OnPage, when set, is called after every page the drain delivered in
+	// full, with the position the drain reached.
+	//
+	// The backfill merges the workers' pages by record ID, so the pages
+	// arrive in ascending order and each reported position is further along
+	// than the last. A page that was cut short by the limit produces no
+	// callback, so a reported position never points past records that were
+	// not delivered.
+	OnPage func(Page)
 }
 
 // Drainer backfills a ledger range by fetching pages concurrently.
@@ -66,7 +77,11 @@ type Drainer struct {
 	callbackM sync.Mutex
 	gapM      sync.Mutex
 
+	sourceName     string
+	reportedLedger uint32
+
 	emitted    atomic.Int64
+	filtered   atomic.Int64
 	duplicates atomic.Int64
 	fetches    atomic.Int64
 	retries    atomic.Int64
@@ -126,6 +141,7 @@ func (d *Drainer) run(ctx context.Context) (Stats, error) {
 	if err != nil {
 		return d.snapshot(), fmt.Errorf("constructing backfill source: %w", err)
 	}
+	d.sourceName = probe.Name()
 	batch, err := d.fetch(ctx, probe, "")
 	if err != nil {
 		if IsCancellation(err) && ctx.Err() != nil {
@@ -171,9 +187,9 @@ func (d *Drainer) run(ctx context.Context) (Stats, error) {
 
 	group := NewTaskGroup(ctx)
 	workCtx := group.Context()
-	channels := make([]chan []Record, len(ranges))
+	channels := make([]chan drainerPage, len(ranges))
 	for i, ledgerRange := range ranges {
-		ch := make(chan []Record, 1)
+		ch := make(chan drainerPage, 1)
 		channels[i] = ch
 		r := ledgerRange
 		group.Go(func(ctx context.Context) error {
@@ -210,18 +226,34 @@ func (d *Drainer) run(ctx context.Context) (Stats, error) {
 		record := item.record
 
 		if lastID == "" || record.ID > lastID {
-			if err := d.cfg.Sink.Emit(record); err != nil {
+			matched := true
+			if d.cfg.Filter != nil {
+				var filterErr error
+				matched, filterErr = d.cfg.Filter.Match(record)
+				if filterErr != nil {
+					group.Cancel()
+					if waitErr := group.Wait(); waitErr != nil {
+						filterErr = errors.Join(filterErr, waitErr)
+					}
+					return d.snapshot(), fmt.Errorf("filtering record %s: %w", record.ID, filterErr)
+				}
+			}
+			if !matched {
+				d.filtered.Add(1)
+				lastID = record.ID
+			} else if err := d.cfg.Sink.Emit(record); err != nil {
 				group.Cancel()
 				if waitErr := group.Wait(); waitErr != nil {
 					err = errors.Join(err, waitErr)
 				}
 				return d.snapshot(), fmt.Errorf("writing record %s: %w", record.ID, err)
-			}
-			d.emitted.Add(1)
-			lastID = record.ID
+			} else {
+				d.emitted.Add(1)
+				lastID = record.ID
 
-			if d.cfg.Limit > 0 && d.emitted.Load() >= int64(d.cfg.Limit) {
-				return d.stop(group)
+				if d.cfg.Limit > 0 && d.emitted.Load() >= int64(d.cfg.Limit) {
+					return d.stop(group)
+				}
 			}
 		} else {
 			d.duplicates.Add(1)
@@ -232,6 +264,13 @@ func (d *Drainer) run(ctx context.Context) (Stats, error) {
 			heap.Push(&items, mergeItem{record: record, worker: item.worker})
 			continue
 		}
+
+		// The page is exhausted, so every record it held has been
+		// delivered. Only now is its position worth reporting: a page cut
+		// short by the limit returns above without reaching this point,
+		// and a checkpoint must never point past undelivered records.
+		d.reportPage(stream.page)
+
 		if streams[item.worker].refill(workCtx) {
 			if record, ok := stream.current(); ok {
 				heap.Push(&items, mergeItem{record: record, worker: item.worker})
@@ -256,7 +295,7 @@ func (d *Drainer) stop(group *TaskGroup) (Stats, error) {
 	return d.snapshot(), nil
 }
 
-func (d *Drainer) worker(ctx context.Context, ledgerRange ledgerRange, out chan<- []Record) error {
+func (d *Drainer) worker(ctx context.Context, ledgerRange ledgerRange, out chan<- drainerPage) error {
 	defer close(out)
 
 	src, err := d.cfg.NewSource(ledgerRange.start)
@@ -302,8 +341,20 @@ func (d *Drainer) worker(ctx context.Context, ledgerRange ledgerRange, out chan<
 		}
 
 		if len(page) > 0 {
+			// The position the page reached is the cursor the source
+			// produced for it. When the source offers no new cursor the
+			// worker keeps the one it had, exactly as the tailer does.
+			resume := batch.NextCursor
+			if resume == "" {
+				resume = cursor
+			}
+			delivered := drainerPage{
+				records: page,
+				cursor:  resume,
+				ledger:  page[len(page)-1].Sequence,
+			}
 			select {
-			case out <- page:
+			case out <- delivered:
 			case <-ctx.Done():
 				return ctx.Err()
 			}
@@ -411,9 +462,37 @@ func (d *Drainer) notifyGap(event GapEvent) {
 	d.cfg.OnGap(event)
 }
 
+// reportPage reports the position a delivered page reached.
+//
+// The workers cover disjoint ledger ranges and their pages are merged by
+// record ID, so the pages are delivered in ascending order and each reported
+// position is further along than the last. Only an advancing position is
+// reported, so a later run can never resume from an earlier checkpoint.
+func (d *Drainer) reportPage(page drainerPage) {
+	if d.cfg.OnPage == nil {
+		return
+	}
+
+	d.callbackM.Lock()
+	defer d.callbackM.Unlock()
+
+	if page.ledger <= d.reportedLedger {
+		return
+	}
+	d.reportedLedger = page.ledger
+
+	d.cfg.OnPage(Page{
+		Source:  d.sourceName,
+		Cursor:  page.cursor,
+		Ledger:  page.ledger,
+		Records: len(page.records),
+	})
+}
+
 func (d *Drainer) snapshot() Stats {
 	return Stats{
 		Emitted:    int(d.emitted.Load()),
+		Filtered:   int(d.filtered.Load()),
 		Duplicates: int(d.duplicates.Load()),
 		Fetches:    int(d.fetches.Load()),
 		Retries:    int(d.retries.Load()),
@@ -460,15 +539,27 @@ func splitLedgerRange(from, until uint32, workers int) []ledgerRange {
 	return ranges
 }
 
+// drainerPage is one worker's page of records, together with the position it
+// reached.
+//
+// The cursor is the one the source produced for the page, which means exactly
+// what it means in the tailer: the position a later run could resume from.
+type drainerPage struct {
+	records []Record
+	cursor  string
+	ledger  uint32
+}
+
+// mergeStream holds the page a worker is currently delivering.
 type mergeStream struct {
-	ch   <-chan []Record
-	page []Record
+	ch   <-chan drainerPage
+	page drainerPage
 	idx  int
 }
 
 func (s *mergeStream) current() (Record, bool) {
-	if s.idx < len(s.page) {
-		return s.page[s.idx], true
+	if s.idx < len(s.page.records) {
+		return s.page.records[s.idx], true
 	}
 	return Record{}, false
 }
@@ -479,7 +570,7 @@ func (s *mergeStream) advance() (Record, bool) {
 }
 
 func (s *mergeStream) refill(ctx context.Context) bool {
-	s.page = nil
+	s.page = drainerPage{}
 	s.idx = 0
 	for {
 		select {
@@ -487,7 +578,7 @@ func (s *mergeStream) refill(ctx context.Context) bool {
 			if !ok {
 				return false
 			}
-			if len(page) == 0 {
+			if len(page.records) == 0 {
 				continue
 			}
 			s.page = page

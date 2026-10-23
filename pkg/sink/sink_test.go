@@ -154,6 +154,29 @@ func TestNDJSONSurvivesUndecodablePayload(t *testing.T) {
 	}
 }
 
+func TestTransactionFailureIsStructuredAndReadable(t *testing.T) {
+	index := uint32(1)
+	record := stream.Record{ID: "0000000100-0001", Sequence: 100, Kind: stream.KindTransaction, Transaction: &stream.Transaction{Hash: "abcdef", Successful: false, ErrorCode: "payment_underfunded", FailureReason: "payment underfunded", FailedOpIndex: &index, FailedOpType: "payment"}}
+	var jsonOut bytes.Buffer
+	if err := sink.NewNDJSON(&jsonOut, false).Emit(record); err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(jsonOut.Bytes(), &fields); err != nil {
+		t.Fatal(err)
+	}
+	if fields["error_code"] != "payment_underfunded" || fields["error_detail"] != "payment underfunded" || fields["failedOpIndex"] != float64(1) {
+		t.Fatalf("failure fields = %#v", fields)
+	}
+	var humanOut bytes.Buffer
+	if err := sink.NewHuman(&humanOut, lensformat.NoColor, true).Emit(record); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(humanOut.String(), "failed at op 1 (payment): payment_underfunded") {
+		t.Fatalf("human output lacks failure explanation: %s", humanOut.String())
+	}
+}
+
 func TestNDJSONEmitsOneLinePerRecord(t *testing.T) {
 	t.Parallel()
 
@@ -332,5 +355,31 @@ func TestHumanEmitBatch(t *testing.T) {
 	}
 	if got := strings.Count(buf.String(), "ledger 100"); got != len(records) {
 		t.Fatalf("EmitBatch() rendered %d records, want %d\n%s", got, len(records), buf.String())
+	}
+}
+
+func TestEventCallTreeMetadataRendersInHumanAndNDJSON(t *testing.T) {
+	t.Parallel()
+	r := eventRecord()
+	r.Event.CallDepth = 2
+	r.Event.ParentContractID = "CPARENT"
+	r.Event.InvocationPath = []string{"CROUTER", "CPAIR", "CTOKEN"}
+	var human bytes.Buffer
+	if err := sink.NewHuman(&human, lensformat.NoColor, false).Emit(r); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(human.String(), "└─ [call 2]") || !strings.Contains(human.String(), "from CPARENT") {
+		t.Fatalf("human event omitted call tree details:\n%s", human.String())
+	}
+	var ndjson bytes.Buffer
+	if err := sink.NewNDJSON(&ndjson, false).Emit(r); err != nil {
+		t.Fatal(err)
+	}
+	var line map[string]any
+	if err := json.Unmarshal(ndjson.Bytes(), &line); err != nil {
+		t.Fatal(err)
+	}
+	if line["callDepth"] != float64(2) || line["parentContract"] != "CPARENT" {
+		t.Fatalf("NDJSON call tree fields = %v", line)
 	}
 }

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"io"
+	"strconv"
 
 	"github.com/spf13/cobra"
 
@@ -27,7 +28,11 @@ InvokeHostFunction operation itself. Contract IDs are derived from the network
 passphrase; use --network-passphrase when streaming a network other than
 testnet.
 
-Failed transactions are skipped unless --include-failed is set.`,
+Failed transactions are skipped unless --include-failed is set.
+
+With --state-file the position reached is recorded after every page, and a
+background pruner keeps that file from growing without bound. Add --resume to
+start the next run where the last one stopped.`,
 		Example: `  # Follow deployments and uploads on testnet
   prism wasm --follow
 
@@ -39,7 +44,7 @@ Failed transactions are skipped unless --include-failed is set.`,
   prism wasm --follow --json | jq -r 'select(.action=="create") | .contract'`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := sf.validate(); err != nil {
+			if err := sf.validate(cmd); err != nil {
 				return err
 			}
 
@@ -49,14 +54,7 @@ Failed transactions are skipped unless --include-failed is set.`,
 			}
 			defer closeClient()
 
-			from := sf.from
-			if from == 0 {
-				latest, err := latestLedger(cmd.Context(), client)
-				if err != nil {
-					return err
-				}
-				from = latest
-			}
+			sf.stateKey = stateKey("wasm", "failed="+strconv.FormatBool(includeFailed))
 
 			newSource := func(startLedger uint32) (stream.Source, error) {
 				return stream.NewWASMSource(client, stream.WASMQuery{
@@ -66,7 +64,7 @@ Failed transactions are skipped unless --include-failed is set.`,
 					IncludeFailed:     includeFailed,
 				})
 			}
-			return runStream(cmd.Context(), newSource, from, &sf, g, stdout, stderr)
+			return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)
 		},
 	}
 
