@@ -7,6 +7,9 @@ An honest account of where this is going. Dates are intentions, not commitments.
 Working and tested:
 
 - `prism events` — contract, topic and type filters; one-shot or `--follow`
+- `prism transactions` — `getTransactions` with SEP-35 cursor continuity,
+  gap detection and classification; `--status`, `--trapped`, `--fee-bump`,
+  `--fee-account` and `--memo` are views of the same stream
 - `prism ledgers` — ledger close metadata
 - `prism tx` — fetch and explain, through the lens explain path
 - `prism abi` — resolve a contract's WASM via RPC and render its embedded spec
@@ -27,6 +30,8 @@ Working and tested:
 - Optional cursor journal (`--state-file`) with background pruning, and
   `--resume` to continue a stream from the last recorded position
 - Streaming core fully tested with no network, and mutation-checked
+- An opt-in end-to-end suite that runs prism against a local Quickstart
+  network (`make test-e2e`), including clean shutdown with no leaked goroutines
 
 Known limits, stated plainly:
 
@@ -69,12 +74,6 @@ Needs a way to obtain the spec (fetch the WASM via `getLedgerEntries` and
 cache it, or accept a local file) and belongs in `lens` rather than `prism`,
 since `lens decode` would benefit identically. Probably the highest-value item
 here, and the largest.
-
-### Transaction and operation streams
-
-`prism txs --follow` over `getTransactions`, which is already a paginated
-cursor API of the same shape. Mostly a new `Source`; the state machine and
-sinks are unchanged. A good first substantial contribution.
 
 ### Better `--follow` ergonomics
 
