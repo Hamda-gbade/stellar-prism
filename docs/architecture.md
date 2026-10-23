@@ -60,6 +60,7 @@ internal/cli/         cobra commands — thin wrappers over pkg/stream
   state.go            the cursor journal, the pruner, and the resume point
   runtime.go          the health server, the lease and the state key source
   syncwriter.go       serialised stderr, for the diagnostics several goroutines write
+  stats.go            the --stats run summary, printed as the run exits
 internal/fakerpc/     scriptable in-memory RPC for tests
 pkg/rpc/              the Client interface + SDK adapter
   health.go           periodic getHealth and ledger latency evaluation
@@ -532,6 +533,45 @@ Two details make the drain safe rather than merely best-effort:
 
 The CLI runs the drain inside its own deadline and joins any error with the
 run's own, so a drain failure is reported rather than swallowed.
+
+## Run summary (`--stats`)
+
+Every streaming command accepts `--stats`, which prints one line on stderr as
+the command exits:
+
+```console
+$ prism events --from 1234567 --follow --stats
+...
+prism: stats: processed=1042 duplicates=7 retries=1 elapsed=2m3s
+```
+
+| Part | Meaning |
+|---|---|
+| `processed` | records handed to the sinks, summed over the backfill and follow phases |
+| `duplicates` | records dropped as duplicates: the tailer's high-water mark (`Stats.Duplicates`) plus the `--dedup-window` ring (`DedupSink.Dropped`) |
+| `retries` | fetches that failed and were retried |
+| `elapsed` | wall-clock time from the start of the run, rounded to milliseconds |
+
+Details:
+
+- **stderr, never stdout.** The summary is a diagnostic like every other
+  `prism:` line, so a piped `--json` stream is unaffected.
+- **Printed once, at the end.** Each phase contributes its `stream.Stats` as
+  it finishes; one deferred call prints after the drain, the cursor commit
+  and the sink close, so the numbers describe what actually reached the
+  sinks.
+- **Silent when there is nothing to summarise.** Without `--stats`, or when
+  the run fails before it starts fetching — a sink that cannot be built, an
+  unresolvable head — nothing is printed and the error stands alone.
+- **Nothing new to clean up.** `internal/cli/stats.go` is a plain struct the
+  run feeds; the reporter holds no goroutine and no timer. The one hazard is
+  counters owned by the *drain* goroutine: a drain that overruns
+  `--drain-timeout` is abandoned to it, so the summary reports snapshots
+  taken before it started — chosen with `errors.Is(drainErr, errTimedOut)` —
+  or a fresh read after a drain that completed and was joined.
+
+The flag is additive: a stream that does not ask for it prints exactly what
+it printed before.
 
 ## Encrypted state files (`pkg/stream/crypto_state.go`)
 

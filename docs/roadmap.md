@@ -26,6 +26,8 @@ Working and tested:
   `--gap-strategy resume` with the skipped range reported
 - Optional cursor journal (`--state-file`) with background pruning, and
   `--resume` to continue a stream from the last recorded position
+- `--stats` — a run summary on exit: records processed, duplicates dropped,
+  retries and elapsed time
 - Streaming core fully tested with no network, and mutation-checked
 
 Known limits, stated plainly:
@@ -79,10 +81,8 @@ sinks are unchanged. A good first substantial contribution.
 ### Better `--follow` ergonomics
 
 - a heartbeat line on stderr when a follow is idle, so a quiet contract is
-  distinguishable from a hung process (the `--since` half of this list has
-  already shipped — see it in the working list above)
-- `--stats` on exit, reporting records emitted, duplicates suppressed and
-  retries
+  distinguishable from a hung process (the `--since` and `--stats` halves of
+  this list have already shipped — see them in the working list above)
 
 ## Later, and less certain
 
