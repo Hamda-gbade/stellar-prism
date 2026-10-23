@@ -61,6 +61,7 @@ internal/cli/         cobra commands — thin wrappers over pkg/stream
   runtime.go          the health server, the lease and the state key source
   syncwriter.go       serialised stderr, for the diagnostics several goroutines write
   stats.go            the --stats run summary, printed as the run exits
+  heartbeat.go        the --heartbeat liveness line for idle follows
 internal/fakerpc/     scriptable in-memory RPC for tests
 pkg/rpc/              the Client interface + SDK adapter
   health.go           periodic getHealth and ledger latency evaluation
@@ -572,6 +573,43 @@ Details:
 
 The flag is additive: a stream that does not ask for it prints exactly what
 it printed before.
+
+## Heartbeat (`--heartbeat`)
+
+A follow on a quiet contract is indistinguishable from a hung process unless
+something keeps saying the stream is alive. `--heartbeat` prints one line on
+stderr for every interval the stream waits without delivering a record:
+
+```console
+$ prism events --follow --heartbeat 30s
+prism: heartbeat: idle for 30s with no records
+prism: heartbeat: idle for 60s with no records
+```
+
+Details:
+
+- **Driven by the tailer's own waits.** `internal/cli/heartbeat.go` wraps
+  the injected `Clock` (`Options.Clock`), slicing each wait at the interval
+  so the beat lands *while* the stream waits — a line printed only after a
+  wait ends would say nothing about a process stuck inside one. The waits
+  are sliced rather than raced against a timer, so the beat needs no
+  goroutine of its own and there is nothing new to clean up at termination.
+- **Idle means idle.** The wrapped `OnPage` marks every page emitted in
+  full, restarting the window, so heartbeats never interrupt a busy stream
+  however long its polls take. The chain preserves what `OnPage` already
+  did — recording the cursor in `--state-file`.
+- **Follow only.** The backfill workers keep the plain clock: their waits
+  are fetch retries, not idle follow intervals, and `--heartbeat` without
+  `--follow` is rejected rather than silently ignored.
+- **Cancellation is unaffected.** Ctrl-C interrupts a wait at the next
+  slice boundary, with the wrapped clock's error passed through untouched.
+- **stderr, never stdout**, like every other `prism:` line, and only when
+  the flag is passed: a run that does not ask for it prints exactly what it
+  printed before.
+
+Retry backoffs pass through the wrapped clock too, so a long backoff may
+beat as well — which is honest: the process really is waiting, and the
+retry messages around it explain why.
 
 ## Encrypted state files (`pkg/stream/crypto_state.go`)
 

@@ -31,6 +31,8 @@ Working and tested:
   `--resume` to continue a stream from the last recorded position
 - `--stats` — a run summary on exit: records processed, duplicates dropped,
   retries and elapsed time
+- `--heartbeat 30s` — a line on stderr after every idle interval during
+  `--follow`, so a quiet contract is distinguishable from a hung process
 - Streaming core fully tested with no network, and mutation-checked
 - An opt-in end-to-end suite that runs prism against a local Quickstart
   network (`make test-e2e`), including clean shutdown with no leaked goroutines
