@@ -7,6 +7,8 @@ require (
 	github.com/go-zeromq/zmq4 v0.17.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/nats-io/nats.go v1.47.0
+	github.com/rabbitmq/amqp091-go v1.16.0
+	github.com/segmentio/kafka-go v0.4.51
 	github.com/spf13/cobra v1.10.2
 	github.com/stellar-optics/stellar-xdr-lens v0.2.0
 	github.com/stellar/go-stellar-sdk v0.7.3
@@ -22,6 +24,7 @@ require (
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/nats-io/nkeys v0.4.11 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
+	github.com/pierrec/lz4/v4 v4.1.15 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect

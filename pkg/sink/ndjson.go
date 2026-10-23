@@ -398,14 +398,14 @@ func (n *NDJSON) document(r stream.Record) (any, error) {
 				if op.ParametersXDR != "" {
 					raw, err := n.decodeXDR(op.ParametersXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Parameters = raw
 				}
 				if op.ResultXDR != "" {
 					raw, err := n.decodeXDR(op.ResultXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Result = raw
 				}
@@ -424,7 +424,7 @@ func (n *NDJSON) document(r stream.Record) (any, error) {
 			if n.decode && sim.ReturnValueXDR != "" {
 				raw, err := n.decodeXDR(sim.ReturnValueXDR)
 				if err != nil {
-					return err
+					return nil, err
 				}
 				line.ReturnValue = raw
 			} else {
@@ -454,21 +454,21 @@ func (n *NDJSON) document(r stream.Record) (any, error) {
 				if c.KeyXDR != "" {
 					raw, err := n.decodeXDR(c.KeyXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Key = raw
 				}
 				if c.EntryXDR != "" {
 					raw, err := n.decodeXDR(c.EntryXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Entry = raw
 				}
 				if c.ChangeXDR != "" {
 					raw, err := n.decodeXDR(c.ChangeXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Change = raw
 				}
@@ -501,7 +501,7 @@ func (n *NDJSON) document(r stream.Record) (any, error) {
 
 	case stream.KindFeeStats:
 		if r.FeeStats == nil {
-			return fmt.Errorf("ndjson: fee stats record %s has no payload", r.ID)
+			return nil, fmt.Errorf("ndjson: fee stats record %s has no payload", r.ID)
 		}
 		line := struct {
 			Kind   string `json:"kind"`
@@ -514,7 +514,7 @@ func (n *NDJSON) document(r stream.Record) (any, error) {
 
 	case stream.KindTrade:
 		if r.Trade == nil {
-			return fmt.Errorf("ndjson: trade record %s has no payload", r.ID)
+			return nil, fmt.Errorf("ndjson: trade record %s has no payload", r.ID)
 		}
 		line := struct {
 			Kind   string `json:"kind"`

@@ -305,8 +305,16 @@ func TestBrokerSinkClosesOnCancellation(t *testing.T) {
 	producer := &recordingKafkaProducer{}
 	withKafkaProducer(t, producer)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
+	// Cancel the way runStream's signal handler does — WithCancelCause with
+	// a nil cause, which reads as context.Canceled — because a deadline
+	// firing (context.DeadlineExceeded) is deliberately surfaced as an
+	// error by runStream, whereas an interrupt is a clean shutdown.
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel(nil)
+	}()
 
 	var out, errBuf bytes.Buffer
 	root := newRootCmd(&out, &errBuf)
