@@ -122,6 +122,12 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
   # Backfill from a ledger, then keep following
   prism events --contract CBGSB... --from 1234567 --follow
 
+  # Ingest into PostgreSQL or TimescaleDB instead of stdout
+  prism events --contract CBGSB... --follow --timescale-dsn "$DATABASE_URL"
+
+  # Archive a backfill as columnar Parquet parts
+  prism transactions --from 1234567 --limit 100000 --parquet-dir ./txs
+
   # Explain a transaction, through the lens explain path
   prism tx 3389e9f0...`,
 		SilenceUsage:  true,

@@ -69,6 +69,7 @@ returns — there is no polling loop, no cursor advancement, no reconnection, an
 | **Graceful drain on SIGTERM** | ❌ | ✅ (`--drain-timeout`) |
 | **Encrypted state file** | ❌ | ✅ (`--state-passphrase-env`) |
 | Ledger streaming | ❌ | ✅ |
+| Database / Parquet ingestion | ❌ | ✅ |
 | Contract-spec-decoded payloads | ✅ **better** | ❌ ([roadmap](docs/roadmap.md)) |
 
 ## Install

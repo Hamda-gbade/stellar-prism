@@ -23,9 +23,9 @@ Everything below is in service of those four.
 
 ```
         ┌──────────┐   Batch    ┌────────┐   Record   ┌──────┐
-RPC ───►│  Source  ├───────────►│ Tailer ├───────────►│ Sink ├───► stdout
-        └──────────┘            └────────┘            └──────┘
-         events.go               tail.go               ndjson.go
+RPC ───►│  Source  ├───────────►│ Tailer ├───────────►│ Sink ├───► stdout,
+        └──────────┘            └────────┘            └──────┘     --timescale-dsn,
+         events.go               tail.go               ndjson.go   --parquet-dir
          ledgers.go            cursor, dedup,          human.go
          transactions.go       backoff, gaps           file_rotator.go
          storage_changes.go                          (via lens)
@@ -297,8 +297,77 @@ price of the guarantee; a poll-only RPC keeps the record rate modest.
 
 `Sink.Emit` is synchronous. A slow consumer (`prism … | jq | something-slow`)
 blocks the write, which blocks the poll loop. That is correct backpressure
-with no queue to grow. It is also why both sinks flush per record: a tail that
-buffers looks like a tail that has hung.
+with no queue to grow. It is also why the line-oriented sinks flush per
+record: a tail that buffers looks like a tail that has hung.
+
+## Sinks that store rather than print
+
+`NDJSON` and `Human` are line-oriented: a record is visible the moment `Emit`
+returns. The two storage sinks batch instead, because a round trip (or a file
+rename) per record would be absurd for a backfill. Both keep the same seam and
+the same delivery contract; the difference is that records are only durable
+once a batch is flushed.
+
+Both sinks own a background goroutine that flushes a partial batch every
+`--flush-interval`, and both implement `io.Closer`. The CLI closes whichever
+sink it built after the tailer returns — including on the gap error path — so
+the last records reach disk before the process exits and no goroutine outlives
+the run. `Flush` remains what the tailer calls; `Close` is the stronger command
+that also stops the timer and releases the driver.
+
+### TimescaleDB (`--timescale-dsn`)
+
+Rows land in one wide table, `prism_records`, with the neutral `Record` fields
+plus kind-specific columns left `NULL` where they do not apply, so a query can
+tell "no transaction here" from "a transaction that failed":
+
+```sql
+CREATE TABLE prism_records (
+  id TEXT NOT NULL, ledger BIGINT NOT NULL, kind TEXT NOT NULL,
+  closed_at TIMESTAMPTZ, hash TEXT, contract_id TEXT, tx_hash TEXT,
+  tx_index INTEGER, op_index INTEGER, successful BOOLEAN,
+  topics_xdr TEXT[], value_xdr TEXT, envelope_xdr TEXT,
+  result_xdr TEXT, result_meta_xdr TEXT, header_xdr TEXT, metadata_xdr TEXT,
+  PRIMARY KEY (id, ledger)
+);
+```
+
+The table is promoted to a hypertable partitioned by **ledger** — not by time —
+with a chunk every 50,000 ledgers. The ledger sequence is always present, is the
+natural dimension for chain data, and does not require inventing a timestamp for
+a record the server did not date. On a server without the extension the
+`create_hypertable` call is recognised as "TimescaleDB is not installed" and the
+sink keeps working against the plain table; anything else is reported.
+
+`COPY` cannot express `ON CONFLICT`, so a batch lands in a `pg_temp` table and
+is merged with `INSERT … ON CONFLICT DO NOTHING` inside one transaction. That
+matters for the delivery contract: a restart re-emits the last record or two by
+design, and the primary key would otherwise turn a legitimate replay into a
+fatal duplicate-key error. A failed batch therefore inserts nothing and stays
+buffered for retry, while a replayed batch is a no-op.
+
+### Parquet (`--parquet-dir`)
+
+An embedded DuckDB instance is used only as the Parquet encoder. Rows are staged
+in an in-memory table and copied out with `COPY (SELECT … ORDER BY id) TO …, so
+each flush produces one part file:
+
+```
+<dir>/part-000001.parquet
+<dir>/part-000002.parquet
+```
+
+Part files are written under a `.tmp` name and renamed, so an interrupted COPY
+cannot leave a truncated file that a later read would trust. Numbering resumes
+after the highest part already in the directory, so a restarted backfill appends
+rather than overwrites. The whole archive is one glob away:
+
+```sql
+SELECT kind, count(*) FROM read_parquet('parts/*.parquet') GROUP BY kind;
+```
+
+Batching bounds memory: the staging table never holds more than one part, so a
+multi-day backfill does not grow with the stream.
 
 `--batch` changes the unit of work, not the backpressure: `Batcher` buffers
 records until `--batch-size` is reached or `--batch-timeout` elapses, then
@@ -1263,9 +1332,11 @@ type Sink interface {
 }
 ```
 
-Flush per record if the sink is for live viewing. Decode XDR through `lens`
-rather than reaching for `xdr` directly, so output stays consistent with the
-rest of the family — and report an undecodable payload inline rather than
+Flush per record if the sink is for live viewing. A batching sink should also
+implement `io.Closer`, stop and wait for any goroutine it started, and flush
+whatever is buffered there; the CLI closes the sink it built. Decode XDR through
+`lens` rather than reaching for `xdr` directly, so output stays consistent with
+the rest of the family — and report an undecodable payload inline rather than
 returning an error, so one malformed value cannot kill a long-running tail.
 
 ### Built-in sinks

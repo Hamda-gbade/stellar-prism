@@ -95,8 +95,9 @@ model, so it would be a second `Source` family rather than a drop-in.
 
 ## Explicitly not planned
 
-- **Indexing or storage.** prism streams and exits. Mercury and Zephyr are
-  hosted indexers; if you need queryable history, use one of those.
+- **Indexing.** prism can write records to PostgreSQL/TimescaleDB or Parquet,
+  but it does not index, query or serve them. Mercury and Zephyr remain the
+  hosted indexers; prism's sinks are for the store you already run.
 - **Transaction submission or signing.** prism reads. It never handles secret
   keys, and adding that would make an inspection tool security-sensitive.
 - **Reimplementing XDR decoding.** That is
