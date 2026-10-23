@@ -145,7 +145,35 @@ type Options struct {
 	// It is the grace period an orchestrator gives the process before it
 	// kills it, so a flush that overruns it is abandoned rather than
 	// waited out. Zero means the flush is waited for as long as it takes.
+	// DrainTimeout bounds how long the final flush may take when the run
+	// stops.
+	//
+	// It is the grace period an orchestrator gives the process before it
+	// kills it, so a flush that overruns it is abandoned rather than
+	// waited out. Zero means the flush is waited for as long as it takes.
 	DrainTimeout time.Duration
+	// State, when set, makes the stream position durable. It is saved after
+	// every successfully emitted record and restored when Run starts, so a
+	// restarted process resumes where the previous one stopped instead of
+	// re-emitting from its original start. Nil (the default) keeps the
+	// position in memory only. *StateFile is the file-backed implementation.
+	State StateStore
+}
+
+// StateStore is the seam durable cursors plug into: it holds the stream's
+// resumable position, and the tailer reads it once at startup and writes it
+// after each successful emit. *StateFile is the file-backed implementation;
+// tests substitute fakes to exercise failure paths.
+//
+// Implementations must treat Save as synchronous and durable when it
+// returns nil: the delivery guarantee across restarts rests on the position
+// being on disk before the tailer advances past it.
+type StateStore interface {
+	// Load returns the persisted position, or the zero State when nothing
+	// has been persisted yet.
+	Load() (State, error)
+	// Save replaces the persisted position.
+	Save(st State) error
 }
 
 // Progress reports how far a stream has got relative to the server's head.
@@ -186,14 +214,14 @@ func (p Progress) Lag() uint32 {
 //
 //   - Not exactly-once across restarts. The tailer cannot atomically emit a
 //     record and commit its cursor, so a process killed between the two will
-//     re-emit on restart. A CursorStore in Options.Store narrows that window
-//     to the single record in flight — the position is written after every
-//     emit — but true exactly-once would need a transaction spanning the sink
-//     and the store, which a CLI writing to stdout cannot have. Consumers
-//     that care should key off Record.ID.
-//     re-emit on restart. Options.StartCursor and Options.OnPage checkpoint
-//     fully delivered pages; pages still held by the reorder buffer may be
-//     replayed. Consumers that care should key off Record.ID.
+//     re-emit on restart. When Options.Store or Options.State is set, the
+//     window narrows to the interrupted record: the position is persisted
+//     after every emit and the restored high-water mark suppresses replays.
+//     Options.StartCursor and Options.OnPage checkpoint fully delivered
+//     pages; pages still held by the reorder buffer may be replayed. True
+//     exactly-once would need a transaction spanning the sink and the cursor
+//     store, which a CLI writing to stdout cannot have; consumers that care
+//     should still key off Record.ID.
 type Tailer struct {
 	src  Source
 	sink Sink
@@ -348,6 +376,9 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		}
 		return err
 	}
+	if err := t.restoreState(); err != nil {
+		return err
+	}
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -423,6 +454,15 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 					return t.finish(nil)
 				}
 				return err
+			}
+			// Re-persist with the server's own token now that the batch has
+			// fully drained. It is equivalent to the last record's ID but in
+			// the exact form the server issued it, which is the most
+			// conservative position to resume from.
+			if ledger, ok := t.src.CursorLedger(t.cursor); ok {
+				if err := t.persistState(t.cursor, ledger); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -847,9 +887,75 @@ func (t *Tailer) emitReady(ctx context.Context, records []Record) (done bool, em
 			return false, emitted, err
 		}
 
+		// The position becomes durable only once the record is out: the
+		// state file is written after the emit, never before, so it can
+		// never run ahead of the stream. A crash in between re-emits this
+		// one record on restart — at-least-once, as documented — and the
+		// restored high-water mark suppresses anything already delivered.
+		if err := t.persistState(r.ID, r.Sequence); err != nil {
+			return false, emitted, err
+		}
+
 		if t.opts.Limit > 0 && t.stats.Emitted >= t.opts.Limit {
 			return true, emitted, nil
 		}
 	}
 	return false, emitted, nil
+}
+
+// restoreState resumes the in-memory position from the persisted one.
+//
+// The saved position wins over a freshly configured start, because that is
+// what "durable" means. A state file written by a different stream is
+// refused rather than misapplied, and a token the Source cannot interpret is
+// reported before any request is made rather than surfacing as a confusing
+// server rejection mid-run.
+func (t *Tailer) restoreState() error {
+	if t.opts.State == nil {
+		return nil
+	}
+	st, err := t.opts.State.Load()
+	if err != nil {
+		return fmt.Errorf("loading stream state: %w", err)
+	}
+	if st.Source == "" {
+		// Nothing persisted yet: start where the Source was configured.
+		return nil
+	}
+	if st.Source != t.src.Name() {
+		return fmt.Errorf(
+			"state holds a position for the %q stream, but this run follows %q; use a separate state file per stream",
+			st.Source, t.src.Name())
+	}
+	if st.PagingToken != "" {
+		if _, ok := t.src.CursorLedger(st.PagingToken); !ok {
+			return fmt.Errorf(
+				"state file cursor %q is not a valid %s cursor", st.PagingToken, t.src.Name())
+		}
+		t.cursor = st.PagingToken
+	}
+	t.lastID = st.LastID
+	return nil
+}
+
+// persistState saves the current position, recording pagingToken as the resume
+// point and the tailer's high-water mark. It is a no-op when no StateStore
+// is configured, which keeps the non-durable path free of extra work.
+func (t *Tailer) persistState(pagingToken string, ledger uint32) error {
+	if t.opts.State == nil {
+		return nil
+	}
+	st := State{
+		Version:     StateVersion,
+		Source:      t.src.Name(),
+		Ledger:      ledger,
+		PagingToken: pagingToken,
+		Cursor:      pagingToken,
+		LastID:      t.lastID,
+		UpdatedAt:   t.opts.Clock.Now(),
+	}
+	if err := t.opts.State.Save(st); err != nil {
+		return fmt.Errorf("persisting stream position: %w", err)
+	}
+	return nil
 }

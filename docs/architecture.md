@@ -99,6 +99,7 @@ pkg/stream/
   demux.go            per-contract fan-out, queues + one goroutine each
   time_window.go      --since → approximate start ledger
   backoff.go          AdaptivePoller for --adaptive follow waits
+  state_file.go       durable cursor: atomic, file-backed stream position
 pkg/sink/
   ndjson.go           NDJSON, one object per line
   human.go            terminal output, payloads via lens
@@ -245,6 +246,52 @@ is still announced: it reaches `Options.OnGap`, the CLI prints it on stderr,
 and `Stats.Gaps` / `Stats.Recovered` count it. `--max-gap-recoveries` bounds
 how many times a stream may skip ahead. A source without `Rewinder` cannot
 resume and fails exactly as it would under the default policy.
+
+### Durable cursors (`--state-file`)
+
+Exactly-once across restarts would need a transaction spanning the sink and
+the cursor store, which a CLI writing to stdout cannot have. What prism can
+have is much better than nothing, and `--state-file <path>` turns it on: the
+stream position is persisted after **every successfully emitted record**, so
+a restart resumes where the previous run stopped and the restart window
+narrows from "the whole run" to "one interrupted record".
+
+The position is one small, versioned JSON document (see
+`pkg/stream/state_file.go`):
+
+```json
+{"version":1,"source":"events","ledger":3966820,"paging_token":"…","last_id":"…","updated_at":"2026-10-20T12:00:00Z"}
+```
+
+Four rules carry the weight:
+
+**1. The file is written after the emit, never before.** It can therefore
+never run ahead of the stream: a crash between the two re-emits exactly the
+interrupted record on restart, and the restored high-water mark (`last_id`)
+suppresses anything the previous run already delivered.
+
+**2. Writes are atomic.** Each save writes a complete snapshot to a
+temporary file in the same directory, fsyncs it, and renames it over the
+destination, so a reader only ever sees a complete snapshot — the previous
+state or the new one, never a torn file. A crash before the rename reverts
+to the previous position, which can only re-emit, never skip: at-least-once
+holds unconditionally.
+
+**3. The saved position wins, visibly.** On startup the tailer resumes from
+the stored paging token, and the CLI notes on stderr when that overrides an
+explicit `--from`. A state file written by a different stream is refused
+rather than misapplied, and a token the Source cannot interpret fails the
+run before any request is made.
+
+**4. The restored high-water mark keeps de-duplication across the restart.**
+`last_id` is reloaded into the tailer, so a server that replays the tail of
+the stream to a freshly restarted client — which the RPC docs warn to expect
+— is still suppressed, exactly as within a single run.
+
+Persistence is synchronous and file-backed: no goroutines, no open
+descriptors between writes, nothing to clean up when the stream terminates
+or is interrupted. The cost is one small fsync per record, which is the
+price of the guarantee; a poll-only RPC keeps the record rate modest.
 
 ### Backpressure
 
@@ -1046,38 +1093,10 @@ Covered: clean streams, drops at every position, consecutive drops, replayed
 pages, out-of-order pages, retention overrun with both gap policies, lagging
 backends, permanent errors, retry exhaustion, cancellation mid-follow, sink
 failure, full-page draining, concurrent backfill, batcher count/time/explicit
-flushes, and task-group cancellation. Gap recovery is also unit-tested
+flushes, durable-cursor resume across restarts, replay suppression across
+restarts, corrupt/foreign/uninterpretable state files, persist failures mid-page,
+and task-group cancellation. Gap recovery is also unit-tested
 without a network through the `Rewinder` seam.
-
-The transactions source has its own matrix: SEP-35 cursor parsing (TOID,
-plain ledger, compound and rejected cursor), fixed-width IDs across page
-boundaries, a short page before the head continuing the drain, gap detection
-*through* a TOID cursor rather than a ledger number, gap resume, and the
-concurrent drainer merging workers over transaction pages. `internal/cli`
-repeats the important ones through the command, including the exit-2 gap
-contract.
-
-The cursor metadata store is tested the same way: appends and rewrites
-against a real file in a temporary directory, a pruner that keeps running
-after a failure, a pruner whose goroutine is joined rather than abandoned,
-and a tailer that resumes from a recorded cursor and is still gap-checked
-when it does. `internal/cli` runs the whole thing end to end against
-`internal/fakerpc`: a run that records checkpoints, a file that stays
-bounded while the stream runs, and a second run that picks up where the
-first stopped.
-
-The same guarantees also hold through the seams this file describes below:
-adaptive poll waits, `--since` window arithmetic, client-side topic
-patterns, and demux routing under concurrent submitters — all checked with
-`go test -race`.
-
-The dead letter queue is covered at both levels. `pkg/sink` tests every
-validation branch, delivery and flush failures (including a writer that
-fails like a full disk), batch attribution, and idempotent close against a
-real file. `internal/cli` runs `runStream` with a source that emits one valid
-record and one malformed record, then asserts that the valid record reached
-stdout, the malformed one reached `--dlq-file`, and the command exited
-successfully — the end-to-end shape of "a bad record does not crash a tail".
 
 Time is injected via `Clock`, so there are no real sleeps and no wall-clock
 flakiness. Follow-loop tests carry a sleep budget that cancels the context, so
@@ -1142,6 +1161,9 @@ The invariants were verified by breaking the code on purpose:
 | DLQ closing without flushing | `TestDLQClosesWriterAndPrimaryIdempotently` fails: the queue file is empty |
 | Transaction cursor parsed as a ledger sequence | `TestTransactionTailDetectsRetentionGap` fails: the stream passes over the pruned range instead of reporting it |
 | Transaction source treats a short page before the head as terminal | `TestTransactionTailContinuesShortPageBeforeHead` and `TestTransactionsCommandShortPageKeepsDraining` fail with one record instead of two |
+| Per-emit persistence disabled | `TestTailStateRecordsPositionAfterEachEmit`, `TestTailStateResumesAcrossRestart` and the CLI restart test fail |
+| Startup restore disabled | `TestTailStateResumesAcrossRestart`, `TestTailStateRefusesPositionFromAnotherStream`, `TestTailStateRejectsUninterpretableToken` and `TestTailStateGapDetectedOnResume` fail |
+| Restored high-water mark dropped | `TestTailStateSuppressesReplayAfterRestart` fails, naming the re-emitted IDs |
 
 If you change the state machine, re-run that exercise. A test suite that
 cannot fail is not protecting anything.

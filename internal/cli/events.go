@@ -695,7 +695,10 @@ start the next run where the last one stopped.`,
   prism events --from 1234567 --follow
 
   # Resume across restarts with a durable cursor in PostgreSQL
-  prism events --contract CBGSB... --follow --pg-dsn "$PRISM_PG_DSN"`,
+  prism events --contract CBGSB... --follow --pg-dsn "$PRISM_PG_DSN"
+
+  # Durable cursor: resume where the previous run stopped
+  prism events --contract CBGSB... --follow --state-file ./prism.state.json`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := sf.validate(cmd); err != nil {
@@ -1164,17 +1167,42 @@ func runStream(
 				fmt.Fprintf(stderr, "prism: recording cursor metadata: %v\n", recordErr)
 			}
 		}
+	} else if sf.stateFile != "" {
+		file, err := stream.OpenStateFile(sf.stateFile)
+		if err != nil {
+			return err
+		}
+		if sf.from != 0 {
+			saved, loadErr := file.Load()
+			if loadErr != nil {
+				return loadErr
+			}
+			if saved.Source == cmd.Name() && saved.PagingToken != "" {
+				fmt.Fprintf(stderr,
+					"prism: resuming the %s stream from %s (ledger %d); ignoring --from\n",
+					cmd.Name(), file.Path(), saved.Ledger)
+			}
+		}
+		opts.State = file
 	}
 
 	startFrom := from
 	if startFrom == 0 && opts.StartCursor == "" {
-		// Starting "now" means asking the server where now is; the
-		// RPC requires a concrete start ledger.
-		latest, err := latestLedger(ctx, client)
-		if err != nil {
-			return err
+		if opts.State != nil {
+			saved, err := opts.State.Load()
+			if err == nil && saved.PagingToken != "" && saved.Ledger != 0 {
+				startFrom = saved.Ledger
+			}
 		}
-		startFrom = latest
+		if startFrom == 0 {
+			// Starting "now" means asking the server where now is; the
+			// RPC requires a concrete start ledger.
+			latest, err := latestLedger(ctx, client)
+			if err != nil {
+				return err
+			}
+			startFrom = latest
+		}
 	}
 
 	if from > 0 && sf.backfillWorkers > 1 {
