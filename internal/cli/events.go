@@ -53,13 +53,24 @@ type streamFlags struct {
 	// runStream, because only the command knows which filters select records.
 	// See cursorKey.
 	derivedKey string
-	quiet      bool
-	verbosity  int
-	stats      bool
-	dryRun     bool
-	statsBar   bool
-	process    func([]stream.Record) ([]stream.Record, error)
-	filter     stream.RecordFilter
+
+	// Broker output. When configured, records are published to the broker
+	// instead of written to stdout.
+	kafkaBrokers     []string
+	kafkaTopic       string
+	kafkaPartitionBy string
+	amqpURL          string
+	amqpQueue        string
+	amqpExchange     string
+	amqpRoutingKey   string
+
+	quiet     bool
+	verbosity int
+	stats     bool
+	dryRun    bool
+	statsBar  bool
+	process   func([]stream.Record) ([]stream.Record, error)
+	filter    stream.RecordFilter
 
 	sinks sinkFlags
 
@@ -241,6 +252,21 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"append malformed or undeliverable records to this file as NDJSON instead of stopping the stream")
 	cmd.Flags().IntVar(&s.maxRecordRetries, "max-record-retries", 0,
 		"retry a failed record this many times before writing it to the dead-letter queue")
+	cmd.Flags().StringSliceVar(&s.kafkaBrokers, "kafka-brokers", nil,
+		"Kafka broker addresses (comma-separated); requires --kafka-topic")
+	cmd.Flags().StringVar(&s.kafkaTopic, "kafka-topic", "",
+		"publish records as JSON to this Kafka topic instead of stdout; requires --kafka-brokers")
+	cmd.Flags().StringVar(&s.kafkaPartitionBy, "kafka-partition-by", string(sink.PartitionContract),
+		`Kafka message key: "contract" keeps one contract's records ordered on one partition, "tx" keys by transaction hash, "record" keys by record ID`)
+	cmd.Flags().StringVar(&s.amqpURL, "amqp-url", "",
+		"AMQP 0-9-1 broker URL, e.g. amqp://guest:guest@localhost:5672/; requires --amqp-queue")
+	cmd.Flags().StringVar(&s.amqpQueue, "amqp-queue", "",
+		"declare this durable queue and publish records to it instead of stdout; requires --amqp-url")
+	cmd.Flags().StringVar(&s.amqpExchange, "amqp-exchange", "",
+		"AMQP exchange to publish to (default: the default exchange, routing by queue name)")
+	cmd.Flags().StringVar(&s.amqpRoutingKey, "amqp-routing-key", "",
+		"AMQP routing key (default: the queue name)")
+	registerFlagCompletion(cmd, "kafka-partition-by", string(sink.PartitionContract), string(sink.PartitionTx), string(sink.PartitionRecord))
 	s.sinks.register(cmd)
 }
 
