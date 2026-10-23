@@ -34,6 +34,7 @@ type streamFlags struct {
 	raw              bool
 	compact          bool
 	poll             time.Duration
+	heartbeat        time.Duration
 	pageSize         uint
 	retries          int
 	adaptive         bool
@@ -43,7 +44,6 @@ type streamFlags struct {
 	batchTimeout     time.Duration
 	gapStrategy      string
 	maxGapRecoveries int
-
 	// pgDSN enables durable cursors in PostgreSQL. Empty means off, subject
 	// to the environment default resolved in runStream.
 	pgDSN string
@@ -55,6 +55,7 @@ type streamFlags struct {
 	derivedKey string
 	quiet      bool
 	verbosity  int
+	stats      bool
 	process    func([]stream.Record) ([]stream.Record, error)
 	filter     stream.RecordFilter
 
@@ -147,6 +148,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"print only the header line for each record, omitting decoded payloads")
 	cmd.Flags().DurationVar(&s.poll, "poll", stream.DefaultPollInterval,
 		"how long to wait between polls once caught up")
+	cmd.Flags().DurationVar(&s.heartbeat, "heartbeat", 0,
+		"print a line on stderr after this long waiting in silence (with --follow; 0 disables)")
 	cmd.Flags().UintVar(&s.pageSize, "page-size", defaultPage,
 		"how many records to request per RPC call")
 	cmd.Flags().IntVar(&s.retries, "max-retries", 0,
@@ -171,6 +174,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"limit how many times --gap-strategy resume may skip ahead (0 means no limit)")
 	cmd.Flags().BoolVar(&s.quiet, "quiet", false,
 		"suppress diagnostic output on stderr; only emit final exit code")
+	cmd.Flags().BoolVar(&s.stats, "stats", false,
+		"print a run summary on exit: records processed, duplicates dropped, retries and elapsed time")
 	cmd.Flags().StringVar(&s.output, "output-file", "",
 		"append records to this file instead of stdout")
 	cmd.Flags().Int64Var(&s.rotateSize, "rotate-size", 0,
@@ -276,6 +281,12 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.dedupWindow < 0 {
 		return fmt.Errorf("--dedup-window must not be negative")
+	}
+	if s.heartbeat < 0 {
+		return fmt.Errorf("--heartbeat must not be negative")
+	}
+	if s.heartbeat > 0 && !s.follow {
+		return fmt.Errorf("--heartbeat requires --follow")
 	}
 	if err := s.validateState(cmd); err != nil {
 		return err
@@ -900,6 +911,26 @@ func runStream(
 	// and so a test's stderr buffer cannot race.
 	stderr = newSyncWriter(stderr)
 
+	// --stats reports what the run did as the command exits. The reporter
+	// holds no goroutine and no timer: the phases feed it as they finish,
+	// and this deferred call — registered before every teardown below, so
+	// it runs last — prints the line after the drain, the cursor commit
+	// and the sink close. It prints nothing when the flag was not passed,
+	// or when the run failed before it started fetching.
+	var dedupOut *stream.DedupSink
+	// drainAbandoned records that the drain overran --drain-timeout and was
+	// left to its goroutine. The deferred report then skips the dedup sink
+	// — that goroutine may still be emitting through it — because the body
+	// already folded a snapshot taken before the goroutine started.
+	drainAbandoned := false
+	summary := newRunStats(sf.stats)
+	defer func() {
+		if !drainAbandoned {
+			summary.addDuplicates(dedupDropped(dedupOut))
+		}
+		summary.report(stderr)
+	}()
+
 	// Ctrl-C ends the stream cleanly rather than killing it mid-record, so a
 	// partially written line never reaches a downstream consumer. The signal
 	// stops the fetching; the drain at the end of the run flushes what is
@@ -970,7 +1001,8 @@ func runStream(
 	// a re-polled event is suppressed for every sink downstream — including
 	// a fanout directory — without any of them knowing about it.
 	if sf.dedupWindow > 0 {
-		out = stream.NewDedupSink(out, sf.dedupWindow)
+		dedupOut = stream.NewDedupSink(out, sf.dedupWindow)
+		out = dedupOut
 	}
 
 	if len(sf.topicPatterns) > 0 {
@@ -1166,7 +1198,9 @@ func runStream(
 			return err
 		}
 
+		summary.start()
 		stats, err := drainer.Run(ctx)
+		summary.add(stats)
 		if err != nil {
 			return reportStreamError(err, stderr, store, key)
 		}
@@ -1192,13 +1226,45 @@ func runStream(
 	if err != nil {
 		return err
 	}
+
+	// --heartbeat prints a line on stderr whenever the follow loop waits
+	// an interval without delivering a record, so a quiet contract is
+	// distinguishable from a hung process. The beat is driven by slicing
+	// the tailer's own waits and by marking delivered pages, so it runs
+	// on the tailer's goroutine and holds nothing to clean up. The
+	// backfill above keeps the plain clock: its waits are fetch retries,
+	// not idle follow intervals.
+	if beat := newHeartbeat(sf.heartbeat, stderr); beat != nil {
+		clock := opts.Clock
+		if clock == nil {
+			clock = stream.RealClock{}
+		}
+		opts.Clock = &heartbeatClock{clock: clock, beat: beat}
+		onPage := opts.OnPage
+		opts.OnPage = func(page stream.Page) {
+			beat.mark()
+			if onPage != nil {
+				onPage(page)
+			}
+		}
+	}
+
 	tailer := stream.NewTailer(src, out, opts)
+	summary.start()
 	runErr := tailer.Run(ctx)
 
 	// The stream has stopped fetching, either because it finished or
 	// because it was interrupted. Everything it is still holding is
 	// flushed now, within the drain timeout, so the final cursor is
 	// committed before the process goes away.
+	//
+	// The counters are snapshotted before the drain is started: a drain
+	// that overruns the timeout is abandoned to its goroutine, which may
+	// still be emitting while the summary prints, so afterwards only a
+	// drain that completed — joined by runWithTimeout's receive — is read
+	// afresh.
+	stats := tailer.Stats()
+	dropped := dedupDropped(dedupOut)
 	drainErr := runWithTimeout(sf.drainTimeout, func() error {
 		var errs []error
 		if err := tailer.Drain(context.WithoutCancel(ctx), sf.drainTimeout); err != nil {
@@ -1217,6 +1283,17 @@ func runStream(
 		if runErr == nil {
 			runErr = drainErr
 		}
+	}
+	if errors.Is(drainErr, errTimedOut) {
+		// Abandoned mid-drain: report the pre-drain snapshot rather
+		// than reading state the abandoned goroutine still owns, and
+		// let the deferred report skip the dedup sink for the same
+		// reason.
+		drainAbandoned = true
+		summary.add(stats)
+		summary.addDuplicates(dropped)
+	} else {
+		summary.add(tailer.Stats())
 	}
 	return reportStreamError(runErr, stderr, store, key)
 }
