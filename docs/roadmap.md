@@ -28,6 +28,8 @@ Working and tested:
   `--resume` to continue a stream from the last recorded position
 - `--stats` — a run summary on exit: records processed, duplicates dropped,
   retries and elapsed time
+- `--heartbeat 30s` — a line on stderr after every idle interval during
+  `--follow`, so a quiet contract is distinguishable from a hung process
 - Streaming core fully tested with no network, and mutation-checked
 
 Known limits, stated plainly:
@@ -77,12 +79,6 @@ here, and the largest.
 `prism txs --follow` over `getTransactions`, which is already a paginated
 cursor API of the same shape. Mostly a new `Source`; the state machine and
 sinks are unchanged. A good first substantial contribution.
-
-### Better `--follow` ergonomics
-
-- a heartbeat line on stderr when a follow is idle, so a quiet contract is
-  distinguishable from a hung process (the `--since` and `--stats` halves of
-  this list have already shipped — see them in the working list above)
 
 ## Later, and less certain
 

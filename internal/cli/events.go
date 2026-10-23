@@ -34,6 +34,7 @@ type streamFlags struct {
 	raw              bool
 	compact          bool
 	poll             time.Duration
+	heartbeat        time.Duration
 	pageSize         uint
 	retries          int
 	adaptive         bool
@@ -138,6 +139,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"print only the header line for each record, omitting decoded payloads")
 	cmd.Flags().DurationVar(&s.poll, "poll", stream.DefaultPollInterval,
 		"how long to wait between polls once caught up")
+	cmd.Flags().DurationVar(&s.heartbeat, "heartbeat", 0,
+		"print a line on stderr after this long waiting in silence (with --follow; 0 disables)")
 	cmd.Flags().UintVar(&s.pageSize, "page-size", defaultPage,
 		"how many records to request per RPC call")
 	cmd.Flags().IntVar(&s.retries, "max-retries", 0,
@@ -265,6 +268,12 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.dedupWindow < 0 {
 		return fmt.Errorf("--dedup-window must not be negative")
+	}
+	if s.heartbeat < 0 {
+		return fmt.Errorf("--heartbeat must not be negative")
+	}
+	if s.heartbeat > 0 && !s.follow {
+		return fmt.Errorf("--heartbeat requires --follow")
 	}
 	if err := s.validateState(cmd); err != nil {
 		return err
@@ -1156,6 +1165,29 @@ func runStream(
 	if err != nil {
 		return err
 	}
+
+	// --heartbeat prints a line on stderr whenever the follow loop waits
+	// an interval without delivering a record, so a quiet contract is
+	// distinguishable from a hung process. The beat is driven by slicing
+	// the tailer's own waits and by marking delivered pages, so it runs
+	// on the tailer's goroutine and holds nothing to clean up. The
+	// backfill above keeps the plain clock: its waits are fetch retries,
+	// not idle follow intervals.
+	if beat := newHeartbeat(sf.heartbeat, stderr); beat != nil {
+		clock := opts.Clock
+		if clock == nil {
+			clock = stream.RealClock{}
+		}
+		opts.Clock = &heartbeatClock{clock: clock, beat: beat}
+		onPage := opts.OnPage
+		opts.OnPage = func(page stream.Page) {
+			beat.mark()
+			if onPage != nil {
+				onPage(page)
+			}
+		}
+	}
+
 	tailer := stream.NewTailer(src, out, opts)
 	summary.start()
 	runErr := tailer.Run(ctx)
