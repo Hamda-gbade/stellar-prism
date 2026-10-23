@@ -43,10 +43,20 @@ type streamFlags struct {
 	batchTimeout     time.Duration
 	gapStrategy      string
 	maxGapRecoveries int
-	quiet            bool
-	verbosity        int
-	process          func([]stream.Record) ([]stream.Record, error)
-	filter           stream.RecordFilter
+
+	// pgDSN enables durable cursors in PostgreSQL. Empty means off, subject
+	// to the environment default resolved in runStream.
+	pgDSN string
+	// pgCursorKey overrides the derived cursor row name.
+	pgCursorKey string
+	// derivedKey is computed by each command from its own query before
+	// runStream, because only the command knows which filters select records.
+	// See cursorKey.
+	derivedKey string
+	quiet      bool
+	verbosity  int
+	process    func([]stream.Record) ([]stream.Record, error)
+	filter     stream.RecordFilter
 
 	sinks sinkFlags
 
@@ -141,6 +151,10 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"how many records to request per RPC call")
 	cmd.Flags().IntVar(&s.retries, "max-retries", 0,
 		"give up after this many consecutive RPC failures (0 means never give up)")
+	cmd.Flags().StringVar(&s.pgDSN, "pg-dsn", "",
+		"PostgreSQL DSN for a durable cursor, so a restart resumes where this run stopped (default $"+envPGDSN+"; empty disables persistence)")
+	cmd.Flags().StringVar(&s.pgCursorKey, "pg-cursor-key", "",
+		"cursor row to save and resume under (default: <command>/<hash of --from and filters, so each distinct stream resumes itself)")
 	cmd.Flags().BoolVar(&s.adaptive, "adaptive", false,
 		"tune the wait between polls from how many new ledgers close each interval (with --follow)")
 	cmd.Flags().IntVar(&s.backfillWorkers, "backfill-workers", 1,
@@ -645,6 +659,9 @@ Events are retained by RPC for roughly 24 hours, so --from cannot reach
 further back than that. If the stream ever falls behind that window, prism
 reports the missed ledger range and exits 2 rather than skipping silently.
 
+With --pg-dsn the position is committed to PostgreSQL after every record, so
+an interrupted run resumes where it stopped instead of starting over.
+
 With --state-file the position reached is recorded after every page, and a
 background pruner keeps that file from growing without bound. Add --resume to
 start the next run where the last one stopped.`,
@@ -664,7 +681,10 @@ start the next run where the last one stopped.`,
   prism events --contracts-file /etc/prism/watchlist.txt --topic-regex '0:^transfer.*,1:.*' --follow
 
   # Backfill from a ledger then keep following
-  prism events --from 1234567 --follow`,
+  prism events --from 1234567 --follow
+
+  # Resume across restarts with a durable cursor in PostgreSQL
+  prism events --contract CBGSB... --follow --pg-dsn "$PRISM_PG_DSN"`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := sf.validate(cmd); err != nil {
@@ -734,6 +754,20 @@ start the next run where the last one stopped.`,
 				return stream.NewEventSource(client, query)
 			}
 
+			// The key names this exact query: same filters, same stream, and
+			// therefore the same durable position on a later run.
+			parts := []string{fromKeyPart(sf.from)}
+			for _, c := range contractIDs {
+				parts = append(parts, "contract="+c)
+			}
+			for _, topic := range topics {
+				parts = append(parts, "topic="+topic)
+			}
+			for _, et := range eventTypes {
+				parts = append(parts, "type="+et)
+			}
+			sf.derivedKey = cursorKey(cmd.Name(), parts...)
+
 			return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)
 		},
 	}
@@ -778,6 +812,9 @@ func newLedgersCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 Ledger metadata is large, so --compact is often what you want when watching
 for liveness rather than reading contents.
 
+With --pg-dsn the position is committed to PostgreSQL as the stream advances,
+so an interrupted run resumes where it stopped.
+
 With --state-file the position reached is recorded after every page, and a
 background pruner keeps that file from growing without bound. Add --resume to
 start the next run where the last one stopped.`,
@@ -811,6 +848,7 @@ start the next run where the last one stopped.`,
 					ExpectedValidators: expected,
 				}), nil
 			}
+			sf.derivedKey = cursorKey(cmd.Name(), fromKeyPart(sf.from))
 			return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)
 		},
 	}
@@ -1059,6 +1097,30 @@ func runStream(
 		from = since
 	}
 
+	// Durable persistence is opt-in: only a DSN (flag or environment) opens
+	// anything, and without one no connection is ever attempted.
+	key := sf.derivedKey
+	if sf.pgCursorKey != "" {
+		key = sf.pgCursorKey
+	}
+	dsn := sf.pgDSN
+	if dsn == "" {
+		dsn = os.Getenv(envPGDSN)
+	}
+	store, closeStore, err := openCursorStore(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	if closeStore != nil {
+		defer func() {
+			if closeErr := closeStore(); closeErr != nil {
+				fmt.Fprintf(stderr, "prism: closing the PostgreSQL cursor store: %v\n", closeErr)
+			}
+		}()
+	}
+	opts.Store = store
+	opts.StoreKey = key
+
 	if state != nil {
 		// An explicit --from or --since wins over a recorded cursor: the
 		// operator asked for a position, so it is the position that counts.
@@ -1106,7 +1168,7 @@ func runStream(
 
 		stats, err := drainer.Run(ctx)
 		if err != nil {
-			return reportStreamError(err, stderr)
+			return reportStreamError(err, stderr, store, key)
 		}
 		if sf.limit > 0 {
 			remaining := sf.limit - stats.Emitted
@@ -1156,16 +1218,21 @@ func runStream(
 			runErr = drainErr
 		}
 	}
-	return reportStreamError(runErr, stderr)
+	return reportStreamError(runErr, stderr, store, key)
 }
 
-func reportStreamError(err error, stderr io.Writer) error {
+func reportStreamError(err error, stderr io.Writer, store stream.CursorStore, key string) error {
 	var gap *stream.GapError
 	if errors.As(err, &gap) {
 		fmt.Fprintf(stderr, "prism: %v\n", gap)
 		fmt.Fprintf(stderr,
 			"prism: restart with --from %d to resume from the oldest data the server still has\n",
 			gap.Oldest)
+		if store != nil {
+			fmt.Fprintf(stderr,
+				"prism: that starts a fresh stream with a new cursor row; the stale row for %q can be deleted\n",
+				key)
+		}
 		return &ExitCodeError{Code: 2, Message: gap.Error()}
 	}
 	return err

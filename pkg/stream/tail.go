@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -92,6 +93,16 @@ type Options struct {
 	// OnRetry, when set, is called before each backoff wait so the CLI can
 	// tell the user what is happening rather than appearing to hang.
 	OnRetry func(attempt int, delay time.Duration, err error)
+	// Store, when set, persists the stream position so a later run resumes
+	// where this one stopped. Nil — the default — keeps the position in
+	// memory only, which is exactly the behaviour prism had before durable
+	// cursors existed.
+	Store CursorStore
+	// StoreKey names the row the position is saved under. Empty means the
+	// Source's name; set it when one Source name covers several distinct
+	// queries, or two streams would resume from each other's position.
+	StoreKey string
+
 	// GapStrategy selects what to do when the server has pruned records.
 	// The empty value means GapFail.
 	GapStrategy GapStrategy
@@ -175,6 +186,11 @@ func (p Progress) Lag() uint32 {
 //
 //   - Not exactly-once across restarts. The tailer cannot atomically emit a
 //     record and commit its cursor, so a process killed between the two will
+//     re-emit on restart. A CursorStore in Options.Store narrows that window
+//     to the single record in flight — the position is written after every
+//     emit — but true exactly-once would need a transaction spanning the sink
+//     and the store, which a CLI writing to stdout cannot have. Consumers
+//     that care should key off Record.ID.
 //     re-emit on restart. Options.StartCursor and Options.OnPage checkpoint
 //     fully delivered pages; pages still held by the reorder buffer may be
 //     replayed. Consumers that care should key off Record.ID.
@@ -190,6 +206,13 @@ type Tailer struct {
 	// fixed-width and zero-padded, a plain string comparison orders them
 	// correctly, which is what makes de-duplication a single comparison.
 	lastID string
+
+	// persisted is the last position successfully written to the Store, and
+	// persistedOK records whether anything has been written or restored yet.
+	// Re-writing an unchanged position would turn every idle poll of a
+	// caught-up follow into a transaction for nothing.
+	persisted   CursorState
+	persistedOK bool
 
 	stats    Stats
 	recovery GapRecovery
@@ -319,6 +342,13 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		}
 	}()
 
+	if err := t.restore(ctx); err != nil {
+		if IsCancellation(err) {
+			return t.finish(nil)
+		}
+		return err
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return t.finish(nil)
@@ -357,8 +387,11 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		}
 
 		t.queuePage(batch)
-		done, _, err := t.emit(batch)
+		done, _, err := t.emit(ctx, batch)
 		if err != nil {
+			if IsCancellation(err) {
+				return t.finish(nil)
+			}
 			return err
 		}
 		t.reportProgress(batch)
@@ -366,7 +399,7 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		// drained and the buffered suffix satisfies the limit. Do not wait
 		// for another ledger just to finish an explicitly bounded request.
 		if !done && !batch.Full && t.opts.Limit > 0 && t.stats.Emitted+len(t.reorder.pending) >= t.opts.Limit {
-			done, _, err = t.emitReady(t.reorder.Flush())
+			done, _, err = t.emitReady(ctx, t.reorder.Flush())
 			if err != nil {
 				return err
 			}
@@ -382,6 +415,15 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		// whole run resumes from the same place rather than past the failure.
 		if batch.NextCursor != "" {
 			t.cursor = batch.NextCursor
+			// The page boundary is the first point at which the resume
+			// position may move; writing it here is what lets a later run
+			// fetch from here instead of from the start of the page.
+			if err := t.persist(ctx); err != nil {
+				if IsCancellation(err) {
+					return t.finish(nil)
+				}
+				return err
+			}
 		}
 
 		// A full page means the server already has more for us; keep draining
@@ -510,7 +552,7 @@ func (t *Tailer) Drain(ctx context.Context, timeout time.Duration) error {
 // quietly become N plus whatever the run happened to be holding.
 func (t *Tailer) drain(ctx context.Context) error {
 	if t.opts.Limit == 0 || t.stats.Emitted < t.opts.Limit {
-		if _, _, err := t.emitReady(t.reorder.Flush()); err != nil {
+		if _, _, err := t.emitReady(ctx, t.reorder.Flush()); err != nil {
 			return err
 		}
 	}
@@ -528,7 +570,7 @@ func (t *Tailer) drain(ctx context.Context) error {
 // run that ends flushes exactly once whatever path it ended by.
 func (t *Tailer) finish(err error) error {
 	if err == nil && (t.opts.Limit == 0 || t.stats.Emitted < t.opts.Limit) {
-		if _, _, flushErr := t.emitReady(t.reorder.Flush()); flushErr != nil {
+		if _, _, flushErr := t.emitReady(context.Background(), t.reorder.Flush()); flushErr != nil {
 			return flushErr
 		}
 	}
@@ -634,6 +676,60 @@ func (t *Tailer) checkGap(b Batch) *GapError {
 	return nil
 }
 
+// restore loads a persisted position, if any, before the first fetch.
+//
+// A missing row is a first run and leaves the configured start position
+// alone. Any other failure is fatal: carrying on would mean claiming
+// durability the operator asked for and silently not having it.
+func (t *Tailer) restore(ctx context.Context) error {
+	if t.opts.Store == nil {
+		return nil
+	}
+	state, err := t.opts.Store.Load(ctx, t.storeKey())
+	switch {
+	case errors.Is(err, ErrNoCursor):
+		return nil
+	case err != nil:
+		return fmt.Errorf("restoring cursor: %w", err)
+	}
+	t.cursor = state.Cursor
+	t.lastID = state.LastID
+	// Restoring counts as persisted: it is the same position, already durable.
+	t.persisted, t.persistedOK = state, true
+	return nil
+}
+
+// persist writes the position reached so far.
+//
+// It is called after every emitted record and again when a page boundary is
+// crossed, which is what bounds a crash's replay window to one record: the
+// resume point only ever moves to a page boundary once the whole page is out,
+// and LastID suppresses the replay of what was already emitted from inside
+// the page. A position that has not moved is not written again.
+func (t *Tailer) persist(ctx context.Context) error {
+	if t.opts.Store == nil {
+		return nil
+	}
+	state := CursorState{Cursor: t.cursor, LastID: t.lastID}
+	if t.persistedOK && state == t.persisted {
+		return nil
+	}
+	if err := t.opts.Store.Save(ctx, t.storeKey(), state); err != nil {
+		return fmt.Errorf("persisting cursor: %w", err)
+	}
+	t.persisted, t.persistedOK = state, true
+	return nil
+}
+
+// storeKey is the row the position lives under: an explicit key when the
+// caller named one, the Source's name otherwise.
+func (t *Tailer) storeKey() string {
+	if t.opts.StoreKey != "" {
+		return t.opts.StoreKey
+	}
+	return t.src.Name()
+}
+
 // reportsPage reports whether a page moved the stream forward.
 //
 // An empty page that leaves the cursor where it was says nothing new, and
@@ -691,11 +787,14 @@ func (t *Tailer) reportReadyPages() {
 
 // emit writes a batch's records, suppressing any the server replayed, and
 // reports whether the configured limit has been reached and records written.
-func (t *Tailer) emit(b Batch) (done bool, emitted int, err error) {
-	return t.emitReady(t.reorder.Add(b.Records))
+func (t *Tailer) emit(ctx context.Context, b Batch) (done bool, emitted int, err error) {
+	if t.opts.Store != nil {
+		return t.emitReady(ctx, b.Records)
+	}
+	return t.emitReady(ctx, t.reorder.Add(b.Records))
 }
 
-func (t *Tailer) emitReady(records []Record) (done bool, emitted int, err error) {
+func (t *Tailer) emitReady(ctx context.Context, records []Record) (done bool, emitted int, err error) {
 	if len(records) == 0 {
 		return false, 0, nil
 	}
@@ -740,6 +839,13 @@ func (t *Tailer) emitReady(records []Record) (done bool, emitted int, err error)
 		t.stats.Emitted++
 		emitted++
 		t.reportReadyPages()
+
+		// Persist at the cursor the record was fetched from: the record is
+		// out, and the next run must both resume at or before it and know
+		// what to suppress.
+		if err := t.persist(ctx); err != nil {
+			return false, emitted, err
+		}
 
 		if t.opts.Limit > 0 && t.stats.Emitted >= t.opts.Limit {
 			return true, emitted, nil

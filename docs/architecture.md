@@ -158,6 +158,69 @@ The RPC rejects a request carrying both a ledger range and a cursor
 enforces the same rule, so a regression here fails in tests rather than only
 in production.
 
+### Durable cursors
+
+By default a cursor lives only in the process, so restarting a stream starts it
+over from `StartLedger`. `--pg-dsn` moves that position into PostgreSQL, making
+a restart resume where the last run stopped:
+
+```go
+prism events tail --start-ledger 50000000 \
+    --pg-dsn "$PRISM_PG_DSN" --pg-cursor-key events/tendermint
+```
+
+With no `--pg-cursor-key`, prism derives one from the command and its tagged
+arguments (`events/tendermint` + start ledger → `events/<sha256-prefix>`), so
+two differently-configured streams sharing a database never share a row. Two
+runs pointed at the *same* key are two writers on one cursor; see the
+mutual-exclusion caveat below.
+
+The table is created on first use:
+
+```sql
+CREATE TABLE IF NOT EXISTS "prism_cursors" (
+    name       TEXT        PRIMARY KEY,
+    cursor     TEXT        NOT NULL,
+    last_id    TEXT        NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+)
+```
+
+`EnsureSchema` is a no-op when it already exists, so a role without `CREATE`
+can be given a pre-created table instead.
+
+**Why `SELECT … FOR UPDATE`.** Two processes writing one key must not
+interleave, or the cursor can move *backwards* and a later restart replays
+records that were already emitted. `PGCursorStore.Save` therefore takes the
+row's lock before writing:
+
+```sql
+SELECT name FROM prism_cursors WHERE name = $1 FOR UPDATE  -- the lock
+INSERT … ON CONFLICT (name) DO NOTHING                     -- only if absent
+UPDATE prism_cursors SET cursor = $2, … WHERE name = $1    -- the write
+```
+
+The lock is held to commit, so concurrent writers queue instead of racing.
+Waiting is bounded by a context deadline (`DefaultCursorLockTimeout`, 5s): a
+peer holding the lock for longer than that means something is wrong, and the
+save fails loudly rather than stalling a stream that looks hung.
+
+**Cost.** The tailer writes once per emitted record, so steady-state traffic is
+one round trip plus one small indexed row update per record — cheap next to the
+RPC fetch that produced it. Backfilling a large range at full speed does one
+write per record rather than per page; if that ever matters, the seam is the
+`CursorStore` interface, and batching per page is a bounded change.
+
+**What this does not give you.** Durable position is not exactly-once. A crash
+between emitting a record and persisting it replays that record, which is why
+de-duplication still runs after a restore — and why the `LastID` high-water mark
+is stored alongside the cursor. A second caveat: two processes writing one key
+take turns rather than merging, so run one tailer per key. `Save` deliberately
+does *not* detect a position moving backwards: a rewind is indistinguishable
+legitimately (an operator re-pointing a key) from a bug, and silently refusing
+to move would hide the operator's intent. Run one tailer per key and the
+question does not arise.
+
 ### Gap detection
 
 Records can be lost exactly one way: falling behind the RPC's retention window
