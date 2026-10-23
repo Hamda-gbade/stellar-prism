@@ -69,6 +69,7 @@ returns — there is no polling loop, no cursor advancement, no reconnection, an
 | **Graceful drain on SIGTERM** | ❌ | ✅ (`--drain-timeout`) |
 | **Encrypted state file** | ❌ | ✅ (`--state-passphrase-env`) |
 | Ledger streaming | ❌ | ✅ |
+| Database / Parquet ingestion | ❌ | ✅ |
 | Contract-spec-decoded payloads | ✅ **better** | ❌ ([roadmap](docs/roadmap.md)) |
 
 ## Install
@@ -359,6 +360,13 @@ The filters are applied after each page is fetched, so the cursor still
 advances across suppressed transactions — a filtered stream is a view of the
 transaction stream rather than a second stream that could skip history.
 
+Pagination uses the RPC's own SEP-35 paging token, so `--from` hands over to
+`--follow` at exactly the next transaction rather than at the next ledger. The
+page size is capped at 200 by the server (the default is 100, because each
+transaction carries three XDR blobs), and a page that stops short of the head
+keeps draining: the server limits how many ledgers one call scans, so a short
+page is not the end of a backfill.
+
 ```console
 $ prism transactions --status failed --limit 1 --json
 {"kind":"transaction","id":"0003966820-0001","ledger":3966820,"hash":"…","index":1,"successful":false,"status":"failed","feeAccount":"GBGSB…","failure":{"code":"tx_failed","summary":"The transaction was well-formed and authorised, but at least one of its operations failed.","operation":{"index":0,"type":"invoke_host_function","code":"invoke_host_function_trapped","summary":"The contract trapped: it panicked, or explicitly returned an error."}}}
@@ -550,6 +558,8 @@ before v1.0.
   and `stellar events` is better for that today.
 - Optional cursor journal (`--state-file`) with background pruning, and
   `--resume` to continue from it. Still not exactly-once across restarts.
+- Covered twice: by an offline suite with no network, and by an opt-in
+  end-to-end run against a local Quickstart network (`make test-e2e`).
 
 See [docs/roadmap.md](docs/roadmap.md).
 
