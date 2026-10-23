@@ -699,6 +699,42 @@ for each newly observed head, decodes Soroban resource estimates, and compares
 successive return values through stellar-xdr-lens before emitting changed
 fields.
 
+### Transaction cursors, IDs and backfill
+
+`getTransactions` resembles `getEvents` with a different payload, but its
+pagination is not the same, and two details decide whether the source is
+correct:
+
+**The cursor is a SEP-35 total-order ID, not a ledger sequence.** It is one
+decimal string encoding the ledger, the transaction's application order within
+that ledger and an operation index into a single int64. `transactionCursorLedger`
+parses it through `toid.Parse`; reading it as a plain ledger number produces a
+value around 10^13, which is larger than any retention floor, so
+`cursorLedger < batch.Oldest` never becomes true and gap detection silently
+stops working. `TestTransactionTailDetectsRetentionGap` is the regression test
+for exactly that failure.
+
+**There is no per-record ID from the server.** The events API returns one;
+transactions expose only a ledger and an application order, so the source
+synthesises `%010d-%07d` from them. Ten digits covers the ledger, and seven is
+the width of TOID's transaction field, so the fixed-width contract holds for a
+whole ledger's worth of transactions rather than only the first 10,000.
+
+Two smaller behaviours follow from the real server:
+
+- The server caps how many *ledgers* one call scans. A short page that has not
+  yet reached `LatestLedger` therefore means "more is waiting", not "the
+  stream is done"; `transactionPageIsFull` keeps a backfill draining instead of
+  ending it mid-range. An empty page stays terminal, because the cursor cannot
+  advance past nothing.
+- An unparseable cursor is wrapped with `rpc.Permanent`, so a corrupt position
+  fails immediately instead of exhausting the retry budget and reporting the
+  wrong cause.
+
+The `internal/fakerpc` and `pkg/prismtest` doubles return the same decimal
+TOID cursor the real server does. A fake whose cursors merely looked plausible
+would let a broken `CursorLedger` pass every test.
+
 ### Transaction classification (`prism transactions`)
 
 `TransactionSource` accepts `TransactionQuery.Classify`, which fills four
@@ -950,6 +986,14 @@ failure, full-page draining, concurrent backfill, batcher count/time/explicit
 flushes, and task-group cancellation. Gap recovery is also unit-tested
 without a network through the `Rewinder` seam.
 
+The transactions source has its own matrix: SEP-35 cursor parsing (TOID,
+plain ledger, compound and rejected cursor), fixed-width IDs across page
+boundaries, a short page before the head continuing the drain, gap detection
+*through* a TOID cursor rather than a ledger number, gap resume, and the
+concurrent drainer merging workers over transaction pages. `internal/cli`
+repeats the important ones through the command, including the exit-2 gap
+contract.
+
 The cursor metadata store is tested the same way: appends and rewrites
 against a real file in a temporary directory, a pruner that keeps running
 after a failure, a pruner whose goroutine is joined rather than abandoned,
@@ -977,6 +1021,45 @@ flakiness. Follow-loop tests carry a sleep budget that cancels the context, so
 a regression that stops the tailer terminating **fails** rather than hanging
 CI — a distinction worth the few extra lines.
 
+### End-to-end tests against a real network
+
+Offline determinism is the right default, so the live suite is opt-in twice
+over: it lives behind the `e2e` build tag and skips unless `PRISM_E2E=1` is
+set. `make test-e2e` runs it.
+
+```
+internal/cli/e2e_test.go                     the scenarios
+internal/cli/testdata/e2e/docker-compose.yml a local Quickstart node
+```
+
+`TestMain` brings up `stellar/quickstart` (standalone network, Soroban RPC
+enabled), waits for it to report a ledger, runs the tests and tears the
+container down. Point `PRISM_E2E_RPC_URL` at an existing node to skip the
+container entirely; `PRISM_E2E_FRIENDBOT_URL` overrides friendbot, which is
+otherwise derived from the RPC URL.
+
+What it proves that the fake cannot: real cursor paging and real XDR. Each
+test funds a fresh account through friendbot, which submits a genuine
+`createAccount` transaction, and waits until the node can serve it — a freshly
+started node ingests a ledger into the RPC store a moment after it closes, so
+asserting immediately would race the ingester rather than test prism.
+
+- `prism transactions --from <ledger>` returns the submitted hash, with valid
+  NDJSON, strictly increasing IDs and no duplicates;
+- `prism tx <hash>` explains a real envelope/result pair;
+- `prism ledgers` and `--backfill-workers` work against the paginated API;
+- cancelling `--follow` returns cleanly and leaves no goroutine behind.
+
+Cancellation is timed rather than triggered by the first record, because the
+tailer holds the newest ledger's records until a later ledger proves they are
+final; on a quiet local network a head record can legitimately wait.
+Termination is what that test owns, and delivery under traffic is covered by
+the offline suite.
+
+Nothing here runs in CI by default: it needs Docker and a network, and a
+flaky testnet would make CI untrustworthy. Run it before a release or when
+touching the RPC adapter.
+
 ### Mutation-checked
 
 The invariants were verified by breaking the code on purpose:
@@ -994,6 +1077,8 @@ The invariants were verified by breaking the code on purpose:
 | DLQ swallowing a failure without recording it | `TestDLQCapturesDeliveryFailure` fails: no dead letter on disk |
 | DLQ returning a captured delivery failure | `TestDLQCapturesDeliveryFailure` fails: `Emit()` returned the error |
 | DLQ closing without flushing | `TestDLQClosesWriterAndPrimaryIdempotently` fails: the queue file is empty |
+| Transaction cursor parsed as a ledger sequence | `TestTransactionTailDetectsRetentionGap` fails: the stream passes over the pruned range instead of reporting it |
+| Transaction source treats a short page before the head as terminal | `TestTransactionTailContinuesShortPageBeforeHead` and `TestTransactionsCommandShortPageKeepsDraining` fail with one record instead of two |
 
 If you change the state machine, re-run that exercise. A test suite that
 cannot fail is not protecting anything.

@@ -7,6 +7,9 @@ An honest account of where this is going. Dates are intentions, not commitments.
 Working and tested:
 
 - `prism events` — contract, topic and type filters; one-shot or `--follow`
+- `prism transactions` — `getTransactions` with SEP-35 cursor continuity,
+  gap detection and classification; `--status`, `--trapped`, `--fee-bump`,
+  `--fee-account` and `--memo` are views of the same stream
 - `prism ledgers` — ledger close metadata
 - `prism tx` — fetch and explain, through the lens explain path
 - `prism abi` — resolve a contract's WASM via RPC and render its embedded spec
@@ -31,6 +34,8 @@ Working and tested:
 - `--heartbeat 30s` — a line on stderr after every idle interval during
   `--follow`, so a quiet contract is distinguishable from a hung process
 - Streaming core fully tested with no network, and mutation-checked
+- An opt-in end-to-end suite that runs prism against a local Quickstart
+  network (`make test-e2e`), including clean shutdown with no leaked goroutines
 
 Known limits, stated plainly:
 
@@ -74,11 +79,11 @@ cache it, or accept a local file) and belongs in `lens` rather than `prism`,
 since `lens decode` would benefit identically. Probably the highest-value item
 here, and the largest.
 
-### Transaction and operation streams
+### Better `--follow` ergonomics
 
-`prism txs --follow` over `getTransactions`, which is already a paginated
-cursor API of the same shape. Mostly a new `Source`; the state machine and
-sinks are unchanged. A good first substantial contribution.
+- a heartbeat line on stderr when a follow is idle, so a quiet contract is
+  distinguishable from a hung process (the `--since` and `--stats` halves of
+  this list have already shipped — see them in the working list above)
 
 ## Later, and less certain
 

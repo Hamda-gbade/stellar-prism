@@ -71,8 +71,9 @@ func closeClient(c rpc.Client, stderr io.Writer) {
 
 // globalFlags holds options shared by every subcommand.
 type globalFlags struct {
-	serveSSE string
-	serveWS  string
+	serveSSE  string
+	serveWS   string
+	serveGRPC string
 	// color is one of "auto", "always" or "never", matching lens.
 	color string
 	// rpcURLs overrides the endpoints; empty falls back to the environment.
@@ -148,6 +149,7 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
 	root.PersistentFlags().StringVar(&g.serveSSE, "serve-sse", "", "broadcast SSE at this listen address (/events); retains 1024 records for replay")
 	root.PersistentFlags().StringVar(&g.serveSSE, "sse", "", "alias for --serve-sse")
 	root.PersistentFlags().StringVar(&g.serveWS, "ws", "", "broadcast WebSocket events at this listen address (/events or /ws)")
+	root.PersistentFlags().StringVar(&g.serveGRPC, "serve-grpc", "", "serve gRPC PrismStream at this listen address")
 	root.AddCommand(
 		newServeCmd(g, stdout, stderr),
 		newEventsCmd(g, stdout, stderr),
