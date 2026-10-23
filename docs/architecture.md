@@ -23,9 +23,9 @@ Everything below is in service of those four.
 
 ```
         ┌──────────┐   Batch    ┌────────┐   Record   ┌──────┐
-RPC ───►│  Source  ├───────────►│ Tailer ├───────────►│ Sink ├───► stdout
-        └──────────┘            └────────┘            └──────┘
-         events.go               tail.go               ndjson.go
+RPC ───►│  Source  ├───────────►│ Tailer ├───────────►│ Sink ├───► stdout,
+        └──────────┘            └────────┘            └──────┘     --timescale-dsn,
+         events.go               tail.go               ndjson.go   --parquet-dir
          ledgers.go            cursor, dedup,          human.go
          transactions.go       backoff, gaps           file_rotator.go
          storage_changes.go                          (via lens)
@@ -58,7 +58,10 @@ internal/cli/         cobra commands — thin wrappers over pkg/stream
   completion.go       bash/zsh/fish/powershell script generation
   abi_resolve.go      contract WASM lookup and embedded-spec parsing
   state.go            the cursor journal, the pruner, and the resume point
+  runtime.go          the health server, the lease and the state key source
   syncwriter.go       serialised stderr, for the diagnostics several goroutines write
+  stats.go            the --stats run summary, printed as the run exits
+  heartbeat.go        the --heartbeat liveness line for idle follows
 internal/fakerpc/     scriptable in-memory RPC for tests
 pkg/rpc/              the Client interface + SDK adapter
   wire_log.go         debug HTTP wire logger with credential redaction
@@ -68,17 +71,35 @@ pkg/stream/
   tail.go             the state machine
   events.go           contract events source
   ledgers.go          ledger close source
-  transactions.go     transaction source
+  transactions.go     transaction source and opt-in classification
+  tx_status.go        status/failure decoding and the filtered tx source
+  traps.go            Soroban trap predicate and trap source
+  feebump.go          fee-bump classification and fee-account filters
+  dedup.go            bounded ring-buffer de-duplication for re-polls
   storage_changes.go  contract storage mutations (from tx meta)
   wasm_events.go      WASM uploads and contract deployments
+  operations.go        operation-level transaction demux
+  footprint.go         same-ledger Soroban footprint conflicts
+  simulate.go          live transaction simulation estimates
+  reorder.go            intra-ledger response reordering buffer
   pool.go             multi-endpoint failover RPC client
   drainer.go          concurrent historical backfill + ordered merge
   batcher.go          count/time batching sink wrapper
   gap_recovery.go     GapStrategy, Rewinder and gap handling
   pruning.go          CursorMetadata, MetadataStore, Pruner
   cursor_store.go     file-backed cursor metadata journal
+  ha.go               lease-based leader election (active-passive)
+  ha_lock_unix.go     flock(2) primitives for the lease
+  health.go           the liveness/readiness probe server and its monitor
+  crypto_state.go     AES-256-GCM encrypted cursor journal
+  kms.go              AWS and GCP key management clients
   context.go          TaskGroup and cancellation helpers
   clock.go            Clock and Backoff, both injectable
+  topic_pattern.go    client-side topic matching over decoded text
+  demux.go            per-contract fan-out, queues + one goroutine each
+  time_window.go      --since → approximate start ledger
+  backoff.go          AdaptivePoller for --adaptive follow waits
+  state_file.go       durable cursor: atomic, file-backed stream position
 pkg/sink/
   ndjson.go           NDJSON, one object per line
   human.go            terminal output, payloads via lens
@@ -140,6 +161,69 @@ The RPC rejects a request carrying both a ledger range and a cursor
 enforces the same rule, so a regression here fails in tests rather than only
 in production.
 
+### Durable cursors
+
+By default a cursor lives only in the process, so restarting a stream starts it
+over from `StartLedger`. `--pg-dsn` moves that position into PostgreSQL, making
+a restart resume where the last run stopped:
+
+```go
+prism events tail --start-ledger 50000000 \
+    --pg-dsn "$PRISM_PG_DSN" --pg-cursor-key events/tendermint
+```
+
+With no `--pg-cursor-key`, prism derives one from the command and its tagged
+arguments (`events/tendermint` + start ledger → `events/<sha256-prefix>`), so
+two differently-configured streams sharing a database never share a row. Two
+runs pointed at the *same* key are two writers on one cursor; see the
+mutual-exclusion caveat below.
+
+The table is created on first use:
+
+```sql
+CREATE TABLE IF NOT EXISTS "prism_cursors" (
+    name       TEXT        PRIMARY KEY,
+    cursor     TEXT        NOT NULL,
+    last_id    TEXT        NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+)
+```
+
+`EnsureSchema` is a no-op when it already exists, so a role without `CREATE`
+can be given a pre-created table instead.
+
+**Why `SELECT … FOR UPDATE`.** Two processes writing one key must not
+interleave, or the cursor can move *backwards* and a later restart replays
+records that were already emitted. `PGCursorStore.Save` therefore takes the
+row's lock before writing:
+
+```sql
+SELECT name FROM prism_cursors WHERE name = $1 FOR UPDATE  -- the lock
+INSERT … ON CONFLICT (name) DO NOTHING                     -- only if absent
+UPDATE prism_cursors SET cursor = $2, … WHERE name = $1    -- the write
+```
+
+The lock is held to commit, so concurrent writers queue instead of racing.
+Waiting is bounded by a context deadline (`DefaultCursorLockTimeout`, 5s): a
+peer holding the lock for longer than that means something is wrong, and the
+save fails loudly rather than stalling a stream that looks hung.
+
+**Cost.** The tailer writes once per emitted record, so steady-state traffic is
+one round trip plus one small indexed row update per record — cheap next to the
+RPC fetch that produced it. Backfilling a large range at full speed does one
+write per record rather than per page; if that ever matters, the seam is the
+`CursorStore` interface, and batching per page is a bounded change.
+
+**What this does not give you.** Durable position is not exactly-once. A crash
+between emitting a record and persisting it replays that record, which is why
+de-duplication still runs after a restore — and why the `LastID` high-water mark
+is stored alongside the cursor. A second caveat: two processes writing one key
+take turns rather than merging, so run one tailer per key. `Save` deliberately
+does *not* detect a position moving backwards: a rewind is indistinguishable
+legitimately (an operator re-pointing a key) from a bug, and silently refusing
+to move would hide the operator's intent. Run one tailer per key and the
+question does not arise.
+
 ### Gap detection
 
 Records can be lost exactly one way: falling behind the RPC's retention window
@@ -163,12 +247,127 @@ and `Stats.Gaps` / `Stats.Recovered` count it. `--max-gap-recoveries` bounds
 how many times a stream may skip ahead. A source without `Rewinder` cannot
 resume and fails exactly as it would under the default policy.
 
+### Durable cursors (`--state-file`)
+
+Exactly-once across restarts would need a transaction spanning the sink and
+the cursor store, which a CLI writing to stdout cannot have. What prism can
+have is much better than nothing, and `--state-file <path>` turns it on: the
+stream position is persisted after **every successfully emitted record**, so
+a restart resumes where the previous run stopped and the restart window
+narrows from "the whole run" to "one interrupted record".
+
+The position is one small, versioned JSON document (see
+`pkg/stream/state_file.go`):
+
+```json
+{"version":1,"source":"events","ledger":3966820,"paging_token":"…","last_id":"…","updated_at":"2026-10-20T12:00:00Z"}
+```
+
+Four rules carry the weight:
+
+**1. The file is written after the emit, never before.** It can therefore
+never run ahead of the stream: a crash between the two re-emits exactly the
+interrupted record on restart, and the restored high-water mark (`last_id`)
+suppresses anything the previous run already delivered.
+
+**2. Writes are atomic.** Each save writes a complete snapshot to a
+temporary file in the same directory, fsyncs it, and renames it over the
+destination, so a reader only ever sees a complete snapshot — the previous
+state or the new one, never a torn file. A crash before the rename reverts
+to the previous position, which can only re-emit, never skip: at-least-once
+holds unconditionally.
+
+**3. The saved position wins, visibly.** On startup the tailer resumes from
+the stored paging token, and the CLI notes on stderr when that overrides an
+explicit `--from`. A state file written by a different stream is refused
+rather than misapplied, and a token the Source cannot interpret fails the
+run before any request is made.
+
+**4. The restored high-water mark keeps de-duplication across the restart.**
+`last_id` is reloaded into the tailer, so a server that replays the tail of
+the stream to a freshly restarted client — which the RPC docs warn to expect
+— is still suppressed, exactly as within a single run.
+
+Persistence is synchronous and file-backed: no goroutines, no open
+descriptors between writes, nothing to clean up when the stream terminates
+or is interrupted. The cost is one small fsync per record, which is the
+price of the guarantee; a poll-only RPC keeps the record rate modest.
+
 ### Backpressure
 
 `Sink.Emit` is synchronous. A slow consumer (`prism … | jq | something-slow`)
 blocks the write, which blocks the poll loop. That is correct backpressure
-with no queue to grow. It is also why both sinks flush per record: a tail that
-buffers looks like a tail that has hung.
+with no queue to grow. It is also why the line-oriented sinks flush per
+record: a tail that buffers looks like a tail that has hung.
+
+## Sinks that store rather than print
+
+`NDJSON` and `Human` are line-oriented: a record is visible the moment `Emit`
+returns. The two storage sinks batch instead, because a round trip (or a file
+rename) per record would be absurd for a backfill. Both keep the same seam and
+the same delivery contract; the difference is that records are only durable
+once a batch is flushed.
+
+Both sinks own a background goroutine that flushes a partial batch every
+`--flush-interval`, and both implement `io.Closer`. The CLI closes whichever
+sink it built after the tailer returns — including on the gap error path — so
+the last records reach disk before the process exits and no goroutine outlives
+the run. `Flush` remains what the tailer calls; `Close` is the stronger command
+that also stops the timer and releases the driver.
+
+### TimescaleDB (`--timescale-dsn`)
+
+Rows land in one wide table, `prism_records`, with the neutral `Record` fields
+plus kind-specific columns left `NULL` where they do not apply, so a query can
+tell "no transaction here" from "a transaction that failed":
+
+```sql
+CREATE TABLE prism_records (
+  id TEXT NOT NULL, ledger BIGINT NOT NULL, kind TEXT NOT NULL,
+  closed_at TIMESTAMPTZ, hash TEXT, contract_id TEXT, tx_hash TEXT,
+  tx_index INTEGER, op_index INTEGER, successful BOOLEAN,
+  topics_xdr TEXT[], value_xdr TEXT, envelope_xdr TEXT,
+  result_xdr TEXT, result_meta_xdr TEXT, header_xdr TEXT, metadata_xdr TEXT,
+  PRIMARY KEY (id, ledger)
+);
+```
+
+The table is promoted to a hypertable partitioned by **ledger** — not by time —
+with a chunk every 50,000 ledgers. The ledger sequence is always present, is the
+natural dimension for chain data, and does not require inventing a timestamp for
+a record the server did not date. On a server without the extension the
+`create_hypertable` call is recognised as "TimescaleDB is not installed" and the
+sink keeps working against the plain table; anything else is reported.
+
+`COPY` cannot express `ON CONFLICT`, so a batch lands in a `pg_temp` table and
+is merged with `INSERT … ON CONFLICT DO NOTHING` inside one transaction. That
+matters for the delivery contract: a restart re-emits the last record or two by
+design, and the primary key would otherwise turn a legitimate replay into a
+fatal duplicate-key error. A failed batch therefore inserts nothing and stays
+buffered for retry, while a replayed batch is a no-op.
+
+### Parquet (`--parquet-dir`)
+
+An embedded DuckDB instance is used only as the Parquet encoder. Rows are staged
+in an in-memory table and copied out with `COPY (SELECT … ORDER BY id) TO …, so
+each flush produces one part file:
+
+```
+<dir>/part-000001.parquet
+<dir>/part-000002.parquet
+```
+
+Part files are written under a `.tmp` name and renamed, so an interrupted COPY
+cannot leave a truncated file that a later read would trust. Numbering resumes
+after the highest part already in the directory, so a restarted backfill appends
+rather than overwrites. The whole archive is one glob away:
+
+```sql
+SELECT kind, count(*) FROM read_parquet('parts/*.parquet') GROUP BY kind;
+```
+
+Batching bounds memory: the staging table never holds more than one part, so a
+multi-day backfill does not grow with the stream.
 
 `--batch` changes the unit of work, not the backpressure: `Batcher` buffers
 records until `--batch-size` is reached or `--batch-timeout` elapses, then
@@ -177,6 +376,70 @@ and `Close` stops the timer and flushes the remainder, so Ctrl-C cannot leave
 a buffered record behind. Sinks that implement `BatchSink` (both built-ins do)
 flush once per batch; other sinks are driven with one `Emit` per record.
 
+### --since: relative windows, offline and approximate
+
+`--since 10m` converts a relative window into a start ledger by dividing the
+window by `RoughLedgerCloseInterval` (5s, in `time_window.go`) and rounding
+**up**, so a window never starts *later* than asked. The conversion is pure
+arithmetic on the server's reported head: one RPC call (`getLatestLedger`, the
+same one a run with no `--from` makes anyway), no second call to measure the
+real cadence. The ledger rate varies with network load, so the result is
+approximate by design — streams needing an exact ledger use `--from`. Very
+long windows clamp to ledger 1, where the server's own retention error takes
+over.
+
+### Client-side topic patterns
+
+The server-side `--topic` filters are constrained to base64 ScVal segments
+with `*`/`**` wildcards, because that is all the RPC understands. `--topic-pattern`
+adds glob, prefix and regular-expression matching over the **decoded** topic
+text, applied client-side in `topic_pattern.go` by a `PatternSink` that wraps
+the output sink. The text it matches against is derived from the same lens
+envelope `--json` prints, so a pattern tuned against `--json` output works
+unchanged here — and filtering lives at the sink seam rather than inside the
+tailer, so the delivery guarantee and cursor mechanics are untouched by
+output shaping.
+
+### Per-contract fan-out
+
+`--fanout-dir` routes one stream to one NDJSON file per contract while the
+terminal keeps the combined output. The routing lives in `stream.Demux`
+(demux.go): an intake queue, a single dispatcher goroutine, and one queue plus
+goroutine per subscribed contract. Records are routed by `Event.ContractID`;
+each subscriber's queue holds a small buffer and overflows by counting drops
+rather than wedging the other contracts. `Close` after the tailer stops
+drains everything the caller accepted, closes each queue from the dispatcher
+—the only closer, after its last send — flushes, and waits on every goroutine,
+so a fanout run terminates with no leaked goroutines and a joined error.
+
+### Re-poll de-duplication
+
+`--dedup-window N` wraps the event sink in `stream.DedupSink`, which
+suppresses a record whose fingerprint was already emitted within the last `N`
+keys. The window is a fixed-size ring (`dedup.go`): the oldest key is evicted
+when a new one arrives, so memory is bounded by count rather than by traffic
+or elapsed time, and a hot contract cannot grow it without bound. A zero
+window disables the wrapper entirely.
+
+The fingerprint prefers the server's event ID, because a re-poll after a
+reconnect replays the same ID while two genuinely distinct events can carry
+byte-identical topics and values. Records without an ID fall back to a
+content hash over the event locator and payload. De-duplication lives at the
+sink seam, like pattern filtering, so the cursor still advances across a
+suppressed record and the tailer's delivery guarantee is unchanged.
+
+### Adaptive polling
+
+`--adaptive` replaces the fixed `--poll` wait with an `AdaptivePoller`
+(backoff.go) whose only signal is how many new ledgers closed during the last
+wait: at least one means the wait matched or beat the ledger cadence, so
+shorten; zero means mostly dead time, so lengthen. With no cadence parameter
+at all that rule converges on oscillating around the real close rate, tracking
+a network it is never told about — and the stretchy bounds (`--min-poll`-less
+defaults 1s..30s) keep the invariant: never faster than Min, never slower
+than Max. Jitter spreads each returned wait over its lower half so several
+prism instances do not poll in phase. The tuner is one number in one
+goroutine, so its tests run deterministically — no wall-clock flakiness.
 ### Parallel historical backfill
 
 `--backfill-workers N` (with an explicit `--from`) uses `Drainer` instead of
@@ -203,9 +466,9 @@ or returned as a `*GapError` under the default policy.
 The first non-cancellation error cancels every sibling; `Wait` blocks until
 all workers have returned and then cancels the shared context. A caller
 cancellation is a clean stop, not an error. `Drainer.Run` waits for every
-worker on every path, including sink failure and limit exhaustion, so a
-terminated backfill cannot leak goroutines or leave a worker writing to a
+worker on every path, including sink failure and limit exhaustion, soa terminated backfill cannot leak goroutines or leave a worker writing to a
 closed sink.
+
 
 ### What is deliberately *not* handled
 
@@ -319,6 +582,99 @@ Both sources synthesise fixed-width zero-padded IDs (`%010d-%06d-…`) from
 the ledger sequence, preserving the lexicographic-order contract the tailer
 depends on.
 
+### Operation streams (`prism operations`)
+
+`OperationSource` decodes each transaction envelope and emits one record per
+operation with the deterministic ID `%010d-%04d-%02d`. It carries the operation
+type, effective source account, operation-body XDR and matching operation
+result, and supports type and source-account filters.
+
+### Footprint conflicts (`--detect-conflicts`)
+
+The tailer's reorder buffer closes a ledger before `FootprintAnalyzer` examines
+its Soroban transaction footprints. A key is reported when transactions share
+it and at least one access is read-write. The same conflict is attached to
+each participating transaction, allowing both human warnings and structured
+NDJSON consumers to identify hot keys and transaction sets.
+
+### Simulation streams (`prism simulate`)
+
+`SimulationSource` polls the latest ledger, calls `simulateTransaction` once
+for each newly observed head, decodes Soroban resource estimates, and compares
+successive return values through stellar-xdr-lens before emitting changed
+fields.
+
+### Transaction cursors, IDs and backfill
+
+`getTransactions` resembles `getEvents` with a different payload, but its
+pagination is not the same, and two details decide whether the source is
+correct:
+
+**The cursor is a SEP-35 total-order ID, not a ledger sequence.** It is one
+decimal string encoding the ledger, the transaction's application order within
+that ledger and an operation index into a single int64. `transactionCursorLedger`
+parses it through `toid.Parse`; reading it as a plain ledger number produces a
+value around 10^13, which is larger than any retention floor, so
+`cursorLedger < batch.Oldest` never becomes true and gap detection silently
+stops working. `TestTransactionTailDetectsRetentionGap` is the regression test
+for exactly that failure.
+
+**There is no per-record ID from the server.** The events API returns one;
+transactions expose only a ledger and an application order, so the source
+synthesises `%010d-%07d` from them. Ten digits covers the ledger, and seven is
+the width of TOID's transaction field, so the fixed-width contract holds for a
+whole ledger's worth of transactions rather than only the first 10,000.
+
+Two smaller behaviours follow from the real server:
+
+- The server caps how many *ledgers* one call scans. A short page that has not
+  yet reached `LatestLedger` therefore means "more is waiting", not "the
+  stream is done"; `transactionPageIsFull` keeps a backfill draining instead of
+  ending it mid-range. An empty page stays terminal, because the cursor cannot
+  advance past nothing.
+- An unparseable cursor is wrapped with `rpc.Permanent`, so a corrupt position
+  fails immediately instead of exhausting the retry budget and reporting the
+  wrong cause.
+
+The `internal/fakerpc` and `pkg/prismtest` doubles return the same decimal
+TOID cursor the real server does. A fake whose cursors merely looked plausible
+would let a broken `CursorLedger` pass every test.
+
+### Transaction classification (`prism transactions`)
+
+`TransactionSource` accepts `TransactionQuery.Classify`, which fills four
+derived fields on each record by decoding the envelope and result through
+lens: `Status` (`success` or `failed`), `FeeAccount`, `FeeBump` and
+`Failure`. Classification is opt-in because it costs two XDR decodes per
+record; the filtered streams enable it automatically.
+
+`Failure` keeps every level at which the protocol reports a reason, because
+the most specific level is not always the one a consumer wants:
+
+- `Detail` is the transaction-level code (`tx_failed`, `tx_bad_seq`, …).
+- `Inner` is the inner transaction's code for a fee-bump wrapper, which is
+  almost always the real cause.
+- `Operation` is the first failing operation, with its own decoded code. A
+  Soroban host function that trapped or panicked appears here as
+  `invoke_host_function_trapped`, and `Failure.Trapped()` reports it.
+
+`TransactionFilterSource` wraps a classified `TransactionSource` and applies
+a status set plus zero or more `TransactionFilter` predicates after each page
+is fetched. Filtering therefore advances the cursor across suppressed
+records: `--status failed`, `--trapped`, `--fee-bump` and `--fee-account` are
+views of one stream, not separate streams that could skip history. `traps.go`
+exposes `TrappedFilter`/`NewTrapSource` for contract executions that trapped,
+which is distinct from a malformed invocation or an exceeded resource limit.
+`feebump.go` exposes `FeeBumpFilter`, `FeeAccountFilter` (which normalises a
+muxed address to its underlying account) and the `FeeBump` classification,
+which keeps the wrapper's fee payer, inner source, inner hash, fee bids and
+signature counts separate from the inner transaction.
+
+`prism transactions` always classifies, so the JSON line carries `status`,
+`feeAccount`, and `failure`/`feeBump` objects when they apply. The human sink
+names the failed operation and prints "contract execution trapped or
+panicked" for a trap.
+
 ## Cursor metadata and background pruning (`pkg/stream/pruning.go`)
 
 A long-running stream produces one checkpoint per page, and a page per ledger
@@ -350,7 +706,12 @@ The pieces:
 | `stream.DrainerConfig.OnPage` | how a concurrent backfill reports a delivered page |
 
 **The checkpoint is written after the emit, not before.** `Options.OnPage`
-fires once a page has been delivered in full. A page cut short by `--limit`,
+fires once a page has been delivered in full. Pages held in the ledger reorder
+buffer delay their checkpoints, including subsequent empty filtered pages;
+`Tailer.Cursor()` returns the delivered position, not the ahead-of-output fetch
+cursor. A bounded follow drains its buffered suffix when the available pages
+are exhausted and enough records are available to satisfy `--limit`, without
+waiting for another ledger. A page cut short by `--limit`,
 or one the sink rejected, produces no checkpoint, so a recorded position can
 never point past records that were not delivered. The callback also skips a
 page that returned nothing and left the cursor where it was: that says
@@ -527,30 +888,54 @@ Covered: clean streams, drops at every position, consecutive drops, replayed
 pages, out-of-order pages, retention overrun with both gap policies, lagging
 backends, permanent errors, retry exhaustion, cancellation mid-follow, sink
 failure, full-page draining, concurrent backfill, batcher count/time/explicit
-flushes, and task-group cancellation. Gap recovery is also unit-tested
+flushes, durable-cursor resume across restarts, replay suppression across
+restarts, corrupt/foreign/uninterpretable state files, persist failures mid-page,
+and task-group cancellation. Gap recovery is also unit-tested
 without a network through the `Rewinder` seam.
-
-The cursor metadata store is tested the same way: appends and rewrites
-against a real file in a temporary directory, a pruner that keeps running
-after a failure, a pruner whose goroutine is joined rather than abandoned,
-and a tailer that resumes from a recorded cursor and is still gap-checked
-when it does. `internal/cli` runs the whole thing end to end against
-`internal/fakerpc`: a run that records checkpoints, a file that stays
-bounded while the stream runs, and a second run that picks up where the
-first stopped.
-
-The dead letter queue is covered at both levels. `pkg/sink` tests every
-validation branch, delivery and flush failures (including a writer that
-fails like a full disk), batch attribution, and idempotent close against a
-real file. `internal/cli` runs `runStream` with a source that emits one valid
-record and one malformed record, then asserts that the valid record reached
-stdout, the malformed one reached `--dlq-file`, and the command exited
-successfully — the end-to-end shape of "a bad record does not crash a tail".
 
 Time is injected via `Clock`, so there are no real sleeps and no wall-clock
 flakiness. Follow-loop tests carry a sleep budget that cancels the context, so
 a regression that stops the tailer terminating **fails** rather than hanging
 CI — a distinction worth the few extra lines.
+
+### End-to-end tests against a real network
+
+Offline determinism is the right default, so the live suite is opt-in twice
+over: it lives behind the `e2e` build tag and skips unless `PRISM_E2E=1` is
+set. `make test-e2e` runs it.
+
+```
+internal/cli/e2e_test.go                     the scenarios
+internal/cli/testdata/e2e/docker-compose.yml a local Quickstart node
+```
+
+`TestMain` brings up `stellar/quickstart` (standalone network, Soroban RPC
+enabled), waits for it to report a ledger, runs the tests and tears the
+container down. Point `PRISM_E2E_RPC_URL` at an existing node to skip the
+container entirely; `PRISM_E2E_FRIENDBOT_URL` overrides friendbot, which is
+otherwise derived from the RPC URL.
+
+What it proves that the fake cannot: real cursor paging and real XDR. Each
+test funds a fresh account through friendbot, which submits a genuine
+`createAccount` transaction, and waits until the node can serve it — a freshly
+started node ingests a ledger into the RPC store a moment after it closes, so
+asserting immediately would race the ingester rather than test prism.
+
+- `prism transactions --from <ledger>` returns the submitted hash, with valid
+  NDJSON, strictly increasing IDs and no duplicates;
+- `prism tx <hash>` explains a real envelope/result pair;
+- `prism ledgers` and `--backfill-workers` work against the paginated API;
+- cancelling `--follow` returns cleanly and leaves no goroutine behind.
+
+Cancellation is timed rather than triggered by the first record, because the
+tailer holds the newest ledger's records until a later ledger proves they are
+final; on a quiet local network a head record can legitimately wait.
+Termination is what that test owns, and delivery under traffic is covered by
+the offline suite.
+
+Nothing here runs in CI by default: it needs Docker and a network, and a
+flaky testnet would make CI untrustworthy. Run it before a release or when
+touching the RPC adapter.
 
 ### Mutation-checked
 
@@ -569,6 +954,11 @@ The invariants were verified by breaking the code on purpose:
 | DLQ swallowing a failure without recording it | `TestDLQCapturesDeliveryFailure` fails: no dead letter on disk |
 | DLQ returning a captured delivery failure | `TestDLQCapturesDeliveryFailure` fails: `Emit()` returned the error |
 | DLQ closing without flushing | `TestDLQClosesWriterAndPrimaryIdempotently` fails: the queue file is empty |
+| Transaction cursor parsed as a ledger sequence | `TestTransactionTailDetectsRetentionGap` fails: the stream passes over the pruned range instead of reporting it |
+| Transaction source treats a short page before the head as terminal | `TestTransactionTailContinuesShortPageBeforeHead` and `TestTransactionsCommandShortPageKeepsDraining` fail with one record instead of two |
+| Per-emit persistence disabled | `TestTailStateRecordsPositionAfterEachEmit`, `TestTailStateResumesAcrossRestart` and the CLI restart test fail |
+| Startup restore disabled | `TestTailStateResumesAcrossRestart`, `TestTailStateRefusesPositionFromAnotherStream`, `TestTailStateRejectsUninterpretableToken` and `TestTailStateGapDetectedOnResume` fail |
+| Restored high-water mark dropped | `TestTailStateSuppressesReplayAfterRestart` fails, naming the re-emitted IDs |
 
 If you change the state machine, re-run that exercise. A test suite that
 cannot fail is not protecting anything.
@@ -617,7 +1007,7 @@ rendered in Soroban type syntax, and `--function` plus repeated `--arg` decodes
 actual base64 `ScVal` values through lens against the named parameters.
 
 `getLedgerEntries` is an optional capability (`rpc.LedgerEntriesClient`), not
-part of the streaming `rpc.Client` interface. That keeps the four-method core
+part of the streaming `rpc.Client` interface. That keeps the core interface
 small and avoids forcing stream-only fakes to implement a method they never
 use. Only the `abi` command takes this path; every streaming command remains
 independent of it.
@@ -668,14 +1058,164 @@ type Sink interface {
 }
 ```
 
-Flush per record if the sink is for live viewing. Decode XDR through `lens`
-rather than reaching for `xdr` directly, so output stays consistent with the
-rest of the family — and report an undecodable payload inline rather than
+Flush per record if the sink is for live viewing. A batching sink should also
+implement `io.Closer`, stop and wait for any goroutine it started, and flush
+whatever is buffered there; the CLI closes the sink it built. Decode XDR through
+`lens` rather than reaching for `xdr` directly, so output stays consistent with
+the rest of the family — and report an undecodable payload inline rather than
 returning an error, so one malformed value cannot kill a long-running tail.
+
+### Built-in sinks
+
+Every streaming command accepts the same optional output flags. They are off
+unless set, so the default path still touches nothing but RPC and stdout. When
+one or more are enabled, `pkg/sink.MultiSink` delivers each record to the
+normal output and every extra sink. It records acknowledgements per sink, so a
+retry does not repeat a delivery that already succeeded; any unresolved
+failure ends the stream rather than silently dropping records. `Close` flushes buffered
+batches, stops timers and closes listeners and sockets, so a finished stream
+leaves nothing running.
+
+All extra sinks reuse `sink.MarshalRecord`, so the JSON object is byte-for-byte
+what `--json` writes to stdout. With `--raw` the base64 XDR fields are kept
+instead of decoded values.
+
+#### Webhook (`--webhook-url`, `pkg/sink/webhook.go`)
+
+Batches records into one request body:
+
+```json
+{"delivery":"1700000123456789-1","sentAt":"2023-11-14T22:15:23Z",
+ "records":[{"kind":"event","id":"..."}]}
+```
+
+Headers: `Content-Type: application/json`, `X-Prism-Delivery` (the idempotency
+key), `X-Prism-Timestamp` (Unix seconds) and, when a secret is configured,
+`X-Prism-Signature: sha256=<hex>`. The signature is
+`HMAC-SHA256(secret, "<timestamp>.<body>")`; receivers must verify it before
+trusting a payload. The secret comes from `--webhook-secret` or
+`PRISM_WEBHOOK_SECRET`.
+
+Batching flushes at `--webhook-batch-size` records or `--webhook-timeout`
+after the first buffered record, and on exit. Failures retry with exponential
+backoff from 100ms to 5s, ±20% jitter, honouring `Retry-After`; a 4xx other
+than 408/425/429 is treated as permanent. A failed batch stays buffered, so a
+later flush or close retries it: delivery is at-least-once, not exactly-once.
+
+#### Object storage (`--cloud-*`, `pkg/sink/cloud_storage.go`)
+
+Records are accumulated in memory and uploaded as one object when the chunk
+reaches `--cloud-batch-records`, `--cloud-batch-bytes`, or
+`--cloud-batch-timeout`. The key is derived only from the records:
+
+```
+<prefix>/<YYYY>/<MM>/<DD>/ledger-<start>-<end>/<firstID>-<lastID>.ndjson[.gz]
+```
+
+A retry therefore overwrites the same object instead of duplicating a chunk,
+and a backfill lands in the partition of the ledger's close date rather than
+the upload date. `--cloud-compress` (default on) gzips the body and sets
+`application/gzip`; otherwise it is `application/x-ndjson`. One record larger
+than the byte cap is uploaded alone rather than split.
+
+The `ObjectStore` interface is the seam, so chunking is tested with an
+in-memory store and no network:
+
+- **S3** (`pkg/sink/s3.go`): SigV4-signed `PUT` using
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and optional
+  `AWS_SESSION_TOKEN`. Path-style addressing by default, `--cloud-region`
+  defaults to `us-east-1`. The signer is checked against AWS's published PUT
+  example in the unit tests.
+- **GCS** (`pkg/sink/gcs.go`): the JSON API's simple media upload (`POST
+  /upload/storage/v1/b/<bucket>/o?uploadType=media&name=<key>`) with a bearer
+  token from `GOOGLE_OAUTH_ACCESS_TOKEN`.
+
+Uploads retry like the webhook and keep the chunk buffered on failure.
+
+#### Prometheus (`--metrics-addr`, `pkg/sink/prometheus.go`)
+
+Serves `/metrics` on the configured address with:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `prism_records_total{kind}` | counter | records emitted |
+| `prism_events_total{type}` | counter | Soroban events by type |
+| `prism_errors_total{stage}` | counter | `rpc` retries, `gap` recoveries, `sink` failures |
+| `prism_ledger_latency_seconds` | histogram | ledger close to emission, default buckets |
+| `prism_ledger_sequence` | gauge | highest ledger emitted |
+
+The exposition text is rendered directly rather than through the Prometheus
+client, keeping the CLI dependency-free. The server binds before the stream
+starts; `:0` chooses a port, which the CLI prints on stderr. Shutdown waits for
+in-flight scrapes and leaves no goroutine behind.
+
+#### Syslog and journald (`--syslog-address`, `pkg/sink/syslog.go`)
+
+`--syslog-format rfc5424` writes one newline-terminated message per record:
+
+```
+<134>1 2023-11-14T22:15:23.000Z host prism - event [prism@32473 kind="event" ledger="100" id="..."] {"kind":"event",...}
+```
+
+Severity follows the record: failed transactions and deployments are warnings
+(4), diagnostic events are debug (7), everything else is informational (6).
+Structured-data values escape `\`, `"` and `]` per RFC 5424.
+
+`--syslog-format journald` writes the journald native protocol instead: a
+`NAME=value` block with `PRIORITY`, `SYSLOG_IDENTIFIER`, `SYSLOG_FACILITY`,
+`PRISM_KIND`, `PRISM_LEDGER`, `PRISM_RECORD_ID`, `PRISM_LEDGER_TIME` and
+`MESSAGE`, terminated by a blank line. Use `unixgram:///run/systemd/journal/socket`
+as the address. `DialSyslog` also accepts `unix://`, `udp://`, `tcp://` and a
+bare socket path; `--syslog-facility` accepts any POSIX facility name and
+defaults to `local0`.
+
+#### Elasticsearch/OpenSearch (`--sink-es-url`, `pkg/sink/elasticsearch.go`)
+
+Records are written through the bulk API in NDJSON pairs: an `index` action
+followed by the same JSON document emitted by `--json`. The record ID is the
+Elasticsearch document ID, so retrying a buffered batch overwrites the same
+documents rather than creating duplicates. `--sink-es-index` is the base name;
+the actual index is `<base>-YYYY.MM.DD`, derived from each record's UTC close
+time. `--sink-es-batch-size` and `--sink-es-flush-interval` bound the in-memory
+batch. Authenticate with `--sink-es-api-key` (or `PRISM_ES_API_KEY`) or basic
+credentials.
+
+#### NATS and JetStream (`--sink-nats`, `pkg/sink/nats.go`)
+
+Each record is published as the regular `--json` document to a subject rendered
+from `--nats-subject`; the template may use `.ContractID`, `.Topic0`, `.ID` and
+`.Ledger`. The default is `stellar.events.{{.ContractID}}`. A rendered subject
+must contain nonempty publish tokens. Core NATS flushes after each publish;
+`--nats-jetstream` waits for a JetStream publish acknowledgement.
+
+#### ZeroMQ PUB (`--sink-zmq`, `pkg/sink/zeromq.go`)
+
+The ZeroMQ sink connects a PUB socket to `--sink-zmq` and sends each record as
+a multipart `[topic, JSON]` message. `--zmq-topic` uses the same template data
+as `--nats-subject`, which gives subscribers an efficient prefix-filterable
+first frame. PUB delivery is intentionally best-effort: a slow or disconnected
+subscriber can miss messages under ZeroMQ's high-water-mark semantics. Use
+NATS JetStream when publisher acknowledgements are required.
+
+#### Configuration rules
+
+Secrets are read from the environment wherever possible, because command-line
+flags are visible in process listings. `--webhook-secret` exists for trusted
+shells; the cloud adapters only read credentials from the environment.
+
+`--batch` composes with these sinks: the batcher wraps the fanout, so stdout
+and every destination receive whole batches. The webhook and cloud sinks also
+cap their own in-memory batches, so a large stream cannot grow memory without
+bound even when `--batch` is not used.
 
 ## Adding an RPC method
 
-`pkg/rpc.Client` has four methods. Every one added must also be implemented in
+`pkg/rpc.Client` has a small set of methods. Every one added must also be implemented in
 `internal/fakerpc`, so prefer composing the existing calls. The interface is
 small on purpose: it is the boundary that keeps the entire streaming core
 testable without a network.
+
+A method used by only one command belongs in its own optional interface, as
+`LedgerEntriesClient` and `HealthClient` do. That keeps stream-only fakes small
+and makes a missing capability an explicit, testable error rather than a
+compile-time burden on every implementation.

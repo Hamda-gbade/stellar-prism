@@ -21,11 +21,12 @@ import (
 type poolFake struct {
 	rpc.Client
 
-	mu     sync.Mutex
-	err    error
-	latest uint32
-	calls  int
-	closed int
+	mu         sync.Mutex
+	err        error
+	latest     uint32
+	healthResp protocol.GetHealthResponse
+	calls      int
+	closed     int
 }
 
 func (f *poolFake) GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerResponse, error) {
@@ -41,6 +42,19 @@ func (f *poolFake) GetLatestLedger(ctx context.Context) (protocol.GetLatestLedge
 	return protocol.GetLatestLedgerResponse{Sequence: f.latest}, nil
 }
 
+func (f *poolFake) GetHealth(ctx context.Context) (protocol.GetHealthResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return protocol.GetHealthResponse{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.err != nil {
+		return protocol.GetHealthResponse{}, f.err
+	}
+	return f.healthResp, nil
+}
+
 func (f *poolFake) GetEvents(ctx context.Context, _ protocol.GetEventsRequest) (protocol.GetEventsResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return protocol.GetEventsResponse{}, err
@@ -52,6 +66,23 @@ func (f *poolFake) GetEvents(ctx context.Context, _ protocol.GetEventsRequest) (
 		return protocol.GetEventsResponse{}, f.err
 	}
 	return protocol.GetEventsResponse{LatestLedger: f.latest}, nil
+}
+
+func (f *poolFake) GetEventsBatch(ctx context.Context, reqs []protocol.GetEventsRequest) ([]protocol.GetEventsResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := make([]protocol.GetEventsResponse, 0, len(reqs))
+	for range reqs {
+		out = append(out, protocol.GetEventsResponse{LatestLedger: f.latest})
+	}
+	return out, nil
 }
 
 func (f *poolFake) GetLedgers(ctx context.Context, _ protocol.GetLedgersRequest) (protocol.GetLedgersResponse, error) {
@@ -348,8 +379,106 @@ func TestPoolImplementsEveryClientMethod(t *testing.T) {
 	if _, err := p.GetTransactions(context.Background(), protocol.GetTransactionsRequest{}); err != nil {
 		t.Errorf("GetTransactions() error = %v", err)
 	}
-	if got := fake.callCount(); got != 3 {
-		t.Errorf("endpoint handled %d calls, want 3", got)
+	if _, err := p.GetEventsBatch(context.Background(), make([]protocol.GetEventsRequest, 2)); err != nil {
+		t.Errorf("GetEventsBatch() error = %v", err)
+	}
+	if got := fake.callCount(); got != 4 {
+		t.Errorf("endpoint handled %d calls, want 4", got)
+	}
+}
+
+// TestPoolGetEventsBatchFailsOverAndKeepsOrder: a batch is one call as far as
+// the pool is concerned, so an unhealthy first endpoint is skipped and every
+// requested entry still comes back, in order.
+func TestPoolGetEventsBatchFailsOverAndKeepsOrder(t *testing.T) {
+	t.Parallel()
+
+	bad := &poolFake{err: errors.New("dial tcp: connection refused")}
+	good := &poolFake{latest: 7}
+	p := newFakePool(t, map[string]*poolFake{
+		"https://bad.example":  bad,
+		"https://good.example": good,
+	})
+
+	responses, err := p.GetEventsBatch(context.Background(), make([]protocol.GetEventsRequest, 3))
+	if err != nil {
+		t.Fatalf("GetEventsBatch() error = %v, want failover to succeed", err)
+	}
+	if len(responses) != 3 {
+		t.Fatalf("GetEventsBatch() returned %d responses, want one per request", len(responses))
+	}
+	for i, resp := range responses {
+		if resp.LatestLedger != 7 {
+			t.Errorf("responses[%d].LatestLedger = %d, want 7 from the healthy endpoint", i, resp.LatestLedger)
+		}
+	}
+	if got := bad.callCount(); got != 1 {
+		t.Errorf("unhealthy endpoint handled %d calls, want 1 before failover", got)
+	}
+}
+
+// TestPoolGetEventsBatchIsRetryable: the tailer decides whether to back off
+// based on this, so a batch failure must not be misclassified as permanent.
+func TestPoolGetEventsBatchIsRetryable(t *testing.T) {
+	t.Parallel()
+
+	p := newFakePool(t, map[string]*poolFake{
+		"https://a.example": {err: errors.New("503 Service Unavailable")},
+	})
+
+	_, err := p.GetEventsBatch(context.Background(), make([]protocol.GetEventsRequest, 1))
+	if err == nil {
+		t.Fatal("GetEventsBatch() error = nil, want an error")
+	}
+	if !rpc.IsRetryable(err) {
+		t.Errorf("error = %v, want it to remain retryable for the tailer", err)
+	}
+}
+
+func TestPoolGetHealthFailsOver(t *testing.T) {
+	t.Parallel()
+
+	bad := &poolFake{err: errors.New("connection refused")}
+	good := &poolFake{healthResp: protocol.GetHealthResponse{
+		Status:       "healthy",
+		LatestLedger: 99,
+	}}
+	p := newFakePool(t, map[string]*poolFake{
+		"https://bad.example":  bad,
+		"https://good.example": good,
+	})
+
+	var _ rpc.HealthClient = p
+
+	resp, err := p.GetHealth(context.Background())
+	if err != nil {
+		t.Fatalf("GetHealth() error = %v, want failover to succeed", err)
+	}
+	if resp.Status != "healthy" || resp.LatestLedger != 99 {
+		t.Errorf("GetHealth() = %+v, want the healthy endpoint's response", resp)
+	}
+	if got := p.Healthy(); got != 1 {
+		t.Errorf("Healthy() = %d, want 1 after the failure", got)
+	}
+}
+
+func TestPoolGetHealthRejectsClientWithoutCapability(t *testing.T) {
+	t.Parallel()
+
+	p, err := stream.NewPool([]string{"https://a.example"},
+		stream.WithHealthInterval(0),
+		stream.WithClientFactory(func(string) rpc.Client { return &closeErrFake{} }))
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+
+	_, err = p.GetHealth(context.Background())
+	if !errors.Is(err, rpc.ErrHealthUnsupported) {
+		t.Fatalf("GetHealth() error = %v, want ErrHealthUnsupported", err)
+	}
+	if !rpc.IsPermanent(err) {
+		t.Errorf("error = %v, want the missing capability to be permanent", err)
 	}
 }
 

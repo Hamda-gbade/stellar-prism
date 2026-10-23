@@ -611,6 +611,10 @@ func (streamOnlyClient) GetEvents(context.Context, protocol.GetEventsRequest) (p
 	return protocol.GetEventsResponse{}, nil
 }
 
+func (streamOnlyClient) GetEventsBatch(context.Context, []protocol.GetEventsRequest) ([]protocol.GetEventsResponse, error) {
+	return nil, nil
+}
+
 func (streamOnlyClient) GetLedgers(context.Context, protocol.GetLedgersRequest) (protocol.GetLedgersResponse, error) {
 	return protocol.GetLedgersResponse{}, nil
 }
@@ -621,6 +625,10 @@ func (streamOnlyClient) GetTransaction(context.Context, protocol.GetTransactionR
 
 func (streamOnlyClient) GetTransactions(context.Context, protocol.GetTransactionsRequest) (protocol.GetTransactionsResponse, error) {
 	return protocol.GetTransactionsResponse{}, nil
+}
+
+func (streamOnlyClient) SimulateTransaction(context.Context, protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+	return protocol.SimulateTransactionResponse{}, nil
 }
 
 func (streamOnlyClient) GetLatestLedger(context.Context) (protocol.GetLatestLedgerResponse, error) {

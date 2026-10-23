@@ -153,6 +153,58 @@ func TestDLQClosesItsFileWithBatching(t *testing.T) {
 	}
 }
 
+// TestDLQComposesWithTopicPatterns pins how the client-side filter stacks
+// with the dead letter queue: the PatternSink wraps the DLQ chain, and it
+// passes non-event records through untouched, so a malformed record still
+// lands in the queue whether or not the patterns would have matched it.
+func TestDLQComposesWithTopicPatterns(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		pattern string
+		wantOut int
+	}{
+		// The fixture event's topic decodes to u32 7, so this pattern keeps
+		// it on stdout.
+		{name: "matching pattern", pattern: "7", wantOut: 1},
+		{name: "filtering pattern", pattern: "nope", wantOut: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "dead.ndjson")
+			sf := &streamFlags{
+				from:            100,
+				asJSON:          true,
+				dlqFile:         path,
+				pageSize:        10,
+				backfillWorkers: 1,
+				topicPatterns:   []string{tc.pattern},
+			}
+
+			stdout, _, err := runStreamWithDLQ(t, sf)
+			if err != nil {
+				t.Fatalf("runStream() error = %v, want the malformed record captured", err)
+			}
+			if got := len(nonEmptyLines(stdout)); got != tc.wantOut {
+				t.Errorf("stdout has %d records, want %d\n%s", got, tc.wantOut, stdout)
+			}
+
+			// Filtering happens before the DLQ chain, so a filtered-out valid
+			// record never dead-letters; the malformed one is not an event, so
+			// the pattern sink passes it through and it still does.
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("reading dead letter queue: %v", err)
+			}
+			if got := len(nonEmptyLines(string(data))); got != 1 {
+				t.Errorf("queue has %d entries, want 1\n%s", got, data)
+			}
+		})
+	}
+}
+
 func TestDLQFileMustDifferFromOutputFile(t *testing.T) {
 	t.Parallel()
 

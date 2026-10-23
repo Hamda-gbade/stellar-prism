@@ -321,7 +321,6 @@ func compressFile(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("rotating writer: open backup %s: %w", path, err)
 	}
-	defer func() { _ = src.Close() }()
 
 	compressed := path + ".gz"
 	dst, err := os.OpenFile(compressed, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
@@ -333,13 +332,15 @@ func compressFile(path string) (string, error) {
 	_, copyErr := io.Copy(gz, src)
 	gzCloseErr := gz.Close()
 	dstCloseErr := dst.Close()
+	srcCloseErr := src.Close()
 
-	if copyErr != nil || gzCloseErr != nil || dstCloseErr != nil {
+	if copyErr != nil || gzCloseErr != nil || dstCloseErr != nil || srcCloseErr != nil {
 		_ = os.Remove(compressed)
 		return "", errors.Join(
 			wrapError("compress", path, copyErr),
 			wrapError("compress", path, gzCloseErr),
 			wrapError("compress", path, dstCloseErr),
+			wrapError("close backup", path, srcCloseErr),
 		)
 	}
 	if err := os.Remove(path); err != nil {

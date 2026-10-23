@@ -156,6 +156,9 @@ func closeClient(c rpc.Client, stderr io.Writer) {
 
 // globalFlags holds options shared by every subcommand.
 type globalFlags struct {
+	serveSSE  string
+	serveWS   string
+	serveGRPC string
 	// color is one of "auto", "always" or "never", matching lens.
 	color string
 	// rpcURLs overrides the endpoints; empty falls back to the environment.
@@ -232,6 +235,12 @@ redacted before anything is written.`,
   # Backfill from a ledger, then keep following
   prism events --contract CBGSB... --from 1234567 --follow
 
+  # Ingest into PostgreSQL or TimescaleDB instead of stdout
+  prism events --contract CBGSB... --follow --timescale-dsn "$DATABASE_URL"
+
+  # Archive a backfill as columnar Parquet parts
+  prism transactions --from 1234567 --limit 100000 --parquet-dir ./txs
+
   # Explain a transaction, through the lens explain path
   prism tx 3389e9f0...`,
 		SilenceUsage:  true,
@@ -262,14 +271,28 @@ redacted before anything is written.`,
 		"maximum bytes of each body recorded by --wire-log (0 uses 1 MiB, -1 disables body capture)")
 	registerFlagCompletion(root, "color", string(colorAuto), string(colorAlways), string(colorNever))
 
+	root.PersistentFlags().StringVar(&g.serveSSE, "serve-sse", "", "broadcast SSE at this listen address (/events); retains 1024 records for replay")
+	root.PersistentFlags().StringVar(&g.serveSSE, "sse", "", "alias for --serve-sse")
+	root.PersistentFlags().StringVar(&g.serveWS, "ws", "", "broadcast WebSocket events at this listen address (/events or /ws)")
+	root.PersistentFlags().StringVar(&g.serveGRPC, "serve-grpc", "", "serve gRPC PrismStream at this listen address")
 	root.AddCommand(
+		newServeCmd(g, stdout, stderr),
 		newEventsCmd(g, stdout, stderr),
 		newLedgersCmd(g, stdout, stderr),
 		newTransactionsCmd(g, stdout, stderr),
+		newOperationsCmd(g, stdout, stderr),
+		newSimulateCmd(g, stdout, stderr),
 		newABICmd(g, stdout, stderr),
 		newStorageCmd(g, stdout, stderr),
 		newWASMCmd(g, stdout, stderr),
+		newFeeStatsCmd(g, stdout, stderr),
+		newContractsCmd(g, stdout, stderr),
+		newTradesCmd(g, stdout, stderr),
+		newHealthCmd(g, stdout, stderr),
 		newTxCmd(g, stdout, stderr),
+		newDiffCmd(g, stdout, stderr),
+		newGenerateTypesCmd(g, stdout, stderr),
+		newAuditCmd(g, stdout, stderr),
 		newVersionCmd(stdout),
 		newCompletionCmd(stdout),
 	)

@@ -12,16 +12,17 @@ import (
 
 var sigQuitOnce sync.Once
 
-// handleSigQUIT installs the SIGQUIT/SIGUSR1 handler so that when the process
-// receives either signal it prints goroutine stacks to stderr instead of aborting.
+// handleSigQUIT installs the SIGQUIT handler so that when the process receives
+// it, it prints goroutine stacks to stderr instead of aborting. SIGUSR1 is not
+// defined by the Windows syscall package, so SIGQUIT is the portable hook.
 func handleSigQUIT() {
 	sigQuitOnce.Do(func() {
 		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGQUIT, syscall.SIGUSR1)
+		signal.Notify(sigChan, syscall.SIGQUIT)
 
 		go func() {
 			for range sigChan {
-				fmt.Fprintln(os.Stderr, "SIGQUIT/SIGUSR1 received:")
+				fmt.Fprintln(os.Stderr, "SIGQUIT received:")
 				fmt.Fprintln(os.Stderr, getAllGoroutineStacks())
 			}
 		}()

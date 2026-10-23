@@ -25,6 +25,8 @@ type DrainerConfig struct {
 	NewSource SourceFactory
 	// Sink receives records in ascending ID order. Required.
 	Sink Sink
+	// Filter optionally rejects records before they reach Sink.
+	Filter RecordFilter
 	// From is the first ledger to drain. Required.
 	From uint32
 	// Until is the last ledger to drain. Zero means the server's latest
@@ -79,6 +81,7 @@ type Drainer struct {
 	reportedLedger uint32
 
 	emitted    atomic.Int64
+	filtered   atomic.Int64
 	duplicates atomic.Int64
 	fetches    atomic.Int64
 	retries    atomic.Int64
@@ -223,18 +226,34 @@ func (d *Drainer) run(ctx context.Context) (Stats, error) {
 		record := item.record
 
 		if lastID == "" || record.ID > lastID {
-			if err := d.cfg.Sink.Emit(record); err != nil {
+			matched := true
+			if d.cfg.Filter != nil {
+				var filterErr error
+				matched, filterErr = d.cfg.Filter.Match(record)
+				if filterErr != nil {
+					group.Cancel()
+					if waitErr := group.Wait(); waitErr != nil {
+						filterErr = errors.Join(filterErr, waitErr)
+					}
+					return d.snapshot(), fmt.Errorf("filtering record %s: %w", record.ID, filterErr)
+				}
+			}
+			if !matched {
+				d.filtered.Add(1)
+				lastID = record.ID
+			} else if err := d.cfg.Sink.Emit(record); err != nil {
 				group.Cancel()
 				if waitErr := group.Wait(); waitErr != nil {
 					err = errors.Join(err, waitErr)
 				}
 				return d.snapshot(), fmt.Errorf("writing record %s: %w", record.ID, err)
-			}
-			d.emitted.Add(1)
-			lastID = record.ID
+			} else {
+				d.emitted.Add(1)
+				lastID = record.ID
 
-			if d.cfg.Limit > 0 && d.emitted.Load() >= int64(d.cfg.Limit) {
-				return d.stop(group)
+				if d.cfg.Limit > 0 && d.emitted.Load() >= int64(d.cfg.Limit) {
+					return d.stop(group)
+				}
 			}
 		} else {
 			d.duplicates.Add(1)
@@ -473,6 +492,7 @@ func (d *Drainer) reportPage(page drainerPage) {
 func (d *Drainer) snapshot() Stats {
 	return Stats{
 		Emitted:    int(d.emitted.Load()),
+		Filtered:   int(d.filtered.Load()),
 		Duplicates: int(d.duplicates.Load()),
 		Fetches:    int(d.fetches.Load()),
 		Retries:    int(d.retries.Load()),
