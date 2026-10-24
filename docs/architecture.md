@@ -23,9 +23,9 @@ Everything below is in service of those four.
 
 ```
         ┌──────────┐   Batch    ┌────────┐   Record   ┌──────┐
-RPC ───►│  Source  ├───────────►│ Tailer ├───────────►│ Sink ├───► stdout
-        └──────────┘            └────────┘            └──────┘
-         events.go               tail.go               ndjson.go
+RPC ───►│  Source  ├───────────►│ Tailer ├───────────►│ Sink ├───► stdout,
+        └──────────┘            └────────┘            └──────┘     --timescale-dsn,
+         events.go               tail.go               ndjson.go   --parquet-dir
          ledgers.go            cursor, dedup,          human.go
          transactions.go       backoff, gaps           file_rotator.go
          storage_changes.go                          (via lens)
@@ -60,6 +60,8 @@ internal/cli/         cobra commands — thin wrappers over pkg/stream
   state.go            the cursor journal, the pruner, and the resume point
   runtime.go          the health server, the lease and the state key source
   syncwriter.go       serialised stderr, for the diagnostics several goroutines write
+  stats.go            the --stats run summary, printed as the run exits
+  heartbeat.go        the --heartbeat liveness line for idle follows
 internal/fakerpc/     scriptable in-memory RPC for tests
 pkg/rpc/              the Client interface + SDK adapter
   health.go           periodic getHealth and ledger latency evaluation
@@ -97,6 +99,7 @@ pkg/stream/
   demux.go            per-contract fan-out, queues + one goroutine each
   time_window.go      --since → approximate start ledger
   backoff.go          AdaptivePoller for --adaptive follow waits
+  state_file.go       durable cursor: atomic, file-backed stream position
 pkg/sink/
   ndjson.go           NDJSON, one object per line
   human.go            terminal output, payloads via lens
@@ -158,6 +161,69 @@ The RPC rejects a request carrying both a ledger range and a cursor
 enforces the same rule, so a regression here fails in tests rather than only
 in production.
 
+### Durable cursors
+
+By default a cursor lives only in the process, so restarting a stream starts it
+over from `StartLedger`. `--pg-dsn` moves that position into PostgreSQL, making
+a restart resume where the last run stopped:
+
+```go
+prism events tail --start-ledger 50000000 \
+    --pg-dsn "$PRISM_PG_DSN" --pg-cursor-key events/tendermint
+```
+
+With no `--pg-cursor-key`, prism derives one from the command and its tagged
+arguments (`events/tendermint` + start ledger → `events/<sha256-prefix>`), so
+two differently-configured streams sharing a database never share a row. Two
+runs pointed at the *same* key are two writers on one cursor; see the
+mutual-exclusion caveat below.
+
+The table is created on first use:
+
+```sql
+CREATE TABLE IF NOT EXISTS "prism_cursors" (
+    name       TEXT        PRIMARY KEY,
+    cursor     TEXT        NOT NULL,
+    last_id    TEXT        NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+)
+```
+
+`EnsureSchema` is a no-op when it already exists, so a role without `CREATE`
+can be given a pre-created table instead.
+
+**Why `SELECT … FOR UPDATE`.** Two processes writing one key must not
+interleave, or the cursor can move *backwards* and a later restart replays
+records that were already emitted. `PGCursorStore.Save` therefore takes the
+row's lock before writing:
+
+```sql
+SELECT name FROM prism_cursors WHERE name = $1 FOR UPDATE  -- the lock
+INSERT … ON CONFLICT (name) DO NOTHING                     -- only if absent
+UPDATE prism_cursors SET cursor = $2, … WHERE name = $1    -- the write
+```
+
+The lock is held to commit, so concurrent writers queue instead of racing.
+Waiting is bounded by a context deadline (`DefaultCursorLockTimeout`, 5s): a
+peer holding the lock for longer than that means something is wrong, and the
+save fails loudly rather than stalling a stream that looks hung.
+
+**Cost.** The tailer writes once per emitted record, so steady-state traffic is
+one round trip plus one small indexed row update per record — cheap next to the
+RPC fetch that produced it. Backfilling a large range at full speed does one
+write per record rather than per page; if that ever matters, the seam is the
+`CursorStore` interface, and batching per page is a bounded change.
+
+**What this does not give you.** Durable position is not exactly-once. A crash
+between emitting a record and persisting it replays that record, which is why
+de-duplication still runs after a restore — and why the `LastID` high-water mark
+is stored alongside the cursor. A second caveat: two processes writing one key
+take turns rather than merging, so run one tailer per key. `Save` deliberately
+does *not* detect a position moving backwards: a rewind is indistinguishable
+legitimately (an operator re-pointing a key) from a bug, and silently refusing
+to move would hide the operator's intent. Run one tailer per key and the
+question does not arise.
+
 ### Gap detection
 
 Records can be lost exactly one way: falling behind the RPC's retention window
@@ -181,12 +247,127 @@ and `Stats.Gaps` / `Stats.Recovered` count it. `--max-gap-recoveries` bounds
 how many times a stream may skip ahead. A source without `Rewinder` cannot
 resume and fails exactly as it would under the default policy.
 
+### Durable cursors (`--state-file`)
+
+Exactly-once across restarts would need a transaction spanning the sink and
+the cursor store, which a CLI writing to stdout cannot have. What prism can
+have is much better than nothing, and `--state-file <path>` turns it on: the
+stream position is persisted after **every successfully emitted record**, so
+a restart resumes where the previous run stopped and the restart window
+narrows from "the whole run" to "one interrupted record".
+
+The position is one small, versioned JSON document (see
+`pkg/stream/state_file.go`):
+
+```json
+{"version":1,"source":"events","ledger":3966820,"paging_token":"…","last_id":"…","updated_at":"2026-10-20T12:00:00Z"}
+```
+
+Four rules carry the weight:
+
+**1. The file is written after the emit, never before.** It can therefore
+never run ahead of the stream: a crash between the two re-emits exactly the
+interrupted record on restart, and the restored high-water mark (`last_id`)
+suppresses anything the previous run already delivered.
+
+**2. Writes are atomic.** Each save writes a complete snapshot to a
+temporary file in the same directory, fsyncs it, and renames it over the
+destination, so a reader only ever sees a complete snapshot — the previous
+state or the new one, never a torn file. A crash before the rename reverts
+to the previous position, which can only re-emit, never skip: at-least-once
+holds unconditionally.
+
+**3. The saved position wins, visibly.** On startup the tailer resumes from
+the stored paging token, and the CLI notes on stderr when that overrides an
+explicit `--from`. A state file written by a different stream is refused
+rather than misapplied, and a token the Source cannot interpret fails the
+run before any request is made.
+
+**4. The restored high-water mark keeps de-duplication across the restart.**
+`last_id` is reloaded into the tailer, so a server that replays the tail of
+the stream to a freshly restarted client — which the RPC docs warn to expect
+— is still suppressed, exactly as within a single run.
+
+Persistence is synchronous and file-backed: no goroutines, no open
+descriptors between writes, nothing to clean up when the stream terminates
+or is interrupted. The cost is one small fsync per record, which is the
+price of the guarantee; a poll-only RPC keeps the record rate modest.
+
 ### Backpressure
 
 `Sink.Emit` is synchronous. A slow consumer (`prism … | jq | something-slow`)
 blocks the write, which blocks the poll loop. That is correct backpressure
-with no queue to grow. It is also why both sinks flush per record: a tail that
-buffers looks like a tail that has hung.
+with no queue to grow. It is also why the line-oriented sinks flush per
+record: a tail that buffers looks like a tail that has hung.
+
+## Sinks that store rather than print
+
+`NDJSON` and `Human` are line-oriented: a record is visible the moment `Emit`
+returns. The two storage sinks batch instead, because a round trip (or a file
+rename) per record would be absurd for a backfill. Both keep the same seam and
+the same delivery contract; the difference is that records are only durable
+once a batch is flushed.
+
+Both sinks own a background goroutine that flushes a partial batch every
+`--flush-interval`, and both implement `io.Closer`. The CLI closes whichever
+sink it built after the tailer returns — including on the gap error path — so
+the last records reach disk before the process exits and no goroutine outlives
+the run. `Flush` remains what the tailer calls; `Close` is the stronger command
+that also stops the timer and releases the driver.
+
+### TimescaleDB (`--timescale-dsn`)
+
+Rows land in one wide table, `prism_records`, with the neutral `Record` fields
+plus kind-specific columns left `NULL` where they do not apply, so a query can
+tell "no transaction here" from "a transaction that failed":
+
+```sql
+CREATE TABLE prism_records (
+  id TEXT NOT NULL, ledger BIGINT NOT NULL, kind TEXT NOT NULL,
+  closed_at TIMESTAMPTZ, hash TEXT, contract_id TEXT, tx_hash TEXT,
+  tx_index INTEGER, op_index INTEGER, successful BOOLEAN,
+  topics_xdr TEXT[], value_xdr TEXT, envelope_xdr TEXT,
+  result_xdr TEXT, result_meta_xdr TEXT, header_xdr TEXT, metadata_xdr TEXT,
+  PRIMARY KEY (id, ledger)
+);
+```
+
+The table is promoted to a hypertable partitioned by **ledger** — not by time —
+with a chunk every 50,000 ledgers. The ledger sequence is always present, is the
+natural dimension for chain data, and does not require inventing a timestamp for
+a record the server did not date. On a server without the extension the
+`create_hypertable` call is recognised as "TimescaleDB is not installed" and the
+sink keeps working against the plain table; anything else is reported.
+
+`COPY` cannot express `ON CONFLICT`, so a batch lands in a `pg_temp` table and
+is merged with `INSERT … ON CONFLICT DO NOTHING` inside one transaction. That
+matters for the delivery contract: a restart re-emits the last record or two by
+design, and the primary key would otherwise turn a legitimate replay into a
+fatal duplicate-key error. A failed batch therefore inserts nothing and stays
+buffered for retry, while a replayed batch is a no-op.
+
+### Parquet (`--parquet-dir`)
+
+An embedded DuckDB instance is used only as the Parquet encoder. Rows are staged
+in an in-memory table and copied out with `COPY (SELECT … ORDER BY id) TO …, so
+each flush produces one part file:
+
+```
+<dir>/part-000001.parquet
+<dir>/part-000002.parquet
+```
+
+Part files are written under a `.tmp` name and renamed, so an interrupted COPY
+cannot leave a truncated file that a later read would trust. Numbering resumes
+after the highest part already in the directory, so a restarted backfill appends
+rather than overwrites. The whole archive is one glob away:
+
+```sql
+SELECT kind, count(*) FROM read_parquet('parts/*.parquet') GROUP BY kind;
+```
+
+Batching bounds memory: the staging table never holds more than one part, so a
+multi-day backfill does not grow with the stream.
 
 `--batch` changes the unit of work, not the backpressure: `Batcher` buffers
 records until `--batch-size` is reached or `--batch-timeout` elapses, then
@@ -533,6 +714,82 @@ Two details make the drain safe rather than merely best-effort:
 The CLI runs the drain inside its own deadline and joins any error with the
 run's own, so a drain failure is reported rather than swallowed.
 
+## Run summary (`--stats`)
+
+Every streaming command accepts `--stats`, which prints one line on stderr as
+the command exits:
+
+```console
+$ prism events --from 1234567 --follow --stats
+...
+prism: stats: processed=1042 duplicates=7 retries=1 elapsed=2m3s
+```
+
+| Part | Meaning |
+|---|---|
+| `processed` | records handed to the sinks, summed over the backfill and follow phases |
+| `duplicates` | records dropped as duplicates: the tailer's high-water mark (`Stats.Duplicates`) plus the `--dedup-window` ring (`DedupSink.Dropped`) |
+| `retries` | fetches that failed and were retried |
+| `elapsed` | wall-clock time from the start of the run, rounded to milliseconds |
+
+Details:
+
+- **stderr, never stdout.** The summary is a diagnostic like every other
+  `prism:` line, so a piped `--json` stream is unaffected.
+- **Printed once, at the end.** Each phase contributes its `stream.Stats` as
+  it finishes; one deferred call prints after the drain, the cursor commit
+  and the sink close, so the numbers describe what actually reached the
+  sinks.
+- **Silent when there is nothing to summarise.** Without `--stats`, or when
+  the run fails before it starts fetching — a sink that cannot be built, an
+  unresolvable head — nothing is printed and the error stands alone.
+- **Nothing new to clean up.** `internal/cli/stats.go` is a plain struct the
+  run feeds; the reporter holds no goroutine and no timer. The one hazard is
+  counters owned by the *drain* goroutine: a drain that overruns
+  `--drain-timeout` is abandoned to it, so the summary reports snapshots
+  taken before it started — chosen with `errors.Is(drainErr, errTimedOut)` —
+  or a fresh read after a drain that completed and was joined.
+
+The flag is additive: a stream that does not ask for it prints exactly what
+it printed before.
+
+## Heartbeat (`--heartbeat`)
+
+A follow on a quiet contract is indistinguishable from a hung process unless
+something keeps saying the stream is alive. `--heartbeat` prints one line on
+stderr for every interval the stream waits without delivering a record:
+
+```console
+$ prism events --follow --heartbeat 30s
+prism: heartbeat: idle for 30s with no records
+prism: heartbeat: idle for 60s with no records
+```
+
+Details:
+
+- **Driven by the tailer's own waits.** `internal/cli/heartbeat.go` wraps
+  the injected `Clock` (`Options.Clock`), slicing each wait at the interval
+  so the beat lands *while* the stream waits — a line printed only after a
+  wait ends would say nothing about a process stuck inside one. The waits
+  are sliced rather than raced against a timer, so the beat needs no
+  goroutine of its own and there is nothing new to clean up at termination.
+- **Idle means idle.** The wrapped `OnPage` marks every page emitted in
+  full, restarting the window, so heartbeats never interrupt a busy stream
+  however long its polls take. The chain preserves what `OnPage` already
+  did — recording the cursor in `--state-file`.
+- **Follow only.** The backfill workers keep the plain clock: their waits
+  are fetch retries, not idle follow intervals, and `--heartbeat` without
+  `--follow` is rejected rather than silently ignored.
+- **Cancellation is unaffected.** Ctrl-C interrupts a wait at the next
+  slice boundary, with the wrapped clock's error passed through untouched.
+- **stderr, never stdout**, like every other `prism:` line, and only when
+  the flag is passed: a run that does not ask for it prints exactly what it
+  printed before.
+
+Retry backoffs pass through the wrapped clock too, so a long backoff may
+beat as well — which is honest: the process really is waiting, and the
+retry messages around it explain why.
+
 ## Encrypted state files (`pkg/stream/crypto_state.go`)
 
 The cursor journal holds stream metadata, and on a shared file system or in a
@@ -620,6 +877,42 @@ NDJSON consumers to identify hot keys and transaction sets.
 for each newly observed head, decodes Soroban resource estimates, and compares
 successive return values through stellar-xdr-lens before emitting changed
 fields.
+
+### Transaction cursors, IDs and backfill
+
+`getTransactions` resembles `getEvents` with a different payload, but its
+pagination is not the same, and two details decide whether the source is
+correct:
+
+**The cursor is a SEP-35 total-order ID, not a ledger sequence.** It is one
+decimal string encoding the ledger, the transaction's application order within
+that ledger and an operation index into a single int64. `transactionCursorLedger`
+parses it through `toid.Parse`; reading it as a plain ledger number produces a
+value around 10^13, which is larger than any retention floor, so
+`cursorLedger < batch.Oldest` never becomes true and gap detection silently
+stops working. `TestTransactionTailDetectsRetentionGap` is the regression test
+for exactly that failure.
+
+**There is no per-record ID from the server.** The events API returns one;
+transactions expose only a ledger and an application order, so the source
+synthesises `%010d-%07d` from them. Ten digits covers the ledger, and seven is
+the width of TOID's transaction field, so the fixed-width contract holds for a
+whole ledger's worth of transactions rather than only the first 10,000.
+
+Two smaller behaviours follow from the real server:
+
+- The server caps how many *ledgers* one call scans. A short page that has not
+  yet reached `LatestLedger` therefore means "more is waiting", not "the
+  stream is done"; `transactionPageIsFull` keeps a backfill draining instead of
+  ending it mid-range. An empty page stays terminal, because the cursor cannot
+  advance past nothing.
+- An unparseable cursor is wrapped with `rpc.Permanent`, so a corrupt position
+  fails immediately instead of exhausting the retry budget and reporting the
+  wrong cause.
+
+The `internal/fakerpc` and `pkg/prismtest` doubles return the same decimal
+TOID cursor the real server does. A fake whose cursors merely looked plausible
+would let a broken `CursorLedger` pass every test.
 
 ### Transaction classification (`prism transactions`)
 
@@ -869,35 +1162,54 @@ Covered: clean streams, drops at every position, consecutive drops, replayed
 pages, out-of-order pages, retention overrun with both gap policies, lagging
 backends, permanent errors, retry exhaustion, cancellation mid-follow, sink
 failure, full-page draining, concurrent backfill, batcher count/time/explicit
-flushes, and task-group cancellation. Gap recovery is also unit-tested
+flushes, durable-cursor resume across restarts, replay suppression across
+restarts, corrupt/foreign/uninterpretable state files, persist failures mid-page,
+and task-group cancellation. Gap recovery is also unit-tested
 without a network through the `Rewinder` seam.
-
-The cursor metadata store is tested the same way: appends and rewrites
-against a real file in a temporary directory, a pruner that keeps running
-after a failure, a pruner whose goroutine is joined rather than abandoned,
-and a tailer that resumes from a recorded cursor and is still gap-checked
-when it does. `internal/cli` runs the whole thing end to end against
-`internal/fakerpc`: a run that records checkpoints, a file that stays
-bounded while the stream runs, and a second run that picks up where the
-first stopped.
-
-The same guarantees also hold through the seams this file describes below:
-adaptive poll waits, `--since` window arithmetic, client-side topic
-patterns, and demux routing under concurrent submitters — all checked with
-`go test -race`.
-
-The dead letter queue is covered at both levels. `pkg/sink` tests every
-validation branch, delivery and flush failures (including a writer that
-fails like a full disk), batch attribution, and idempotent close against a
-real file. `internal/cli` runs `runStream` with a source that emits one valid
-record and one malformed record, then asserts that the valid record reached
-stdout, the malformed one reached `--dlq-file`, and the command exited
-successfully — the end-to-end shape of "a bad record does not crash a tail".
 
 Time is injected via `Clock`, so there are no real sleeps and no wall-clock
 flakiness. Follow-loop tests carry a sleep budget that cancels the context, so
 a regression that stops the tailer terminating **fails** rather than hanging
 CI — a distinction worth the few extra lines.
+
+### End-to-end tests against a real network
+
+Offline determinism is the right default, so the live suite is opt-in twice
+over: it lives behind the `e2e` build tag and skips unless `PRISM_E2E=1` is
+set. `make test-e2e` runs it.
+
+```
+internal/cli/e2e_test.go                     the scenarios
+internal/cli/testdata/e2e/docker-compose.yml a local Quickstart node
+```
+
+`TestMain` brings up `stellar/quickstart` (standalone network, Soroban RPC
+enabled), waits for it to report a ledger, runs the tests and tears the
+container down. Point `PRISM_E2E_RPC_URL` at an existing node to skip the
+container entirely; `PRISM_E2E_FRIENDBOT_URL` overrides friendbot, which is
+otherwise derived from the RPC URL.
+
+What it proves that the fake cannot: real cursor paging and real XDR. Each
+test funds a fresh account through friendbot, which submits a genuine
+`createAccount` transaction, and waits until the node can serve it — a freshly
+started node ingests a ledger into the RPC store a moment after it closes, so
+asserting immediately would race the ingester rather than test prism.
+
+- `prism transactions --from <ledger>` returns the submitted hash, with valid
+  NDJSON, strictly increasing IDs and no duplicates;
+- `prism tx <hash>` explains a real envelope/result pair;
+- `prism ledgers` and `--backfill-workers` work against the paginated API;
+- cancelling `--follow` returns cleanly and leaves no goroutine behind.
+
+Cancellation is timed rather than triggered by the first record, because the
+tailer holds the newest ledger's records until a later ledger proves they are
+final; on a quiet local network a head record can legitimately wait.
+Termination is what that test owns, and delivery under traffic is covered by
+the offline suite.
+
+Nothing here runs in CI by default: it needs Docker and a network, and a
+flaky testnet would make CI untrustworthy. Run it before a release or when
+touching the RPC adapter.
 
 ### Mutation-checked
 
@@ -916,6 +1228,11 @@ The invariants were verified by breaking the code on purpose:
 | DLQ swallowing a failure without recording it | `TestDLQCapturesDeliveryFailure` fails: no dead letter on disk |
 | DLQ returning a captured delivery failure | `TestDLQCapturesDeliveryFailure` fails: `Emit()` returned the error |
 | DLQ closing without flushing | `TestDLQClosesWriterAndPrimaryIdempotently` fails: the queue file is empty |
+| Transaction cursor parsed as a ledger sequence | `TestTransactionTailDetectsRetentionGap` fails: the stream passes over the pruned range instead of reporting it |
+| Transaction source treats a short page before the head as terminal | `TestTransactionTailContinuesShortPageBeforeHead` and `TestTransactionsCommandShortPageKeepsDraining` fail with one record instead of two |
+| Per-emit persistence disabled | `TestTailStateRecordsPositionAfterEachEmit`, `TestTailStateResumesAcrossRestart` and the CLI restart test fail |
+| Startup restore disabled | `TestTailStateResumesAcrossRestart`, `TestTailStateRefusesPositionFromAnotherStream`, `TestTailStateRejectsUninterpretableToken` and `TestTailStateGapDetectedOnResume` fail |
+| Restored high-water mark dropped | `TestTailStateSuppressesReplayAfterRestart` fails, naming the re-emitted IDs |
 
 If you change the state machine, re-run that exercise. A test suite that
 cannot fail is not protecting anything.
@@ -1015,9 +1332,11 @@ type Sink interface {
 }
 ```
 
-Flush per record if the sink is for live viewing. Decode XDR through `lens`
-rather than reaching for `xdr` directly, so output stays consistent with the
-rest of the family — and report an undecodable payload inline rather than
+Flush per record if the sink is for live viewing. A batching sink should also
+implement `io.Closer`, stop and wait for any goroutine it started, and flush
+whatever is buffered there; the CLI closes the sink it built. Decode XDR through
+`lens` rather than reaching for `xdr` directly, so output stays consistent with
+the rest of the family — and report an undecodable payload inline rather than
 returning an error, so one malformed value cannot kill a long-running tail.
 
 ### Built-in sinks

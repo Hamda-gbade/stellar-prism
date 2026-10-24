@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -92,6 +93,16 @@ type Options struct {
 	// OnRetry, when set, is called before each backoff wait so the CLI can
 	// tell the user what is happening rather than appearing to hang.
 	OnRetry func(attempt int, delay time.Duration, err error)
+	// Store, when set, persists the stream position so a later run resumes
+	// where this one stopped. Nil — the default — keeps the position in
+	// memory only, which is exactly the behaviour prism had before durable
+	// cursors existed.
+	Store CursorStore
+	// StoreKey names the row the position is saved under. Empty means the
+	// Source's name; set it when one Source name covers several distinct
+	// queries, or two streams would resume from each other's position.
+	StoreKey string
+
 	// GapStrategy selects what to do when the server has pruned records.
 	// The empty value means GapFail.
 	GapStrategy GapStrategy
@@ -134,7 +145,35 @@ type Options struct {
 	// It is the grace period an orchestrator gives the process before it
 	// kills it, so a flush that overruns it is abandoned rather than
 	// waited out. Zero means the flush is waited for as long as it takes.
+	// DrainTimeout bounds how long the final flush may take when the run
+	// stops.
+	//
+	// It is the grace period an orchestrator gives the process before it
+	// kills it, so a flush that overruns it is abandoned rather than
+	// waited out. Zero means the flush is waited for as long as it takes.
 	DrainTimeout time.Duration
+	// State, when set, makes the stream position durable. It is saved after
+	// every successfully emitted record and restored when Run starts, so a
+	// restarted process resumes where the previous one stopped instead of
+	// re-emitting from its original start. Nil (the default) keeps the
+	// position in memory only. *StateFile is the file-backed implementation.
+	State StateStore
+}
+
+// StateStore is the seam durable cursors plug into: it holds the stream's
+// resumable position, and the tailer reads it once at startup and writes it
+// after each successful emit. *StateFile is the file-backed implementation;
+// tests substitute fakes to exercise failure paths.
+//
+// Implementations must treat Save as synchronous and durable when it
+// returns nil: the delivery guarantee across restarts rests on the position
+// being on disk before the tailer advances past it.
+type StateStore interface {
+	// Load returns the persisted position, or the zero State when nothing
+	// has been persisted yet.
+	Load() (State, error)
+	// Save replaces the persisted position.
+	Save(st State) error
 }
 
 // Progress reports how far a stream has got relative to the server's head.
@@ -175,9 +214,14 @@ func (p Progress) Lag() uint32 {
 //
 //   - Not exactly-once across restarts. The tailer cannot atomically emit a
 //     record and commit its cursor, so a process killed between the two will
-//     re-emit on restart. Options.StartCursor and Options.OnPage checkpoint
-//     fully delivered pages; pages still held by the reorder buffer may be
-//     replayed. Consumers that care should key off Record.ID.
+//     re-emit on restart. When Options.Store or Options.State is set, the
+//     window narrows to the interrupted record: the position is persisted
+//     after every emit and the restored high-water mark suppresses replays.
+//     Options.StartCursor and Options.OnPage checkpoint fully delivered
+//     pages; pages still held by the reorder buffer may be replayed. True
+//     exactly-once would need a transaction spanning the sink and the cursor
+//     store, which a CLI writing to stdout cannot have; consumers that care
+//     should still key off Record.ID.
 type Tailer struct {
 	src  Source
 	sink Sink
@@ -190,6 +234,13 @@ type Tailer struct {
 	// fixed-width and zero-padded, a plain string comparison orders them
 	// correctly, which is what makes de-duplication a single comparison.
 	lastID string
+
+	// persisted is the last position successfully written to the Store, and
+	// persistedOK records whether anything has been written or restored yet.
+	// Re-writing an unchanged position would turn every idle poll of a
+	// caught-up follow into a transaction for nothing.
+	persisted   CursorState
+	persistedOK bool
 
 	stats    Stats
 	recovery GapRecovery
@@ -319,6 +370,16 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		}
 	}()
 
+	if err := t.restore(ctx); err != nil {
+		if IsCancellation(err) {
+			return t.finish(nil)
+		}
+		return err
+	}
+	if err := t.restoreState(); err != nil {
+		return err
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return t.finish(nil)
@@ -357,8 +418,11 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		}
 
 		t.queuePage(batch)
-		done, _, err := t.emit(batch)
+		done, _, err := t.emit(ctx, batch)
 		if err != nil {
+			if IsCancellation(err) {
+				return t.finish(nil)
+			}
 			return err
 		}
 		t.reportProgress(batch)
@@ -366,7 +430,7 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		// drained and the buffered suffix satisfies the limit. Do not wait
 		// for another ledger just to finish an explicitly bounded request.
 		if !done && !batch.Full && t.opts.Limit > 0 && t.stats.Emitted+len(t.reorder.pending) >= t.opts.Limit {
-			done, _, err = t.emitReady(t.reorder.Flush())
+			done, _, err = t.emitReady(ctx, t.reorder.Flush())
 			if err != nil {
 				return err
 			}
@@ -382,6 +446,24 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		// whole run resumes from the same place rather than past the failure.
 		if batch.NextCursor != "" {
 			t.cursor = batch.NextCursor
+			// The page boundary is the first point at which the resume
+			// position may move; writing it here is what lets a later run
+			// fetch from here instead of from the start of the page.
+			if err := t.persist(ctx); err != nil {
+				if IsCancellation(err) {
+					return t.finish(nil)
+				}
+				return err
+			}
+			// Re-persist with the server's own token now that the batch has
+			// fully drained. It is equivalent to the last record's ID but in
+			// the exact form the server issued it, which is the most
+			// conservative position to resume from.
+			if ledger, ok := t.src.CursorLedger(t.cursor); ok {
+				if err := t.persistState(t.cursor, ledger); err != nil {
+					return err
+				}
+			}
 		}
 
 		// A full page means the server already has more for us; keep draining
@@ -510,7 +592,7 @@ func (t *Tailer) Drain(ctx context.Context, timeout time.Duration) error {
 // quietly become N plus whatever the run happened to be holding.
 func (t *Tailer) drain(ctx context.Context) error {
 	if t.opts.Limit == 0 || t.stats.Emitted < t.opts.Limit {
-		if _, _, err := t.emitReady(t.reorder.Flush()); err != nil {
+		if _, _, err := t.emitReady(ctx, t.reorder.Flush()); err != nil {
 			return err
 		}
 	}
@@ -528,7 +610,7 @@ func (t *Tailer) drain(ctx context.Context) error {
 // run that ends flushes exactly once whatever path it ended by.
 func (t *Tailer) finish(err error) error {
 	if err == nil && (t.opts.Limit == 0 || t.stats.Emitted < t.opts.Limit) {
-		if _, _, flushErr := t.emitReady(t.reorder.Flush()); flushErr != nil {
+		if _, _, flushErr := t.emitReady(context.Background(), t.reorder.Flush()); flushErr != nil {
 			return flushErr
 		}
 	}
@@ -634,6 +716,60 @@ func (t *Tailer) checkGap(b Batch) *GapError {
 	return nil
 }
 
+// restore loads a persisted position, if any, before the first fetch.
+//
+// A missing row is a first run and leaves the configured start position
+// alone. Any other failure is fatal: carrying on would mean claiming
+// durability the operator asked for and silently not having it.
+func (t *Tailer) restore(ctx context.Context) error {
+	if t.opts.Store == nil {
+		return nil
+	}
+	state, err := t.opts.Store.Load(ctx, t.storeKey())
+	switch {
+	case errors.Is(err, ErrNoCursor):
+		return nil
+	case err != nil:
+		return fmt.Errorf("restoring cursor: %w", err)
+	}
+	t.cursor = state.Cursor
+	t.lastID = state.LastID
+	// Restoring counts as persisted: it is the same position, already durable.
+	t.persisted, t.persistedOK = state, true
+	return nil
+}
+
+// persist writes the position reached so far.
+//
+// It is called after every emitted record and again when a page boundary is
+// crossed, which is what bounds a crash's replay window to one record: the
+// resume point only ever moves to a page boundary once the whole page is out,
+// and LastID suppresses the replay of what was already emitted from inside
+// the page. A position that has not moved is not written again.
+func (t *Tailer) persist(ctx context.Context) error {
+	if t.opts.Store == nil {
+		return nil
+	}
+	state := CursorState{Cursor: t.cursor, LastID: t.lastID}
+	if t.persistedOK && state == t.persisted {
+		return nil
+	}
+	if err := t.opts.Store.Save(ctx, t.storeKey(), state); err != nil {
+		return fmt.Errorf("persisting cursor: %w", err)
+	}
+	t.persisted, t.persistedOK = state, true
+	return nil
+}
+
+// storeKey is the row the position lives under: an explicit key when the
+// caller named one, the Source's name otherwise.
+func (t *Tailer) storeKey() string {
+	if t.opts.StoreKey != "" {
+		return t.opts.StoreKey
+	}
+	return t.src.Name()
+}
+
 // reportsPage reports whether a page moved the stream forward.
 //
 // An empty page that leaves the cursor where it was says nothing new, and
@@ -691,11 +827,14 @@ func (t *Tailer) reportReadyPages() {
 
 // emit writes a batch's records, suppressing any the server replayed, and
 // reports whether the configured limit has been reached and records written.
-func (t *Tailer) emit(b Batch) (done bool, emitted int, err error) {
-	return t.emitReady(t.reorder.Add(b.Records))
+func (t *Tailer) emit(ctx context.Context, b Batch) (done bool, emitted int, err error) {
+	if t.opts.Store != nil {
+		return t.emitReady(ctx, b.Records)
+	}
+	return t.emitReady(ctx, t.reorder.Add(b.Records))
 }
 
-func (t *Tailer) emitReady(records []Record) (done bool, emitted int, err error) {
+func (t *Tailer) emitReady(ctx context.Context, records []Record) (done bool, emitted int, err error) {
 	if len(records) == 0 {
 		return false, 0, nil
 	}
@@ -741,9 +880,82 @@ func (t *Tailer) emitReady(records []Record) (done bool, emitted int, err error)
 		emitted++
 		t.reportReadyPages()
 
+		// Persist at the cursor the record was fetched from: the record is
+		// out, and the next run must both resume at or before it and know
+		// what to suppress.
+		if err := t.persist(ctx); err != nil {
+			return false, emitted, err
+		}
+
+		// The position becomes durable only once the record is out: the
+		// state file is written after the emit, never before, so it can
+		// never run ahead of the stream. A crash in between re-emits this
+		// one record on restart — at-least-once, as documented — and the
+		// restored high-water mark suppresses anything already delivered.
+		if err := t.persistState(r.ID, r.Sequence); err != nil {
+			return false, emitted, err
+		}
+
 		if t.opts.Limit > 0 && t.stats.Emitted >= t.opts.Limit {
 			return true, emitted, nil
 		}
 	}
 	return false, emitted, nil
+}
+
+// restoreState resumes the in-memory position from the persisted one.
+//
+// The saved position wins over a freshly configured start, because that is
+// what "durable" means. A state file written by a different stream is
+// refused rather than misapplied, and a token the Source cannot interpret is
+// reported before any request is made rather than surfacing as a confusing
+// server rejection mid-run.
+func (t *Tailer) restoreState() error {
+	if t.opts.State == nil {
+		return nil
+	}
+	st, err := t.opts.State.Load()
+	if err != nil {
+		return fmt.Errorf("loading stream state: %w", err)
+	}
+	if st.Source == "" {
+		// Nothing persisted yet: start where the Source was configured.
+		return nil
+	}
+	if st.Source != t.src.Name() {
+		return fmt.Errorf(
+			"state holds a position for the %q stream, but this run follows %q; use a separate state file per stream",
+			st.Source, t.src.Name())
+	}
+	if st.PagingToken != "" {
+		if _, ok := t.src.CursorLedger(st.PagingToken); !ok {
+			return fmt.Errorf(
+				"state file cursor %q is not a valid %s cursor", st.PagingToken, t.src.Name())
+		}
+		t.cursor = st.PagingToken
+	}
+	t.lastID = st.LastID
+	return nil
+}
+
+// persistState saves the current position, recording pagingToken as the resume
+// point and the tailer's high-water mark. It is a no-op when no StateStore
+// is configured, which keeps the non-durable path free of extra work.
+func (t *Tailer) persistState(pagingToken string, ledger uint32) error {
+	if t.opts.State == nil {
+		return nil
+	}
+	st := State{
+		Version:     StateVersion,
+		Source:      t.src.Name(),
+		Ledger:      ledger,
+		PagingToken: pagingToken,
+		Cursor:      pagingToken,
+		LastID:      t.lastID,
+		UpdatedAt:   t.opts.Clock.Now(),
+	}
+	if err := t.opts.State.Save(st); err != nil {
+		return fmt.Errorf("persisting stream position: %w", err)
+	}
+	return nil
 }
