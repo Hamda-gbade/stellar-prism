@@ -53,7 +53,7 @@ func TestRunStatsReportLine(t *testing.T) {
 	var buf bytes.Buffer
 	summary.report(&buf)
 
-	const want = "prism: stats: processed=15 duplicates=6 retries=1 elapsed=1.5s\n"
+	const want = "prism: stats: processed=15 duplicates=6 retries=1 sampled=0 rateLimited=0 elapsed=1.5s\n"
 	if got := buf.String(); got != want {
 		t.Errorf("report() = %q, want %q", got, want)
 	}
@@ -105,7 +105,7 @@ func TestDedupDroppedCountsRingSuppressions(t *testing.T) {
 
 	var buf bytes.Buffer
 	summary.report(&buf)
-	const want = "prism: stats: processed=0 duplicates=1 retries=0 elapsed=0s\n"
+	const want = "prism: stats: processed=0 duplicates=1 retries=0 sampled=0 rateLimited=0 elapsed=0s\n"
 	if got := buf.String(); got != want {
 		t.Errorf("report() = %q, want %q", got, want)
 	}
@@ -123,7 +123,7 @@ func TestEventsCommandStatsReportsOnExit(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	const prefix = "prism: stats: processed=4 duplicates=0 retries=0 elapsed="
+	const prefix = "prism: stats: processed=4 duplicates=0 retries=0 sampled=0 rateLimited=0 elapsed="
 	if !strings.Contains(stderr, prefix) {
 		t.Errorf("stderr does not contain %q\n%s", prefix, stderr)
 	}
@@ -156,7 +156,7 @@ func TestEventsCommandStatsCountsDuplicates(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	const prefix = "prism: stats: processed=4 duplicates=1 retries=0 elapsed="
+	const prefix = "prism: stats: processed=4 duplicates=1 retries=0 sampled=0 rateLimited=0 elapsed="
 	if !strings.Contains(stderr, prefix) {
 		t.Errorf("stderr does not contain %q\n%s", prefix, stderr)
 	}
@@ -182,7 +182,7 @@ func TestEventsCommandStatsCountsRetries(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	const prefix = "prism: stats: processed=4 duplicates=0 retries=1 elapsed="
+	const prefix = "prism: stats: processed=4 duplicates=0 retries=1 sampled=0 rateLimited=0 elapsed="
 	if !strings.Contains(stderr, prefix) {
 		t.Errorf("stderr does not contain %q\n%s", prefix, stderr)
 	}
@@ -201,7 +201,7 @@ func TestEventsCommandStatsAfterBackfill(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	const prefix = "prism: stats: processed=30 duplicates=0 retries=0 elapsed="
+	const prefix = "prism: stats: processed=30 duplicates=0 retries=0 sampled=0 rateLimited=0 elapsed="
 	if !strings.Contains(stderr, prefix) {
 		t.Errorf("stderr does not contain %q\n%s", prefix, stderr)
 	}
@@ -274,7 +274,7 @@ func TestEventsCommandStatsSurvivesDrainTimeout(t *testing.T) {
 	}
 
 	text := stderr.String()
-	const prefix = "prism: stats: processed=4 duplicates=0 retries=0 elapsed="
+	const prefix = "prism: stats: processed=4 duplicates=0 retries=0 sampled=0 rateLimited=0 elapsed="
 	if !strings.Contains(text, prefix) {
 		t.Errorf("stderr does not contain %q\n%s", prefix, text)
 	}
@@ -331,7 +331,7 @@ func TestEventsCommandStatsOnInterrupt(t *testing.T) {
 	// Two records were ready when the signal landed and the third was
 	// still in the reorder buffer: the drain flushed it, so all three
 	// were processed.
-	const prefix = "prism: stats: processed=3 duplicates=0 retries=0 elapsed="
+	const prefix = "prism: stats: processed=3 duplicates=0 retries=0 sampled=0 rateLimited=0 elapsed="
 	if text := stderr.String(); !strings.Contains(text, prefix) {
 		t.Errorf("stderr does not contain %q\n%s", prefix, text)
 	}

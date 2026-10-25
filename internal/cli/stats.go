@@ -36,6 +36,10 @@ type runStats struct {
 	duplicates int
 	// retries counts fetches that failed and were retried.
 	retries int
+	// sampled counts records dropped by deterministic sampling.
+	sampled int
+	// rateLimited counts records dropped by the token bucket rate limiter.
+	rateLimited int
 }
 
 // newRunStats starts a reporter for a run, or returns nil when --stats was
@@ -71,6 +75,8 @@ func (s *runStats) add(stats stream.Stats) {
 	s.processed += stats.Emitted
 	s.duplicates += stats.Duplicates
 	s.retries += stats.Retries
+	s.sampled += stats.Sampled
+	s.rateLimited += stats.RateLimited
 }
 
 // addDuplicates folds in duplicates dropped by the --dedup-window ring.
@@ -83,6 +89,22 @@ func (s *runStats) addDuplicates(n int) {
 		return
 	}
 	s.duplicates += n
+}
+
+// addSampled adds records dropped by deterministic sampling.
+func (s *runStats) addSampled(n int) {
+	if s == nil {
+		return
+	}
+	s.sampled += n
+}
+
+// addRateLimited adds records dropped by the token bucket rate limiter.
+func (s *runStats) addRateLimited(n int) {
+	if s == nil {
+		return
+	}
+	s.rateLimited += n
 }
 
 // dedupDropped reports how many records the --dedup-window ring has
@@ -111,6 +133,6 @@ func (s *runStats) report(w io.Writer) {
 		return
 	}
 	elapsed := s.now().Sub(s.startedAt).Round(time.Millisecond)
-	fmt.Fprintf(w, "prism: stats: processed=%d duplicates=%d retries=%d elapsed=%s\n",
-		s.processed, s.duplicates, s.retries, elapsed)
+	fmt.Fprintf(w, "prism: stats: processed=%d duplicates=%d retries=%d sampled=%d rateLimited=%d elapsed=%s\n",
+		s.processed, s.duplicates, s.retries, s.sampled, s.rateLimited, elapsed)
 }
