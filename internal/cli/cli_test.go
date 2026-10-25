@@ -107,6 +107,26 @@ func TestEventsCommandNDJSON(t *testing.T) {
 	}
 }
 
+func TestEventsCommandDryRunHasNoOutputSideEffects(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(2100, 2), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+	path := filepath.Join(t.TempDir(), "records.ndjson")
+
+	stdout, stderr, err := run(t, "events", "--from", "2100", "--dry-run", "--output-file", path)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want no delivered records", stdout)
+	}
+	if !strings.Contains(stderr, "dry-run: match") {
+		t.Fatalf("stderr = %q, want dry-run diagnostics", stderr)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("output file exists or stat failed: %v", err)
+	}
+}
+
 func TestEventsCommandRawSkipsDecoding(t *testing.T) {
 	srv := fakerpc.NewServer(fakerpc.MakeEvents(3000, 2), fakerpc.WithPageLimit(10))
 	withFake(t, srv)

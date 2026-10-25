@@ -11,6 +11,7 @@ package cli
 import (
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -69,11 +70,24 @@ func closeClient(c rpc.Client, stderr io.Writer) {
 	}
 }
 
+// isTerminalWriter reports whether w is an interactive character device.
+// Status output must never leak into a redirected command pipeline.
+func isTerminalWriter(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
 // globalFlags holds options shared by every subcommand.
 type globalFlags struct {
-	serveSSE  string
-	serveWS   string
-	serveGRPC string
+	serveSSE         string
+	serveWS          string
+	serveGRPC        string
+	network          string
+	skipNetworkCheck bool
 	// color is one of "auto", "always" or "never", matching lens.
 	color string
 	// rpcURLs overrides the endpoints; empty falls back to the environment.
@@ -150,6 +164,11 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
 		"Soroban RPC endpoint; repeat for a failover pool (default $"+rpc.URLEnvVar+", else "+rpc.DefaultURL+")")
 	root.PersistentFlags().DurationVar(&g.timeout, "rpc-timeout", 30*time.Second,
 		"timeout for a single RPC call")
+	root.PersistentFlags().StringVar(&g.network, "network", "testnet",
+		"expected Stellar network: testnet, mainnet, futurenet, or standalone")
+	root.PersistentFlags().BoolVar(&g.skipNetworkCheck, "insecure-skip-network-check", false,
+		"skip RPC network passphrase validation")
+	registerFlagCompletion(root, "network", "testnet", "mainnet", "futurenet", "standalone")
 	registerFlagCompletion(root, "color", string(colorAuto), string(colorAlways), string(colorNever))
 
 	root.PersistentFlags().StringVar(&g.serveSSE, "serve-sse", "", "broadcast SSE at this listen address (/events); retains 1024 records for replay")

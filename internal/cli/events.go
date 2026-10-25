@@ -56,6 +56,8 @@ type streamFlags struct {
 	quiet      bool
 	verbosity  int
 	stats      bool
+	dryRun     bool
+	statsBar   bool
 	process    func([]stream.Record) ([]stream.Record, error)
 	filter     stream.RecordFilter
 
@@ -176,6 +178,10 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"suppress diagnostic output on stderr; only emit final exit code")
 	cmd.Flags().BoolVar(&s.stats, "stats", false,
 		"print a run summary on exit: records processed, duplicates dropped, retries and elapsed time")
+	cmd.Flags().BoolVar(&s.dryRun, "dry-run", false,
+		"validate filters and report matches without writing to configured sinks")
+	cmd.Flags().BoolVar(&s.statsBar, "stats-bar", false,
+		"show live ledger timing and ingest statistics on stderr (with --follow and a terminal stdout)")
 	cmd.Flags().StringVar(&s.output, "output-file", "",
 		"append records to this file instead of stdout")
 	cmd.Flags().Int64Var(&s.rotateSize, "rotate-size", 0,
@@ -287,6 +293,9 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.heartbeat > 0 && !s.follow {
 		return fmt.Errorf("--heartbeat requires --follow")
+	}
+	if s.statsBar && !s.follow {
+		return fmt.Errorf("--stats-bar requires --follow")
 	}
 	if err := s.validateState(cmd); err != nil {
 		return err
@@ -432,10 +441,14 @@ func (s *streamFlags) validateStateEncryption(cmd *cobra.Command) error {
 // underlying sink, so rotation still sees whole batches.
 func (s *streamFlags) newSink(
 	w io.Writer,
+	diagnostics io.Writer,
 	colorMode string,
 	onBatchError func(error),
 	onDeadLetter func(sink.DLQEntry),
 ) (stream.Sink, error) {
+	if s.dryRun {
+		return sink.NewDryRunSink(diagnostics), nil
+	}
 	build := func(out io.Writer) stream.Sink {
 		format := strings.ToLower(s.format)
 		if s.tsv {
@@ -533,6 +546,24 @@ type errorSink struct{ err error }
 
 func (s errorSink) Emit(stream.Record) error { return s.err }
 func (s errorSink) Flush() error             { return s.err }
+
+// dryRunFilter reports records rejected before they reach DryRunSink, making
+// filter validation observable without enabling any configured delivery sink.
+type dryRunFilter struct {
+	next        stream.RecordFilter
+	diagnostics io.Writer
+}
+
+func (f dryRunFilter) Match(record stream.Record) (bool, error) {
+	matched, err := f.next.Match(record)
+	if err != nil {
+		return false, err
+	}
+	if !matched {
+		_, _ = fmt.Fprintf(f.diagnostics, "dry-run: reject id=%s ledger=%d kind=%s\n", record.ID, record.Sequence, record.Kind)
+	}
+	return matched, nil
+}
 
 // closingSink gives a wrapper without its own Close a teardown path. It is how
 // a sink chain tells runStream that there is more to release than the outermost
@@ -907,6 +938,14 @@ func runStream(
 			err = cause
 		}
 	}()
+	if !g.skipNetworkCheck {
+		networkClient, ok := client.(rpc.NetworkClient)
+		if ok {
+			if err := rpc.ValidateNetwork(ctx, networkClient, g.network); err != nil {
+				return err
+			}
+		}
+	}
 
 	// Diagnostics come from more than one goroutine: the stream reports
 	// retries and gaps, and the background cursor pruner reports what it
@@ -950,7 +989,7 @@ func runStream(
 		}
 	}()
 
-	out, err := sf.newSink(stdout, g.color, func(err error) {
+	out, err := sf.newSink(stdout, stderr, g.color, func(err error) {
 		fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
 	}, func(entry sink.DLQEntry) {
 		record := "-"
@@ -962,6 +1001,9 @@ func runStream(
 	})
 	if err != nil {
 		return err
+	}
+	if sf.statsBar {
+		out = sink.NewStatusBar(out, stderr, sink.StatusBarOptions{Enabled: isTerminalWriter(stdout)})
 	}
 	if sf.sinks.metrics != nil {
 		if addr := sf.sinks.metrics.Addr(); addr != "" {
@@ -1057,6 +1099,9 @@ func runStream(
 	opts, err := sf.options(stderr, sf.quiet)
 	if err != nil {
 		return err
+	}
+	if sf.dryRun && opts.Filter != nil {
+		opts.Filter = dryRunFilter{next: opts.Filter, diagnostics: stderr}
 	}
 	opts.Process = sf.process
 
