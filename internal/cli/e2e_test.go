@@ -257,7 +257,7 @@ func runPrism(t *testing.T, args ...string) (stdout, stderr string) {
 	defer cancel()
 
 	var out, errBuf bytes.Buffer
-	root := newRootCmd(&out, &errBuf)
+	root, _ := newRootCmdWithProfiler(&out, &errBuf, nil)
 	root.SetArgs(args)
 	root.SetContext(ctx)
 	if err := root.Execute(); err != nil {
@@ -449,7 +449,7 @@ func TestE2EFollowStopsCleanlyOnCancel(t *testing.T) {
 	defer cancel()
 
 	var out, errBuf bytes.Buffer
-	root := newRootCmd(&out, &errBuf)
+	root, _ := newRootCmdWithProfiler(&out, &errBuf, nil)
 	root.SetArgs([]string{
 		"transactions",
 		"--rpc-url", rpcURL,
