@@ -247,6 +247,15 @@ func (c *SDKClient) GetLatestLedger(ctx context.Context) (protocol.GetLatestLedg
 	return resp, nil
 }
 
+// GetNetwork implements NetworkClient.
+func (c *SDKClient) GetNetwork(ctx context.Context) (protocol.GetNetworkResponse, error) {
+	resp, err := c.inner.GetNetwork(ctx)
+	if err != nil {
+		return resp, fmt.Errorf("rpc getNetwork: %w", err)
+	}
+	return resp, nil
+}
+
 // GetHealth implements HealthClient. It is intentionally not part of the
 // streaming Client interface; only the health command needs it.
 func (c *SDKClient) GetHealth(ctx context.Context) (protocol.GetHealthResponse, error) {
