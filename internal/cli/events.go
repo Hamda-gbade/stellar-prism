@@ -34,6 +34,7 @@ type streamFlags struct {
 	raw              bool
 	compact          bool
 	poll             time.Duration
+	heartbeat        time.Duration
 	pageSize         uint
 	retries          int
 	adaptive         bool
@@ -43,21 +44,22 @@ type streamFlags struct {
 	batchTimeout     time.Duration
 	gapStrategy      string
 	maxGapRecoveries int
-
-	// Broker output. When configured, records are published to the broker
-	// instead of written to stdout.
-	kafkaBrokers     []string
-	kafkaTopic       string
-	kafkaPartitionBy string
-	amqpURL          string
-	amqpQueue        string
-	amqpExchange     string
-	amqpRoutingKey   string
-
-	quiet     bool
-	verbosity int
-	process   func([]stream.Record) ([]stream.Record, error)
-	filter    stream.RecordFilter
+	// pgDSN enables durable cursors in PostgreSQL. Empty means off, subject
+	// to the environment default resolved in runStream.
+	pgDSN string
+	// pgCursorKey overrides the derived cursor row name.
+	pgCursorKey string
+	// derivedKey is computed by each command from its own query before
+	// runStream, because only the command knows which filters select records.
+	// See cursorKey.
+	derivedKey string
+	quiet      bool
+	verbosity  int
+	stats      bool
+	dryRun     bool
+	statsBar   bool
+	process    func([]stream.Record) ([]stream.Record, error)
+	filter     stream.RecordFilter
 
 	sinks sinkFlags
 
@@ -111,7 +113,8 @@ type streamFlags struct {
 
 	// dlqFile is the optional dead letter queue. When set, records that fail
 	// validation or delivery are written there instead of stopping the run.
-	dlqFile string
+	dlqFile          string
+	maxRecordRetries int
 
 	// stateKey identifies this stream inside the cursor metadata file. Two
 	// runs share a key only when they watch the same thing, so a recorded
@@ -126,6 +129,16 @@ type streamFlags struct {
 	// dedupWindow is the events-only re-poll de-duplicator window. Zero
 	// disables it.
 	dedupWindow int
+
+	// sampleRate is the fraction of events to keep (0.0 to 1.0). Zero disables sampling.
+	sampleRate float64
+	// maxRate is the maximum number of events per second to emit. Zero disables rate limiting.
+	maxRate float64
+
+	// excludeTopics are topic patterns to exclude (base64 ScVal or symbol string).
+	excludeTopics []string
+	// excludeContracts are contract IDs to exclude.
+	excludeContracts []string
 }
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
@@ -148,10 +161,16 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"print only the header line for each record, omitting decoded payloads")
 	cmd.Flags().DurationVar(&s.poll, "poll", stream.DefaultPollInterval,
 		"how long to wait between polls once caught up")
+	cmd.Flags().DurationVar(&s.heartbeat, "heartbeat", 0,
+		"print a line on stderr after this long waiting in silence (with --follow; 0 disables)")
 	cmd.Flags().UintVar(&s.pageSize, "page-size", defaultPage,
 		"how many records to request per RPC call")
 	cmd.Flags().IntVar(&s.retries, "max-retries", 0,
 		"give up after this many consecutive RPC failures (0 means never give up)")
+	cmd.Flags().StringVar(&s.pgDSN, "pg-dsn", "",
+		"PostgreSQL DSN for a durable cursor, so a restart resumes where this run stopped (default $"+envPGDSN+"; empty disables persistence)")
+	cmd.Flags().StringVar(&s.pgCursorKey, "pg-cursor-key", "",
+		"cursor row to save and resume under (default: <command>/<hash of --from and filters, so each distinct stream resumes itself)")
 	cmd.Flags().BoolVar(&s.adaptive, "adaptive", false,
 		"tune the wait between polls from how many new ledgers close each interval (with --follow)")
 	cmd.Flags().IntVar(&s.backfillWorkers, "backfill-workers", 1,
@@ -168,6 +187,12 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"limit how many times --gap-strategy resume may skip ahead (0 means no limit)")
 	cmd.Flags().BoolVar(&s.quiet, "quiet", false,
 		"suppress diagnostic output on stderr; only emit final exit code")
+	cmd.Flags().BoolVar(&s.stats, "stats", false,
+		"print a run summary on exit: records processed, duplicates dropped, retries and elapsed time")
+	cmd.Flags().BoolVar(&s.dryRun, "dry-run", false,
+		"validate filters and report matches without writing to configured sinks")
+	cmd.Flags().BoolVar(&s.statsBar, "stats-bar", false,
+		"show live ledger timing and ingest statistics on stderr (with --follow and a terminal stdout)")
 	cmd.Flags().StringVar(&s.output, "output-file", "",
 		"append records to this file instead of stdout")
 	cmd.Flags().Int64Var(&s.rotateSize, "rotate-size", 0,
@@ -214,21 +239,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"how long a shutdown may take to flush records and commit the final cursor")
 	cmd.Flags().StringVar(&s.dlqFile, "dlq-file", "",
 		"append malformed or undeliverable records to this file as NDJSON instead of stopping the stream")
-	cmd.Flags().StringSliceVar(&s.kafkaBrokers, "kafka-brokers", nil,
-		"Kafka broker addresses (comma-separated); requires --kafka-topic")
-	cmd.Flags().StringVar(&s.kafkaTopic, "kafka-topic", "",
-		"publish records as JSON to this Kafka topic instead of stdout; requires --kafka-brokers")
-	cmd.Flags().StringVar(&s.kafkaPartitionBy, "kafka-partition-by", string(sink.PartitionContract),
-		`Kafka message key: "contract" keeps one contract's records ordered on one partition, "tx" keys by transaction hash, "record" keys by record ID`)
-	cmd.Flags().StringVar(&s.amqpURL, "amqp-url", "",
-		"AMQP 0-9-1 broker URL, e.g. amqp://guest:guest@localhost:5672/; requires --amqp-queue")
-	cmd.Flags().StringVar(&s.amqpQueue, "amqp-queue", "",
-		"declare this durable queue and publish records to it instead of stdout; requires --amqp-url")
-	cmd.Flags().StringVar(&s.amqpExchange, "amqp-exchange", "",
-		"AMQP exchange to publish to (default: the default exchange, routing by queue name)")
-	cmd.Flags().StringVar(&s.amqpRoutingKey, "amqp-routing-key", "",
-		"AMQP routing key (default: the queue name)")
-	registerFlagCompletion(cmd, "kafka-partition-by", string(sink.PartitionContract), string(sink.PartitionTx), string(sink.PartitionRecord))
+	cmd.Flags().IntVar(&s.maxRecordRetries, "max-record-retries", 0,
+		"retry a failed record this many times before writing it to the dead-letter queue")
 	s.sinks.register(cmd)
 }
 
@@ -286,8 +298,29 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	if s.dlqFile != "" && s.output != "" && samePath(s.dlqFile, s.output) {
 		return fmt.Errorf("--dlq-file must differ from --output-file")
 	}
+	if s.maxRecordRetries < 0 {
+		return fmt.Errorf("--max-record-retries must not be negative")
+	}
+	if s.maxRecordRetries > 0 && s.dlqFile == "" {
+		return fmt.Errorf("--max-record-retries requires --dlq-file")
+	}
 	if s.dedupWindow < 0 {
 		return fmt.Errorf("--dedup-window must not be negative")
+	}
+	if s.sampleRate < 0 || s.sampleRate > 1 {
+		return fmt.Errorf("--sample-rate must be between 0.0 and 1.0")
+	}
+	if s.maxRate < 0 {
+		return fmt.Errorf("--max-rate must not be negative")
+	}
+	if s.heartbeat < 0 {
+		return fmt.Errorf("--heartbeat must not be negative")
+	}
+	if s.heartbeat > 0 && !s.follow {
+		return fmt.Errorf("--heartbeat requires --follow")
+	}
+	if s.statsBar && !s.follow {
+		return fmt.Errorf("--stats-bar requires --follow")
 	}
 	if err := s.validateState(cmd); err != nil {
 		return err
@@ -433,10 +466,14 @@ func (s *streamFlags) validateStateEncryption(cmd *cobra.Command) error {
 // underlying sink, so rotation still sees whole batches.
 func (s *streamFlags) newSink(
 	w io.Writer,
+	diagnostics io.Writer,
 	colorMode string,
 	onBatchError func(error),
 	onDeadLetter func(sink.DLQEntry),
 ) (stream.Sink, error) {
+	if s.dryRun {
+		return sink.NewDryRunSink(diagnostics), nil
+	}
 	build := func(out io.Writer) stream.Sink {
 		format := strings.ToLower(s.format)
 		if s.tsv {
@@ -504,8 +541,9 @@ func (s *streamFlags) newSink(
 		}
 
 		dlq, err = sink.NewDLQ(out, file, sink.DLQOptions{
-			CloseWriter:  true,
-			OnDeadLetter: onDeadLetter,
+			MaxRecordRetries: s.maxRecordRetries,
+			CloseWriter:      true,
+			OnDeadLetter:     onDeadLetter,
 		})
 		if err != nil {
 			_ = file.Close()
@@ -558,6 +596,24 @@ type errorSink struct{ err error }
 
 func (s errorSink) Emit(stream.Record) error { return s.err }
 func (s errorSink) Flush() error             { return s.err }
+
+// dryRunFilter reports records rejected before they reach DryRunSink, making
+// filter validation observable without enabling any configured delivery sink.
+type dryRunFilter struct {
+	next        stream.RecordFilter
+	diagnostics io.Writer
+}
+
+func (f dryRunFilter) Match(record stream.Record) (bool, error) {
+	matched, err := f.next.Match(record)
+	if err != nil {
+		return false, err
+	}
+	if !matched {
+		_, _ = fmt.Fprintf(f.diagnostics, "dry-run: reject id=%s ledger=%d kind=%s\n", record.ID, record.Sequence, record.Kind)
+	}
+	return matched, nil
+}
 
 // closingSink gives a wrapper without its own Close a teardown path. It is how
 // a sink chain tells runStream that there is more to release than the outermost
@@ -695,6 +751,9 @@ Events are retained by RPC for roughly 24 hours, so --from cannot reach
 further back than that. If the stream ever falls behind that window, prism
 reports the missed ledger range and exits 2 rather than skipping silently.
 
+With --pg-dsn the position is committed to PostgreSQL after every record, so
+an interrupted run resumes where it stopped instead of starting over.
+
 With --state-file the position reached is recorded after every page, and a
 background pruner keeps that file from growing without bound. Add --resume to
 start the next run where the last one stopped.`,
@@ -714,7 +773,13 @@ start the next run where the last one stopped.`,
   prism events --contracts-file /etc/prism/watchlist.txt --topic-regex '0:^transfer.*,1:.*' --follow
 
   # Backfill from a ledger then keep following
-  prism events --from 1234567 --follow`,
+  prism events --from 1234567 --follow
+
+  # Resume across restarts with a durable cursor in PostgreSQL
+  prism events --contract CBGSB... --follow --pg-dsn "$PRISM_PG_DSN"
+
+  # Durable cursor: resume where the previous run stopped
+  prism events --contract CBGSB... --follow --state-file ./prism.state.json`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := sf.validate(cmd); err != nil {
@@ -781,8 +846,36 @@ start the next run where the last one stopped.`,
 				if watchlist != nil {
 					query.Watchlist = watchlist
 				}
-				return stream.NewEventSource(client, query)
+				var src stream.Source
+				src, err := stream.NewEventSource(client, query)
+				if err != nil {
+					return nil, err
+				}
+				if sf.sampleRate > 0 || sf.maxRate > 0 {
+					src = stream.NewSampleFilter(src, sf.sampleRate, sf.maxRate)
+				}
+				if len(sf.excludeTopics) > 0 || len(sf.excludeContracts) > 0 {
+					src, err = stream.NewExcludeFilter(src, sf.excludeTopics, sf.excludeContracts)
+					if err != nil {
+						return nil, err
+					}
+				}
+				return src, nil
 			}
+
+			// The key names this exact query: same filters, same stream, and
+			// therefore the same durable position on a later run.
+			parts := []string{fromKeyPart(sf.from)}
+			for _, c := range contractIDs {
+				parts = append(parts, "contract="+c)
+			}
+			for _, topic := range topics {
+				parts = append(parts, "topic="+topic)
+			}
+			for _, et := range eventTypes {
+				parts = append(parts, "type="+et)
+			}
+			sf.derivedKey = cursorKey(cmd.Name(), parts...)
 
 			return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)
 		},
@@ -804,10 +897,18 @@ start the next run where the last one stopped.`,
 	// within one filter, which StringSlice's comma-splitting would destroy.
 	cmd.Flags().StringArrayVar(&sf.topicPatterns, "topic-pattern", nil,
 		`client-side topic pattern as comma-separated segments over decoded topics: "*", "**", "prefix:TEXT", "re:REGEX", or plain text with "*" and "?" globs; repeatable, up to 5`)
+	cmd.Flags().StringArrayVar(&sf.excludeTopics, "exclude-topic", nil,
+		"topic to exclude: base64 ScVal or symbol string (e.g., 'transfer'); repeatable")
+	cmd.Flags().StringSliceVar(&sf.excludeContracts, "exclude-contract", nil,
+		"contract ID to exclude; repeatable")
 	cmd.Flags().StringVar(&sf.fanoutDir, "fanout-dir", "",
 		"write each watched contract's events to its own NDJSON file in this directory, in addition to the main output")
 	cmd.Flags().IntVar(&sf.dedupWindow, "dedup-window", 0,
 		"drop re-polled duplicate events, remembering this many recent fingerprints (0 disables; 4096 covers a page with margin)")
+	cmd.Flags().Float64Var(&sf.sampleRate, "sample-rate", 0,
+		"fraction of matching events to emit deterministically (0.0 to 1.0; 0 disables)")
+	cmd.Flags().Float64Var(&sf.maxRate, "max-rate", 0,
+		"maximum events per second to emit (0 disables)")
 	sf.register(cmd, stream.DefaultPageLimit)
 	registerFlagCompletion(cmd, "type", "contract", "system", "diagnostic")
 	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
@@ -827,6 +928,9 @@ func newLedgersCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 
 Ledger metadata is large, so --compact is often what you want when watching
 for liveness rather than reading contents.
+
+With --pg-dsn the position is committed to PostgreSQL as the stream advances,
+so an interrupted run resumes where it stopped.
 
 With --state-file the position reached is recorded after every page, and a
 background pruner keeps that file from growing without bound. Add --resume to
@@ -861,6 +965,7 @@ start the next run where the last one stopped.`,
 					ExpectedValidators: expected,
 				}), nil
 			}
+			sf.derivedKey = cursorKey(cmd.Name(), fromKeyPart(sf.from))
 			return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)
 		},
 	}
@@ -905,12 +1010,40 @@ func runStream(
 			err = cause
 		}
 	}()
+	if !g.skipNetworkCheck {
+		networkClient, ok := client.(rpc.NetworkClient)
+		if ok {
+			if err := rpc.ValidateNetwork(ctx, networkClient, g.network); err != nil {
+				return err
+			}
+		}
+	}
 
 	// Diagnostics come from more than one goroutine: the stream reports
 	// retries and gaps, and the background cursor pruner reports what it
 	// compacted. The writer is serialised so those lines cannot interleave
 	// and so a test's stderr buffer cannot race.
 	stderr = newSyncWriter(stderr)
+
+	// --stats reports what the run did as the command exits. The reporter
+	// holds no goroutine and no timer: the phases feed it as they finish,
+	// and this deferred call — registered before every teardown below, so
+	// it runs last — prints the line after the drain, the cursor commit
+	// and the sink close. It prints nothing when the flag was not passed,
+	// or when the run failed before it started fetching.
+	var dedupOut *stream.DedupSink
+	// drainAbandoned records that the drain overran --drain-timeout and was
+	// left to its goroutine. The deferred report then skips the dedup sink
+	// — that goroutine may still be emitting through it — because the body
+	// already folded a snapshot taken before the goroutine started.
+	drainAbandoned := false
+	summary := newRunStats(sf.stats)
+	defer func() {
+		if !drainAbandoned {
+			summary.addDuplicates(dedupDropped(dedupOut))
+		}
+		summary.report(stderr)
+	}()
 
 	// Ctrl-C ends the stream cleanly rather than killing it mid-record, so a
 	// partially written line never reaches a downstream consumer. The signal
@@ -928,7 +1061,7 @@ func runStream(
 		}
 	}()
 
-	out, err := sf.newSink(stdout, g.color, func(err error) {
+	out, err := sf.newSink(stdout, stderr, g.color, func(err error) {
 		fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
 	}, func(entry sink.DLQEntry) {
 		record := "-"
@@ -940,6 +1073,9 @@ func runStream(
 	})
 	if err != nil {
 		return err
+	}
+	if sf.statsBar {
+		out = sink.NewStatusBar(out, stderr, sink.StatusBarOptions{Enabled: isTerminalWriter(stdout)})
 	}
 	if sf.sinks.metrics != nil {
 		if addr := sf.sinks.metrics.Addr(); addr != "" {
@@ -982,7 +1118,8 @@ func runStream(
 	// a re-polled event is suppressed for every sink downstream — including
 	// a fanout directory — without any of them knowing about it.
 	if sf.dedupWindow > 0 {
-		out = stream.NewDedupSink(out, sf.dedupWindow)
+		dedupOut = stream.NewDedupSink(out, sf.dedupWindow)
+		out = dedupOut
 	}
 
 	if len(sf.topicPatterns) > 0 {
@@ -1034,6 +1171,9 @@ func runStream(
 	opts, err := sf.options(stderr, sf.quiet)
 	if err != nil {
 		return err
+	}
+	if sf.dryRun && opts.Filter != nil {
+		opts.Filter = dryRunFilter{next: opts.Filter, diagnostics: stderr}
 	}
 	opts.Process = sf.process
 
@@ -1109,6 +1249,30 @@ func runStream(
 		from = since
 	}
 
+	// Durable persistence is opt-in: only a DSN (flag or environment) opens
+	// anything, and without one no connection is ever attempted.
+	key := sf.derivedKey
+	if sf.pgCursorKey != "" {
+		key = sf.pgCursorKey
+	}
+	dsn := sf.pgDSN
+	if dsn == "" {
+		dsn = os.Getenv(envPGDSN)
+	}
+	store, closeStore, err := openCursorStore(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	if closeStore != nil {
+		defer func() {
+			if closeErr := closeStore(); closeErr != nil {
+				fmt.Fprintf(stderr, "prism: closing the PostgreSQL cursor store: %v\n", closeErr)
+			}
+		}()
+	}
+	opts.Store = store
+	opts.StoreKey = key
+
 	if state != nil {
 		// An explicit --from or --since wins over a recorded cursor: the
 		// operator asked for a position, so it is the position that counts.
@@ -1120,17 +1284,42 @@ func runStream(
 				fmt.Fprintf(stderr, "prism: recording cursor metadata: %v\n", recordErr)
 			}
 		}
+	} else if sf.stateFile != "" {
+		file, err := stream.OpenStateFile(sf.stateFile)
+		if err != nil {
+			return err
+		}
+		if sf.from != 0 {
+			saved, loadErr := file.Load()
+			if loadErr != nil {
+				return loadErr
+			}
+			if saved.Source == cmd.Name() && saved.PagingToken != "" {
+				fmt.Fprintf(stderr,
+					"prism: resuming the %s stream from %s (ledger %d); ignoring --from\n",
+					cmd.Name(), file.Path(), saved.Ledger)
+			}
+		}
+		opts.State = file
 	}
 
 	startFrom := from
 	if startFrom == 0 && opts.StartCursor == "" {
-		// Starting "now" means asking the server where now is; the
-		// RPC requires a concrete start ledger.
-		latest, err := latestLedger(ctx, client)
-		if err != nil {
-			return err
+		if opts.State != nil {
+			saved, err := opts.State.Load()
+			if err == nil && saved.PagingToken != "" && saved.Ledger != 0 {
+				startFrom = saved.Ledger
+			}
 		}
-		startFrom = latest
+		if startFrom == 0 {
+			// Starting "now" means asking the server where now is; the
+			// RPC requires a concrete start ledger.
+			latest, err := latestLedger(ctx, client)
+			if err != nil {
+				return err
+			}
+			startFrom = latest
+		}
 	}
 
 	if from > 0 && sf.backfillWorkers > 1 {
@@ -1154,9 +1343,11 @@ func runStream(
 			return err
 		}
 
+		summary.start()
 		stats, err := drainer.Run(ctx)
+		summary.add(stats)
 		if err != nil {
-			return reportStreamError(err, stderr)
+			return reportStreamError(err, stderr, store, key)
 		}
 		if sf.limit > 0 {
 			remaining := sf.limit - stats.Emitted
@@ -1180,13 +1371,51 @@ func runStream(
 	if err != nil {
 		return err
 	}
+
+	// --heartbeat prints a line on stderr whenever the follow loop waits
+	// an interval without delivering a record, so a quiet contract is
+	// distinguishable from a hung process. The beat is driven by slicing
+	// the tailer's own waits and by marking delivered pages, so it runs
+	// on the tailer's goroutine and holds nothing to clean up. The
+	// backfill above keeps the plain clock: its waits are fetch retries,
+	// not idle follow intervals.
+	if beat := newHeartbeat(sf.heartbeat, stderr); beat != nil {
+		clock := opts.Clock
+		if clock == nil {
+			clock = stream.RealClock{}
+		}
+		opts.Clock = &heartbeatClock{clock: clock, beat: beat}
+		onPage := opts.OnPage
+		opts.OnPage = func(page stream.Page) {
+			beat.mark()
+			if onPage != nil {
+				onPage(page)
+			}
+		}
+	}
+
 	tailer := stream.NewTailer(src, out, opts)
+	summary.start()
 	runErr := tailer.Run(ctx)
 
 	// The stream has stopped fetching, either because it finished or
 	// because it was interrupted. Everything it is still holding is
 	// flushed now, within the drain timeout, so the final cursor is
 	// committed before the process goes away.
+	//
+	// The counters are snapshotted before the drain is started: a drain
+	// that overruns the timeout is abandoned to its goroutine, which may
+	// still be emitting while the summary prints, so afterwards only a
+	// drain that completed — joined by runWithTimeout's receive — is read
+	// afresh.
+	stats := tailer.Stats()
+	dropped := dedupDropped(dedupOut)
+	// Capture sampling and rate limiting stats from the SampleFilter if present.
+	var sampled, rateLimited int
+	if filterSrc, ok := src.(*stream.SampleFilter); ok {
+		sampled = filterSrc.Sampled()
+		rateLimited = filterSrc.RateLimited()
+	}
 	drainErr := runWithTimeout(sf.drainTimeout, func() error {
 		var errs []error
 		if err := tailer.Drain(context.WithoutCancel(ctx), sf.drainTimeout); err != nil {
@@ -1206,16 +1435,37 @@ func runStream(
 			runErr = drainErr
 		}
 	}
-	return reportStreamError(runErr, stderr)
+	if errors.Is(drainErr, errTimedOut) {
+		// Abandoned mid-drain: report the pre-drain snapshot rather
+		// than reading state the abandoned goroutine still owns, and
+		// let the deferred report skip the dedup sink for the same
+		// reason.
+		drainAbandoned = true
+		summary.add(stats)
+		summary.addDuplicates(dropped)
+	} else {
+		summary.add(tailer.Stats())
+	}
+	// Add sampled and rate limited counts to summary
+	if sampled > 0 || rateLimited > 0 {
+		summary.addSampled(sampled)
+		summary.addRateLimited(rateLimited)
+	}
+	return reportStreamError(runErr, stderr, store, key)
 }
 
-func reportStreamError(err error, stderr io.Writer) error {
+func reportStreamError(err error, stderr io.Writer, store stream.CursorStore, key string) error {
 	var gap *stream.GapError
 	if errors.As(err, &gap) {
 		fmt.Fprintf(stderr, "prism: %v\n", gap)
 		fmt.Fprintf(stderr,
 			"prism: restart with --from %d to resume from the oldest data the server still has\n",
 			gap.Oldest)
+		if store != nil {
+			fmt.Fprintf(stderr,
+				"prism: that starts a fresh stream with a new cursor row; the stale row for %q can be deleted\n",
+				key)
+		}
 		return &ExitCodeError{Code: 2, Message: gap.Error()}
 	}
 	return err
