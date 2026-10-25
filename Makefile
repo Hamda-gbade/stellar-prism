@@ -7,6 +7,11 @@ test:
 test-e2e:
 	PRISM_E2E=1 go test -tags e2e -race -count=1 ./internal/cli -run TestE2E -v
 
+# Run the streaming benchmark suite. Each iteration processes 50,000 events
+# through a fixed offline corpus; see docs/architecture.md for the metrics.
+bench:
+	go test -run '^$' -bench 'FiftyThousandEvents' -benchmem ./pkg/stream
+
 lint:
 	golangci-lint run
 
