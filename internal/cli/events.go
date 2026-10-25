@@ -113,7 +113,8 @@ type streamFlags struct {
 
 	// dlqFile is the optional dead letter queue. When set, records that fail
 	// validation or delivery are written there instead of stopping the run.
-	dlqFile string
+	dlqFile          string
+	maxRecordRetries int
 
 	// stateKey identifies this stream inside the cursor metadata file. Two
 	// runs share a key only when they watch the same thing, so a recorded
@@ -228,6 +229,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"how long a shutdown may take to flush records and commit the final cursor")
 	cmd.Flags().StringVar(&s.dlqFile, "dlq-file", "",
 		"append malformed or undeliverable records to this file as NDJSON instead of stopping the stream")
+	cmd.Flags().IntVar(&s.maxRecordRetries, "max-record-retries", 0,
+		"retry a failed record this many times before writing it to the dead-letter queue")
 	s.sinks.register(cmd)
 }
 
@@ -284,6 +287,12 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.dlqFile != "" && s.output != "" && samePath(s.dlqFile, s.output) {
 		return fmt.Errorf("--dlq-file must differ from --output-file")
+	}
+	if s.maxRecordRetries < 0 {
+		return fmt.Errorf("--max-record-retries must not be negative")
+	}
+	if s.maxRecordRetries > 0 && s.dlqFile == "" {
+		return fmt.Errorf("--max-record-retries requires --dlq-file")
 	}
 	if s.dedupWindow < 0 {
 		return fmt.Errorf("--dedup-window must not be negative")
@@ -503,8 +512,9 @@ func (s *streamFlags) newSink(
 		}
 
 		dlq, err = sink.NewDLQ(out, file, sink.DLQOptions{
-			CloseWriter:  true,
-			OnDeadLetter: onDeadLetter,
+			MaxRecordRetries: s.maxRecordRetries,
+			CloseWriter:      true,
+			OnDeadLetter:     onDeadLetter,
 		})
 		if err != nil {
 			_ = file.Close()
