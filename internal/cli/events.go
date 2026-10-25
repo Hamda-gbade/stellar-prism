@@ -128,6 +128,16 @@ type streamFlags struct {
 	// dedupWindow is the events-only re-poll de-duplicator window. Zero
 	// disables it.
 	dedupWindow int
+
+	// sampleRate is the fraction of events to keep (0.0 to 1.0). Zero disables sampling.
+	sampleRate float64
+	// maxRate is the maximum number of events per second to emit. Zero disables rate limiting.
+	maxRate float64
+
+	// excludeTopics are topic patterns to exclude (base64 ScVal or symbol string).
+	excludeTopics []string
+	// excludeContracts are contract IDs to exclude.
+	excludeContracts []string
 }
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
@@ -287,6 +297,12 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.dedupWindow < 0 {
 		return fmt.Errorf("--dedup-window must not be negative")
+	}
+	if s.sampleRate < 0 || s.sampleRate > 1 {
+		return fmt.Errorf("--sample-rate must be between 0.0 and 1.0")
+	}
+	if s.maxRate < 0 {
+		return fmt.Errorf("--max-rate must not be negative")
 	}
 	if s.heartbeat < 0 {
 		return fmt.Errorf("--heartbeat must not be negative")
@@ -796,7 +812,21 @@ start the next run where the last one stopped.`,
 				if watchlist != nil {
 					query.Watchlist = watchlist
 				}
-				return stream.NewEventSource(client, query)
+				var src stream.Source
+				src, err := stream.NewEventSource(client, query)
+				if err != nil {
+					return nil, err
+				}
+				if sf.sampleRate > 0 || sf.maxRate > 0 {
+					src = stream.NewSampleFilter(src, sf.sampleRate, sf.maxRate)
+				}
+				if len(sf.excludeTopics) > 0 || len(sf.excludeContracts) > 0 {
+					src, err = stream.NewExcludeFilter(src, sf.excludeTopics, sf.excludeContracts)
+					if err != nil {
+						return nil, err
+					}
+				}
+				return src, nil
 			}
 
 			// The key names this exact query: same filters, same stream, and
@@ -833,10 +863,18 @@ start the next run where the last one stopped.`,
 	// within one filter, which StringSlice's comma-splitting would destroy.
 	cmd.Flags().StringArrayVar(&sf.topicPatterns, "topic-pattern", nil,
 		`client-side topic pattern as comma-separated segments over decoded topics: "*", "**", "prefix:TEXT", "re:REGEX", or plain text with "*" and "?" globs; repeatable, up to 5`)
+	cmd.Flags().StringArrayVar(&sf.excludeTopics, "exclude-topic", nil,
+		"topic to exclude: base64 ScVal or symbol string (e.g., 'transfer'); repeatable")
+	cmd.Flags().StringSliceVar(&sf.excludeContracts, "exclude-contract", nil,
+		"contract ID to exclude; repeatable")
 	cmd.Flags().StringVar(&sf.fanoutDir, "fanout-dir", "",
 		"write each watched contract's events to its own NDJSON file in this directory, in addition to the main output")
 	cmd.Flags().IntVar(&sf.dedupWindow, "dedup-window", 0,
 		"drop re-polled duplicate events, remembering this many recent fingerprints (0 disables; 4096 covers a page with margin)")
+	cmd.Flags().Float64Var(&sf.sampleRate, "sample-rate", 0,
+		"fraction of matching events to emit deterministically (0.0 to 1.0; 0 disables)")
+	cmd.Flags().Float64Var(&sf.maxRate, "max-rate", 0,
+		"maximum events per second to emit (0 disables)")
 	sf.register(cmd, stream.DefaultPageLimit)
 	registerFlagCompletion(cmd, "type", "contract", "system", "diagnostic")
 	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
@@ -1338,6 +1376,12 @@ func runStream(
 	// afresh.
 	stats := tailer.Stats()
 	dropped := dedupDropped(dedupOut)
+	// Capture sampling and rate limiting stats from the SampleFilter if present.
+	var sampled, rateLimited int
+	if filterSrc, ok := src.(*stream.SampleFilter); ok {
+		sampled = filterSrc.Sampled()
+		rateLimited = filterSrc.RateLimited()
+	}
 	drainErr := runWithTimeout(sf.drainTimeout, func() error {
 		var errs []error
 		if err := tailer.Drain(context.WithoutCancel(ctx), sf.drainTimeout); err != nil {
@@ -1367,6 +1411,11 @@ func runStream(
 		summary.addDuplicates(dropped)
 	} else {
 		summary.add(tailer.Stats())
+	}
+	// Add sampled and rate limited counts to summary
+	if sampled > 0 || rateLimited > 0 {
+		summary.addSampled(sampled)
+		summary.addRateLimited(rateLimited)
 	}
 	return reportStreamError(runErr, stderr, store, key)
 }

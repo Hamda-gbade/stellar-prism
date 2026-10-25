@@ -31,6 +31,10 @@ type Stats struct {
 	Gaps int
 	// Recovered counts gaps the stream skipped past under GapResume.
 	Recovered int
+	// Sampled counts records dropped by deterministic sampling.
+	Sampled int
+	// RateLimited counts records dropped by the token bucket rate limiter.
+	RateLimited int
 }
 
 // Page describes the progress of one page that was emitted in full.
