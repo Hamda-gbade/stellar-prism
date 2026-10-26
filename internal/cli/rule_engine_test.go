@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/stellar-optics/stellar-prism/pkg/stream"
 	"github.com/stellar/go-stellar-sdk/xdr"
+
+	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
 func TestNewRuleEngine(t *testing.T) {
