@@ -6,6 +6,11 @@
 //
 // Flag names deliberately mirror stellar-xdr-lens where the concept is
 // shared (--json, --color), so the two tools feel like one family.
+//
+// Configuration is resolved through Viper: ~/.config/prism/config.yaml,
+// .prism.yaml in the current directory, environment variables prefixed with
+// PRISM_, and then explicit CLI flags. See config.go for the resolution
+// order and the tests for the acceptance criteria.
 package cli
 
 import (
@@ -80,6 +85,10 @@ type globalFlags struct {
 	rpcURLs []string
 	// timeout bounds a single RPC call.
 	timeout time.Duration
+	// configFile is an explicit path to a prism config file. When empty,
+	// Viper searches ~/.config/prism/config.yaml and then .prism.yaml in the
+	// current directory.
+	configFile string
 }
 
 // Execute builds and runs the root command, returning an error rather than
@@ -148,6 +157,7 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
 	root.PersistentFlags().StringVar(&g.serveSSE, "serve-sse", "", "broadcast SSE at this listen address (/events); retains 1024 records for replay")
 	root.PersistentFlags().StringVar(&g.serveSSE, "sse", "", "alias for --serve-sse")
 	root.PersistentFlags().StringVar(&g.serveWS, "ws", "", "broadcast WebSocket events at this listen address (/events or /ws)")
+	root.PersistentFlags().StringVar(&g.configFile, "config", "", "explicit config file to load (default: ~/.config/prism/config.yaml then .prism.yaml in cwd)")
 	root.AddCommand(
 		newServeCmd(g, stdout, stderr),
 		newEventsCmd(g, stdout, stderr),

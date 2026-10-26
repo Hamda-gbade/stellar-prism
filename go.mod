@@ -8,6 +8,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/nats-io/nats.go v1.47.0
 	github.com/spf13/cobra v1.10.2
+	github.com/spf13/viper v1.20.1
 	github.com/stellar-optics/stellar-xdr-lens v0.2.0
 	github.com/stellar/go-stellar-sdk v0.7.3
 )
