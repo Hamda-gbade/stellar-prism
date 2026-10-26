@@ -12,11 +12,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/viper"
 
 	"github.com/stellar-optics/stellar-prism/pkg/rpc"
-	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
 // A Config is the resolved prism configuration for one invocation. It is the
@@ -46,7 +46,7 @@ type Config struct {
 	RPCURLs []string
 
 	// Timeout is the per-call RPC timeout.
-	Timeout stream.Timeout
+	Timeout time.Duration
 
 	// Color is one of "auto", "always" or "never".
 	Color string
@@ -203,7 +203,7 @@ func splitNoEmpty(s string, seps ...string) []string {
 // restarting, and it is the one place where a change to an on-disk file is
 // observed, so it returns any read error rather than swallowing it.
 func (c *Config) ReloadConfig() error {
-	return c.Viper.ReloadConfig()
+	return c.Viper.ReadInConfig()
 }
 
 // IsConfigured reports whether a config file was actually loaded for this

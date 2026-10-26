@@ -86,7 +86,7 @@ func TestResolveConfigBadFileIsAnError(t *testing.T) {
 
 	c := NewConfig()
 	c.SetConfigFile(path)
-	_, err = c.ResolveConfig()
+	_, err := c.ResolveConfig()
 	if err == nil {
 		t.Fatal("expected error for malformed YAML, got nil")
 	}
@@ -125,7 +125,7 @@ func TestResolveConfigEnvOverridesFile(t *testing.T) {
 
 	c := NewConfig()
 	c.SetConfigFile(path)
-	if err := c.ResolveConfig(); err != nil {
+	if _, err := c.ResolveConfig(); err != nil {
 		t.Fatal(err)
 	}
 	c.Viper.Set("rpc-url", "https://env.invalid")
@@ -156,7 +156,7 @@ func TestRPCURLsFromConfigPrefersEnv(t *testing.T) {
 
 	c := NewConfig()
 	c.SetConfigFile(path)
-	if err := c.ResolveConfig(); err != nil {
+	if _, err := c.ResolveConfig(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -176,7 +176,7 @@ func TestRPCURLsFromConfigUsesFileWhenNothingElse(t *testing.T) {
 
 	c := NewConfig()
 	c.SetConfigFile(path)
-	if err := c.ResolveConfig(); err != nil {
+	if _, err := c.ResolveConfig(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -195,7 +195,7 @@ func TestRPCURLsFromConfigFallsBackToFileKey(t *testing.T) {
 
 	c := NewConfig()
 	c.SetConfigFile(path)
-	if err := c.ResolveConfig(); err != nil {
+	if _, err := c.ResolveConfig(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -208,7 +208,7 @@ func TestRPCURLsFromConfigFallsBackToFileKey(t *testing.T) {
 func TestRPCURLsFromConfigReturnsNilWhenEmpty(t *testing.T) {
 	c := NewConfig()
 	c.Viper.SetConfigFile(filepath.Join(t.TempDir(), "absent.yaml"))
-	if err := c.ResolveConfig(); err != nil {
+	if _, err := c.ResolveConfig(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -282,7 +282,7 @@ func TestReloadConfigRefreshesFile(t *testing.T) {
 
 	c := NewConfig()
 	c.SetConfigFile(path)
-	if err := c.ResolveConfig(); err != nil {
+	if _, err := c.ResolveConfig(); err != nil {
 		t.Fatal(err)
 	}
 	if c.Viper.GetString("rpc-url") != "first.invalid" {
