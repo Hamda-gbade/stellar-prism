@@ -253,8 +253,8 @@ func TestHostConfigDirFallsBack(t *testing.T) {
 	if got == "" {
 		t.Fatal("DefaultConfigFile returned empty string")
 	}
-	if filepath.Ext(got) != "" {
-		t.Fatal("DefaultConfigFile should end in the filename, not a directory with an extension baked into the path")
+	if filepath.Ext(got) != ".yaml" {
+		t.Fatalf("DefaultConfigFile should end in .yaml, got %q", got)
 	}
 }
 

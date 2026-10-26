@@ -18,8 +18,6 @@ import (
 // explicit file > cwd .prism.yaml > home config > environment > defaults,
 // and that each layer only fills in values that were not otherwise supplied.
 func TestConfigResolutionOrder(t *testing.T) {
-	t.Parallel()
-
 	tmp := t.TempDir()
 
 	// Step 1: a home config under ~/.config/prism/config.yaml is the first
@@ -36,6 +34,9 @@ func TestConfigResolutionOrder(t *testing.T) {
 	// Step 2: a local .prism.yaml in the current working directory should win
 	// over the home config when both exist.
 	cwd := filepath.Join(tmp, "cwd")
+	if err := os.MkdirAll(cwd, 0755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(cwd, ".prism.yaml"), []byte("rpc-url: https://cwd.invalid\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +47,6 @@ func TestConfigResolutionOrder(t *testing.T) {
 
 	cfg := NewConfig()
 	cfg.SetConfigFile(homeConfig)
-	cfg.Viper.Set("rpc-url", "") // clear any cached binding for a clean test
 	if _, err := cfg.ResolveConfig(); err != nil {
 		t.Fatalf("ResolveConfig: %v", err)
 	}
@@ -77,8 +77,6 @@ func TestConfigResolutionOrder(t *testing.T) {
 // config file is present. That is the offline-first baseline: no file, no
 // panic, no network call.
 func TestConfigMissingFileStillWorks(t *testing.T) {
-	t.Parallel()
-
 	tmp := t.TempDir()
 	t.Chdir(tmp)
 	defer t.Chdir(t.TempDir())
@@ -185,7 +183,6 @@ func TestConfigRPCURLsPrecedence(t *testing.T) {
 		{"flag wins", []string{"https://flag.invalid"}, nil, []string{"https://flag.invalid"}},
 		{"env wins over file", nil, []string{"https://env.invalid"}, []string{"https://env.invalid"}},
 		{"file wins over nothing", nil, nil, []string{"https://file.invalid"}},
-		{"nothing returns nil", nil, nil, nil}, // when there is no file, but here the file exists, so this case is only illustrative; we keep it to assert the function shape
 	}
 
 	for _, tc := range tests {

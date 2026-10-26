@@ -9,6 +9,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -40,6 +41,7 @@ import (
 type Config struct {
 	ConfigFile string
 	Viper      *viper.Viper
+	configured bool
 
 	// RPCURLs is the resolved list of Soroban RPC endpoints, in priority order.
 	// When nothing is configured it falls back to rpc.DefaultURL.
@@ -101,7 +103,6 @@ func NewConfig() *Config {
 // the normal behavior for an explicit --config flag.
 func (c *Config) SetConfigFile(path string) {
 	c.ConfigFile = path
-	c.Viper.SetConfigFile(path)
 }
 
 // ResolveConfig reads configuration from the registered sources and returns
@@ -114,18 +115,23 @@ func (c *Config) SetConfigFile(path string) {
 // parse failures (wrong YAML, wrong permissions) are returned as errors so a
 // misconfigured machine fails loudly rather than silently ignoring the file.
 func (c *Config) ResolveConfig() (*Config, error) {
+	if c.ConfigFile != "" {
+		c.Viper.SetConfigFile(c.ConfigFile)
+	}
+	configured := false
 	if err := c.Viper.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+		var fnf viper.ConfigFileNotFoundError
+		if errors.As(err, &fnf) || os.IsNotExist(err) {
 			// No file found yet; that is fine, defaults and env remain.
 		} else {
 			return nil, fmt.Errorf("reading prism config: %w", err)
 		}
+	} else {
+		configured = true
 	}
 
-	return &Config{
-		ConfigFile: c.ConfigFile,
-		Viper:      c.Viper,
-	}, nil
+	c.configured = configured
+	return c, nil
 }
 
 // RPCURLsFromConfig returns the RPC endpoints resolved from configuration,
@@ -203,14 +209,21 @@ func splitNoEmpty(s string, seps ...string) []string {
 // restarting, and it is the one place where a change to an on-disk file is
 // observed, so it returns any read error rather than swallowing it.
 func (c *Config) ReloadConfig() error {
-	return c.Viper.ReadInConfig()
+	if c.ConfigFile != "" {
+		c.Viper.SetConfigFile(c.ConfigFile)
+	}
+	err := c.Viper.ReadInConfig()
+	if err == nil {
+		c.configured = true
+	}
+	return err
 }
 
 // IsConfigured reports whether a config file was actually loaded for this
 // invocation. It is useful for diagnostics and for tests that want to assert
 // the precedence behavior.
 func (c *Config) IsConfigured() bool {
-	return c.Viper.ConfigFileUsed() != ""
+	return c.configured
 }
 
 // Cleanup runs any cleanup the config layer owns. Viper itself owns nothing
