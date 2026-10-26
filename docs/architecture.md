@@ -56,6 +56,8 @@ cmd/prism/            main; maps errors to exit codes
 internal/cli/         cobra commands — thin wrappers over pkg/stream
   color.go            --color parsing and NO_COLOR handling
   completion.go       bash/zsh/fish/powershell script generation
+  config.go           Viper-based configuration file resolution (~/.config/prism/config.yaml, .prism.yaml)
+  config_test.go      unit tests for config resolution
   abi_resolve.go      contract WASM lookup and embedded-spec parsing
   state.go            the cursor journal, the pruner, and the resume point
   runtime.go          the health server, the lease and the state key source
