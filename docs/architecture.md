@@ -685,6 +685,41 @@ and a process that has not reported for `StaleAfter` (30s by default) is
 considered stuck. A standby is exempt — it is waiting for the lease, not
 wedged.
 
+## Runtime profiling (`--pprof-port`)
+
+`--pprof-port` starts the Go runtime's profiling HTTP server for the lifetime
+of the command:
+
+```sh
+prism events --contract CBGSB... --follow --pprof-port 6060
+# prism: serving pprof on http://127.0.0.1:6060/debug/pprof/
+```
+
+The server is bound to `127.0.0.1` deliberately: profiles expose memory
+contents and stack traces, so they must not be reachable from the network by
+default. The flag is a port rather than an address for the same reason.
+
+The endpoints are the standard library's `/debug/pprof/` set: `heap` and
+`allocs` for memory, `profile` for a CPU sample, `goroutine` for stacks, and
+`trace` for execution traces. For example:
+
+```sh
+# Heap profile, then inspect it with the Go toolchain
+curl -o heap.pprof 'http://127.0.0.1:6060/debug/pprof/heap'
+go tool pprof -top prism heap.pprof
+
+# A 30-second CPU profile
+go tool pprof 'http://127.0.0.1:6060/debug/pprof/profile?seconds=30'
+```
+
+`cmd/prism/pprof.go` owns the server; `internal/cli` owns the flag and the
+lifecycle. The CLI starts it before the command's `RunE` and closes it when
+the command returns, using `http.Server.Shutdown` and then waiting for the
+serving goroutine, so Ctrl-C, a validation failure and a normal exit all leave
+nothing listening or running. `internal/cli.ProfilerFactory` is the seam: the
+binary supplies the real implementation, while tests use a fake to assert the
+flag wiring and cleanup without opening a socket.
+
 ## Graceful drain (`Tailer.Drain`)
 
 On SIGTERM or Ctrl-C, prism stops scheduling new RPC calls and then gives
@@ -1236,6 +1271,46 @@ The invariants were verified by breaking the code on purpose:
 
 If you change the state machine, re-run that exercise. A test suite that
 cannot fail is not protecting anything.
+
+## Performance benchmarks (`pkg/stream/bench_test.go`)
+
+The streaming core has an offline benchmark suite sized around the documented
+operational target of 50,000 events per second:
+
+```sh
+make bench
+# or:
+go test -run '^$' -bench 'FiftyThousandEvents' -benchmem ./pkg/stream
+```
+
+Each benchmark iteration processes a 50,000-event corpus through a real code
+path; the reported `events/op` makes the scale explicit, and the custom
+`events/s`, `allocs/event` and `bytes/event` metrics avoid having to divide
+`allocs/op` by hand. The suite covers:
+
+| Benchmark | What it measures |
+|---|---|
+| `BenchmarkTailerFiftyThousandEvents/raw` | the tailer, reorder buffer and sink seam end to end |
+| `BenchmarkTailerFiftyThousandEvents/dedup` | the same path with the `--dedup-window` sink enabled |
+| `BenchmarkDedupSinkFiftyThousandEvents` | fingerprinting plus the bounded de-duplication ring |
+| `BenchmarkReorderBufferFiftyThousandEvents` | per-ledger sorting and release |
+| `BenchmarkEventKeyFiftyThousandEvents` | the de-duplication key itself |
+
+The benchmarks use a fixed in-memory source and no wall-clock waits, so they
+make no network calls and produce the same record IDs on every run. `TestStreamingFiftyThousandEvents`
+runs the same corpus as an ordinary integration test: it asserts that every
+record was delivered exactly once, that throughput clears the 50,000 events/s
+target (with a lower floor under the race detector, whose overhead is not a
+property of the stream), that allocation stays under the per-event budget, and
+that the run leaves no goroutine behind. The test logs the measured throughput
+and allocation so a regression is visible even when it stays inside the
+budget.
+
+On the reference CI machine the raw tailer path is well above the target
+(roughly 1.4M events/s in a normal build, ~370 bytes/event); the dedup path is
+roughly 0.7M events/s at ~423 bytes/event. These numbers are diagnostics, not
+contracts — the contract is the test's 50,000 events/s floor and allocation
+ceiling.
 
 ## Relationship to stellar-xdr-lens
 
