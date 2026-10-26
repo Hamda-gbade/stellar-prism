@@ -402,6 +402,38 @@ unchanged here — and filtering lives at the sink seam rather than inside the
 tailer, so the delivery guarantee and cursor mechanics are untouched by
 output shaping.
 
+### Expression filter rules
+
+`--filter-expr` compiles a Go-like boolean expression once and evaluates it
+against every event through the `ruleEngine` in `internal/cli/rule_engine.go`.
+The engine is stateless: compilation happens before the stream starts, and
+`Match` is a pure function of the record. That keeps the evaluator offline-
+first and trivially testable without a network or a process.
+
+Supported context fields are `value`, `topics`, `contract`, `type`, `tx`,
+`ledger`, `txIndex` and `opIndex`. `value` and `topics` are decoded from XDR
+through lens, so `value.amount`, `topics[0].symbol` and nested map fields are
+all reachable. Operators follow Go syntax: arithmetic (`+`, `-`, `*`, `/`, `%`),
+comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`), boolean logic (`&&`, `||`, `!`),
+indexing (`topics[0]`) and parentheses.
+
+The rule engine wraps one or more compiled `stream.ExpressionFilter` predicates.
+Each predicate is matched in order; a record that any rule rejects is dropped,
+and a rule that errors on a particular record rejects it and reports the
+underlying reason through the returned error. An empty engine passes every
+event through.
+
+The CLI exposes `CompileRules(exprs ...string) (*ruleEngine, error)` for
+consumer code that prefers an explicit compile step. It trims whitespace and
+skips empty strings, so flag values with surrounding spaces are handled
+gracefully.
+
+| Added | Where |
+|---|---|
+| `ruleEngine`, `NewRuleEngine`, `CompileRules` | `internal/cli/rule_engine.go` |
+| `--filter-expr` | `prism events` |
+
+
 ### Per-contract fan-out
 
 `--fanout-dir` routes one stream to one NDJSON file per contract while the
