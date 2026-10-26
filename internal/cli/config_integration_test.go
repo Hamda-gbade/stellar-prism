@@ -6,14 +6,12 @@
 // into the fake-RPC machinery. It is a configuration integration test: it
 // exercises the same precedence rules the CLI uses, against real files on real
 // disk, with no network and no undeclared IO.
-package stream
+package cli
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/stellar-optics/stellar-prism/internal/cli"
 )
 
 // TestConfigResolutionOrder verifies the documented precedence:
@@ -46,7 +44,7 @@ func TestConfigResolutionOrder(t *testing.T) {
 	t.Chdir(cwd)
 	defer t.Chdir(t.TempDir())
 
-	cfg := cli.NewConfig()
+	cfg := NewConfig()
 	cfg.SetConfigFile(homeConfig)
 	cfg.Viper.Set("rpc-url", "") // clear any cached binding for a clean test
 	if _, err := cfg.ResolveConfig(); err != nil {
@@ -62,7 +60,7 @@ func TestConfigResolutionOrder(t *testing.T) {
 	}
 
 	// Now point Viper at nothing explicit, so both search paths are visible.
-	cfg2 := cli.NewConfig()
+	cfg2 := NewConfig()
 	cfg2.SetConfigFile(filepath.Join(cwd, ".prism.yaml"))
 	if _, err := cfg2.ResolveConfig(); err != nil {
 		t.Fatalf("ResolveConfig for cwd config: %v", err)
@@ -85,7 +83,7 @@ func TestConfigMissingFileStillWorks(t *testing.T) {
 	t.Chdir(tmp)
 	defer t.Chdir(t.TempDir())
 
-	cfg := cli.NewConfig()
+	cfg := NewConfig()
 	cfg.SetConfigFile(filepath.Join(tmp, "absent.yaml"))
 	res, err := cfg.ResolveConfig()
 	if err != nil {
@@ -110,7 +108,7 @@ func TestConfigBadFileFailsLoudly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := cli.NewConfig()
+	cfg := NewConfig()
 	cfg.SetConfigFile(path)
 	_, err := cfg.ResolveConfig()
 	if err == nil {
@@ -129,7 +127,7 @@ func TestConfigReloadPicksUpChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := cli.NewConfig()
+	cfg := NewConfig()
 	cfg.SetConfigFile(path)
 	if _, err := cfg.ResolveConfig(); err != nil {
 		t.Fatalf("ResolveConfig: %v", err)
@@ -154,7 +152,7 @@ func TestConfigReloadPicksUpChanges(t *testing.T) {
 func TestConfigCleanupHasNoSideEffects(t *testing.T) {
 	t.Parallel()
 
-	cfg := cli.NewConfig()
+	cfg := NewConfig()
 	cfg.Cleanup()
 	cfg.Cleanup()
 	cfg.Cleanup()
@@ -172,17 +170,17 @@ func TestConfigRPCURLsPrecedence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := cli.NewConfig()
+	cfg := NewConfig()
 	cfg.SetConfigFile(path)
 	if _, err := cfg.ResolveConfig(); err != nil {
 		t.Fatalf("ResolveConfig: %v", err)
 	}
 
 	tests := []struct {
-		name   string
-		flag   []string
-		env    []string
-		want   []string
+		name string
+		flag []string
+		env  []string
+		want []string
 	}{
 		{"flag wins", []string{"https://flag.invalid"}, nil, []string{"https://flag.invalid"}},
 		{"env wins over file", nil, []string{"https://env.invalid"}, []string{"https://env.invalid"}},

@@ -27,10 +27,10 @@ import (
 //
 // Resolution order (last writer wins):
 //
-//	1. ~/.config/prism/config.yaml
-//	2. .prism.yaml in the current working directory
-//	3. Environment variables prefixed with PRISM_
-//	4. Explicit CLI flags, passed through after the above
+//  1. ~/.config/prism/config.yaml
+//  2. .prism.yaml in the current working directory
+//  3. Environment variables prefixed with PRISM_
+//  4. Explicit CLI flags, passed through after the above
 //
 // This order matches the Viper defaults and matches the request's two file
 // paths exactly. If a flagged value is set, it always wins, which keeps the
@@ -183,7 +183,7 @@ func splitNoEmpty(s string, seps ...string) []string {
 	for i := 0; i < len(s); i++ {
 		for _, sep := range seps {
 			if len(sep) > 0 && s[i:i+len(sep)] == sep {
-				if seg := s[start : i]; seg != "" {
+				if seg := s[start:i]; seg != "" {
 					out = append(out, seg)
 				}
 				i += len(sep) - 1
