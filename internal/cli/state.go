@@ -68,8 +68,19 @@ func eventsStateKey(contractIDs, topics, eventTypes []string) string {
 // The file is encrypted when a key was configured: the passphrase or the key
 // management service decides how the checkpoints are sealed, and the key
 // itself never reaches the disk.
+func isJournalState(sf *streamFlags) bool {
+	return sf.resume ||
+		sf.pruneMaxAge > 0 ||
+		sf.statePassphraseEnv != "" ||
+		sf.statePassphraseFile != "" ||
+		sf.stateKMSProvider != "" ||
+		sf.stateKMSKeyID != "" ||
+		sf.haLeaseFile != "" ||
+		strings.HasSuffix(sf.stateFile, ".jsonl")
+}
+
 func openCursorState(ctx context.Context, sf *streamFlags, key string, stderr io.Writer) (*cursorState, error) {
-	if sf.stateFile == "" {
+	if sf.stateFile == "" || !isJournalState(sf) {
 		return nil, nil
 	}
 

@@ -1,12 +1,17 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 	"time"
 
+	"cloud.google.com/go/pubsub/v2"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/sns"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/spf13/cobra"
 
 	"github.com/stellar-optics/stellar-prism/pkg/sink"
@@ -59,6 +64,11 @@ type sinkFlags struct {
 	natsJetStream    bool
 	zmqEndpoint      string
 	zmqTopic         string
+	parquetDir       string
+	sqsQueue         string
+	snsTopic         string
+	awsRegion        string
+	pubsubTopic      string
 	metrics          *sink.Prometheus
 	constructedSinks []io.Closer
 }
@@ -119,6 +129,11 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 	flags.BoolVar(&s.natsJetStream, "nats-jetstream", false, "wait for JetStream publish acknowledgements")
 	flags.StringVar(&s.zmqEndpoint, "sink-zmq", "", "ZeroMQ PUB endpoint")
 	flags.StringVar(&s.zmqTopic, "zmq-topic", "stellar.events.{{.ContractID}}", "ZeroMQ topic template using .ContractID, .Topic0, .ID or .Ledger")
+	flags.StringVar(&s.parquetDir, "sink-parquet-dir", "", "write partitioned Parquet files under this directory")
+	flags.StringVar(&s.sqsQueue, "sink-sqs-queue", "", "AWS SQS queue URL")
+	flags.StringVar(&s.snsTopic, "sink-sns-topic", "", "AWS SNS topic ARN")
+	flags.StringVar(&s.awsRegion, "sink-region", "", "AWS region (uses SDK defaults when empty)")
+	flags.StringVar(&s.pubsubTopic, "sink-pubsub-topic", "", "Google Pub/Sub topic as projects/PROJECT/topics/TOPIC")
 
 	registerFlagCompletion(cmd, "cloud-provider", "s3", "gcs")
 	registerFlagCompletion(cmd, "syslog-format", string(sink.SyslogRFC5424), string(sink.SyslogJournald))
@@ -190,6 +205,9 @@ func (s *sinkFlags) validate() error {
 	}
 	if s.natsURL == "" && s.natsJetStream {
 		return fmt.Errorf("--nats-jetstream requires --sink-nats")
+	}
+	if s.parquetDir != "" && strings.TrimSpace(s.parquetDir) == "" {
+		return fmt.Errorf("--sink-parquet-dir must not be blank")
 	}
 	return nil
 }
@@ -330,6 +348,56 @@ func (s *sinkFlags) addTo(base stream.Sink, raw bool, onAsyncError func(error)) 
 		}
 		s.constructedSinks = append(s.constructedSinks, zmqSink)
 		sinks = append(sinks, zmqSink)
+	}
+	if s.parquetDir != "" {
+		parquetSink, parquetErr := sink.NewParquetSink(s.parquetDir)
+		if parquetErr != nil {
+			return nil, parquetErr
+		}
+		s.constructedSinks = append(s.constructedSinks, parquetSink)
+		sinks = append(sinks, parquetSink)
+	}
+	if s.sqsQueue != "" || s.snsTopic != "" {
+		loadOpts := []func(*config.LoadOptions) error{}
+		if s.awsRegion != "" {
+			loadOpts = append(loadOpts, config.WithRegion(s.awsRegion))
+		}
+		cfg, awsErr := config.LoadDefaultConfig(context.Background(), loadOpts...)
+		if awsErr != nil {
+			return nil, fmt.Errorf("aws config: %w", awsErr)
+		}
+		if s.sqsQueue != "" {
+			q, e := sink.NewSQSSink(sqs.NewFromConfig(cfg), s.sqsQueue, strings.HasSuffix(s.sqsQueue, ".fifo"), !raw)
+			if e != nil {
+				return nil, e
+			}
+			sinks = append(sinks, q)
+		}
+		if s.snsTopic != "" {
+			n, e := sink.NewSNSSink(sns.NewFromConfig(cfg), s.snsTopic, !raw)
+			if e != nil {
+				return nil, e
+			}
+			sinks = append(sinks, n)
+		}
+	}
+	if s.pubsubTopic != "" {
+		client, pubErr := pubsub.NewClient(context.Background(), strings.TrimPrefix(strings.Split(s.pubsubTopic, "/topics/")[0], "projects/"))
+		if pubErr != nil {
+			return nil, fmt.Errorf("pubsub client: %w", pubErr)
+		}
+		parts := strings.Split(s.pubsubTopic, "/topics/")
+		if len(parts) != 2 || parts[1] == "" {
+			_ = client.Close()
+			return nil, fmt.Errorf("--sink-pubsub-topic must be projects/PROJECT/topics/TOPIC")
+		}
+		p, e := sink.NewPubSubSink(sink.AdaptPubSubPublisher(client.Publisher(s.pubsubTopic)), !raw)
+		if e != nil {
+			_ = client.Close()
+			return nil, e
+		}
+		s.constructedSinks = append(s.constructedSinks, client)
+		sinks = append(sinks, p)
 	}
 
 	if len(sinks) == 1 {

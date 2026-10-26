@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -37,12 +38,20 @@ type once struct {
 // may never end.
 func (o *once) claim() bool { return o.claimed.CompareAndSwap(false, true) }
 
+// errTimedOut marks that runWithTimeout hit its deadline and walked away
+// from the work goroutine instead of waiting for it.
+//
+// Callers use errors.Is to tell that abandonment apart from a finished run,
+// so they never read state — stream counters, sink counters — that the
+// abandoned goroutine may still be writing.
+var errTimedOut = errors.New("timed out")
+
 // runWithTimeout runs work and gives up on it after timeout.
 //
 // The work is run on its own goroutine, so a flush that hangs on a slow
 // network cannot stop the process from exiting: the caller walks away after
 // the deadline, and the goroutine is left to finish or die with the
-// process.
+// process. The returned error wraps errTimedOut when that happened.
 func runWithTimeout(timeout time.Duration, work func() error) error {
 	if timeout <= 0 {
 		return work()
@@ -57,7 +66,7 @@ func runWithTimeout(timeout time.Duration, work func() error) error {
 	case err := <-done:
 		return err
 	case <-timer.C:
-		return fmt.Errorf("timed out after %s", timeout)
+		return fmt.Errorf("%w after %s", errTimedOut, timeout)
 	}
 }
 

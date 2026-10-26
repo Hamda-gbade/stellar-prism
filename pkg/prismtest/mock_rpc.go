@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
+	"github.com/stellar/go-stellar-sdk/toid"
 )
 
 // MockRPC is a scriptable, in-memory Soroban RPC used to test streaming
@@ -37,8 +39,9 @@ type MockRPC struct {
 	// calls counts GetEvents/GetLedgers invocations.
 	calls int
 	// lastPage remembers what was served, for ReplayLast.
-	lastEvents  []protocol.EventInfo
-	lastLedgers []protocol.LedgerInfo
+	lastEvents       []protocol.EventInfo
+	lastLedgers      []protocol.LedgerInfo
+	lastTransactions []protocol.TransactionInfo
 
 	// tx maps a hash to a canned transaction response.
 	tx map[string]protocol.GetTransactionResponse
@@ -459,8 +462,14 @@ func (m *MockRPC) GetTransactions(ctx context.Context, req protocol.GetTransacti
 	}
 
 	hasCursor := req.Pagination != nil && req.Pagination.Cursor != ""
+	// Mirror the real server's rule that a cursor and a ledger range are
+	// mutually exclusive.
+	if hasCursor && req.StartLedger != 0 {
+		return protocol.GetTransactionsResponse{}, errors.New("ledger ranges and cursor cannot both be set")
+	}
 
 	respond := func(page []protocol.TransactionInfo) protocol.GetTransactionsResponse {
+		m.lastTransactions = page
 		resp := protocol.GetTransactionsResponse{
 			Transactions: page,
 			LatestLedger: latest,
@@ -477,11 +486,23 @@ func (m *MockRPC) GetTransactions(ctx context.Context, req protocol.GetTransacti
 	if b.Empty {
 		return respond(nil), nil
 	}
+	if b.ReplayLast {
+		return respond(m.lastTransactions), nil
+	}
+
+	var after int64 = -1
+	if hasCursor {
+		parsed, err := strconv.ParseInt(req.Pagination.Cursor, 10, 64)
+		if err != nil {
+			return protocol.GetTransactionsResponse{}, fmt.Errorf("bad cursor: %w", err)
+		}
+		after = parsed
+	}
 
 	var out []protocol.TransactionInfo
 	for _, tx := range m.transactions {
 		if hasCursor {
-			if transactionCursor(tx) > req.Pagination.Cursor {
+			if transactionToid(tx) > after {
 				out = append(out, tx)
 			}
 			continue
@@ -670,7 +691,13 @@ func MakeLedgers(startLedger uint32, count int) []protocol.LedgerInfo {
 
 // transactionCursor returns a string cursor for a transaction.
 func transactionCursor(tx protocol.TransactionInfo) string {
-	return fmt.Sprintf("%010d-%06d", tx.Ledger, tx.ApplicationOrder)
+	return strconv.FormatInt(transactionToid(tx), 10)
+}
+
+// transactionToid returns the SEP-35 total-order position the real server
+// encodes in its cursor.
+func transactionToid(tx protocol.TransactionInfo) int64 {
+	return toid.New(int32(tx.Ledger), tx.ApplicationOrder, 1).ToInt64() //nolint:gosec // test data
 }
 
 // Behaviour constructs a Behaviour with the given options. The zero value

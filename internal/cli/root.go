@@ -14,8 +14,10 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -74,10 +76,24 @@ func closeClient(c rpc.Client, stderr io.Writer) {
 	}
 }
 
+// isTerminalWriter reports whether w is an interactive character device.
+// Status output must never leak into a redirected command pipeline.
+func isTerminalWriter(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
 // globalFlags holds options shared by every subcommand.
 type globalFlags struct {
-	serveSSE string
-	serveWS  string
+	serveSSE         string
+	serveWS          string
+	serveGRPC        string
+	network          string
+	skipNetworkCheck bool
 	// color is one of "auto", "always" or "never", matching lens.
 	color string
 	// rpcURLs overrides the endpoints; empty falls back to the environment.
@@ -89,6 +105,14 @@ type globalFlags struct {
 	// Viper searches ~/.config/prism/config.yaml and then .prism.yaml in the
 	// current directory.
 	configFile string
+	// pprofPort enables the runtime profiling server on 127.0.0.1 when it is
+	// greater than zero.
+	pprofPort int
+	// profilerFactory builds the profiler cmd/prism supplies. It is nil in
+	// library tests that do not exercise profiling.
+	profilerFactory ProfilerFactory
+	// profiler is the running profiling server, if one was started.
+	profiler Profiler
 }
 
 // Execute builds and runs the root command, returning an error rather than
@@ -98,14 +122,24 @@ type globalFlags struct {
 // binary add commands whose implementation belongs in package main (such as
 // the documentation generator) without growing this package's dependencies.
 func Execute(args []string, stdout, stderr io.Writer, extra ...*cobra.Command) error {
-	root := newRootCmd(stdout, stderr)
+	return ExecuteWithProfiler(args, stdout, stderr, nil, extra...)
+}
+
+// ExecuteWithProfiler is Execute with a runtime profiler factory. The binary
+// passes the pprof implementation from cmd/prism; tests that only exercise
+// command behaviour can leave it nil.
+func ExecuteWithProfiler(args []string, stdout, stderr io.Writer, factory ProfilerFactory, extra ...*cobra.Command) (err error) {
+	root, g := newRootCmdWithProfiler(stdout, stderr, factory)
 	root.AddCommand(extra...)
 	root.SetArgs(args)
+	defer func() {
+		err = errors.Join(err, g.closeProfiler())
+	}()
 	return root.Execute()
 }
 
-func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
-	g := &globalFlags{}
+func newRootCmdWithProfiler(stdout, stderr io.Writer, factory ProfilerFactory) (*cobra.Command, *globalFlags) {
+	g := &globalFlags{profilerFactory: factory}
 
 	root := &cobra.Command{
 		Use:   "prism",
@@ -130,13 +164,21 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
   # Backfill from a ledger, then keep following
   prism events --contract CBGSB... --from 1234567 --follow
 
+  # Ingest into PostgreSQL or TimescaleDB instead of stdout
+  prism events --contract CBGSB... --follow --timescale-dsn "$DATABASE_URL"
+
+  # Archive a backfill as columnar Parquet parts
+  prism transactions --from 1234567 --limit 100000 --parquet-dir ./txs
+
   # Explain a transaction, through the lens explain path
   prism tx 3389e9f0...`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			_, err := parseColorMode(g.color)
-			return err
+			if _, err := parseColorMode(g.color); err != nil {
+				return err
+			}
+			return g.startProfiler(stderr)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return cmd.Help()
@@ -152,12 +194,20 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
 		"Soroban RPC endpoint; repeat for a failover pool (default $"+rpc.URLEnvVar+", else "+rpc.DefaultURL+")")
 	root.PersistentFlags().DurationVar(&g.timeout, "rpc-timeout", 30*time.Second,
 		"timeout for a single RPC call")
+	root.PersistentFlags().IntVar(&g.pprofPort, "pprof-port", 0,
+		"serve Go runtime profiles on http://127.0.0.1:PORT/debug/pprof/ (0 disables)")
+	root.PersistentFlags().StringVar(&g.network, "network", "testnet",
+		"expected Stellar network: testnet, mainnet, futurenet, or standalone")
+	root.PersistentFlags().BoolVar(&g.skipNetworkCheck, "insecure-skip-network-check", false,
+		"skip RPC network passphrase validation")
+	registerFlagCompletion(root, "network", "testnet", "mainnet", "futurenet", "standalone")
 	registerFlagCompletion(root, "color", string(colorAuto), string(colorAlways), string(colorNever))
 
 	root.PersistentFlags().StringVar(&g.serveSSE, "serve-sse", "", "broadcast SSE at this listen address (/events); retains 1024 records for replay")
 	root.PersistentFlags().StringVar(&g.serveSSE, "sse", "", "alias for --serve-sse")
 	root.PersistentFlags().StringVar(&g.serveWS, "ws", "", "broadcast WebSocket events at this listen address (/events or /ws)")
 	root.PersistentFlags().StringVar(&g.configFile, "config", "", "explicit config file to load (default: ~/.config/prism/config.yaml then .prism.yaml in cwd)")
+	root.PersistentFlags().StringVar(&g.serveGRPC, "serve-grpc", "", "serve gRPC PrismStream at this listen address")
 	root.AddCommand(
 		newServeCmd(g, stdout, stderr),
 		newEventsCmd(g, stdout, stderr),
@@ -176,10 +226,12 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
 		newDiffCmd(g, stdout, stderr),
 		newGenerateTypesCmd(g, stdout, stderr),
 		newAuditCmd(g, stdout, stderr),
+		newAggregateCmd(g, stdout, stderr),
+		newRewindCmd(stdout),
 		newVersionCmd(stdout),
 		newCompletionCmd(stdout),
 	)
-	return root
+	return root, g
 }
 
 func newVersionCmd(stdout io.Writer) *cobra.Command {

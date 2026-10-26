@@ -66,9 +66,11 @@ returns — there is no polling loop, no cursor advancement, no reconnection, an
 | **Gap detection** | ❌ | ✅ |
 | **Active-passive HA** | ❌ | ✅ (`--ha-lease-file`) |
 | **Health/readiness probes** | ❌ | ✅ (`--health-port`) |
+| **Runtime pprof profiles** | ❌ | ✅ (`--pprof-port`) |
 | **Graceful drain on SIGTERM** | ❌ | ✅ (`--drain-timeout`) |
 | **Encrypted state file** | ❌ | ✅ (`--state-passphrase-env`) |
 | Ledger streaming | ❌ | ✅ |
+| Database / Parquet ingestion | ❌ | ✅ |
 | Contract-spec-decoded payloads | ✅ **better** | ❌ ([roadmap](docs/roadmap.md)) |
 
 ## Install
@@ -310,6 +312,21 @@ stream's own progress, so it is the real distance to the head and not a guess.
 A standby answers `/healthz` with 200 — it is waiting, not stuck — and
 `/readyz` with 503, so the orchestrator keeps traffic away from it.
 
+### Runtime profiling
+
+`--pprof-port` starts the Go runtime's profiling server on loopback for the
+lifetime of the command:
+
+```sh
+prism events --contract CDLZF... --follow --pprof-port 6060
+# prism: serving pprof on http://127.0.0.1:6060/debug/pprof/
+```
+
+Use `/debug/pprof/heap` and `/debug/pprof/allocs` for memory, or
+`/debug/pprof/profile?seconds=30` for CPU. The server binds to `127.0.0.1`
+because profiles expose memory and stack contents; it is shut down and its
+goroutine joined when the command exits, including on Ctrl-C.
+
 ### Graceful drain
 
 Kubernetes gives a pod a grace period (30s by default) after SIGTERM before
@@ -388,6 +405,13 @@ effective payer, so a muxed fee source resolves to its underlying account.
 The filters are applied after each page is fetched, so the cursor still
 advances across suppressed transactions — a filtered stream is a view of the
 transaction stream rather than a second stream that could skip history.
+
+Pagination uses the RPC's own SEP-35 paging token, so `--from` hands over to
+`--follow` at exactly the next transaction rather than at the next ledger. The
+page size is capped at 200 by the server (the default is 100, because each
+transaction carries three XDR blobs), and a page that stops short of the head
+keeps draining: the server limits how many ledgers one call scans, so a short
+page is not the end of a backfill.
 
 ```console
 $ prism transactions --status failed --limit 1 --json
@@ -577,6 +601,8 @@ before v1.0.
   and `stellar events` is better for that today.
 - Optional cursor journal (`--state-file`) with background pruning, and
   `--resume` to continue from it. Still not exactly-once across restarts.
+- Covered twice: by an offline suite with no network, and by an opt-in
+  end-to-end run against a local Quickstart network (`make test-e2e`).
 
 See [docs/roadmap.md](docs/roadmap.md).
 
