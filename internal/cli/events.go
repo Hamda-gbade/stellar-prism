@@ -53,13 +53,24 @@ type streamFlags struct {
 	// runStream, because only the command knows which filters select records.
 	// See cursorKey.
 	derivedKey string
-	quiet      bool
-	verbosity  int
-	stats      bool
-	dryRun     bool
-	statsBar   bool
-	process    func([]stream.Record) ([]stream.Record, error)
-	filter     stream.RecordFilter
+
+	// Broker output. When configured, records are published to the broker
+	// instead of written to stdout.
+	kafkaBrokers     []string
+	kafkaTopic       string
+	kafkaPartitionBy string
+	amqpURL          string
+	amqpQueue        string
+	amqpExchange     string
+	amqpRoutingKey   string
+
+	quiet     bool
+	verbosity int
+	stats     bool
+	dryRun    bool
+	statsBar  bool
+	process   func([]stream.Record) ([]stream.Record, error)
+	filter    stream.RecordFilter
 
 	sinks sinkFlags
 
@@ -241,6 +252,21 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"append malformed or undeliverable records to this file as NDJSON instead of stopping the stream")
 	cmd.Flags().IntVar(&s.maxRecordRetries, "max-record-retries", 0,
 		"retry a failed record this many times before writing it to the dead-letter queue")
+	cmd.Flags().StringSliceVar(&s.kafkaBrokers, "kafka-brokers", nil,
+		"Kafka broker addresses (comma-separated); requires --kafka-topic")
+	cmd.Flags().StringVar(&s.kafkaTopic, "kafka-topic", "",
+		"publish records as JSON to this Kafka topic instead of stdout; requires --kafka-brokers")
+	cmd.Flags().StringVar(&s.kafkaPartitionBy, "kafka-partition-by", string(sink.PartitionContract),
+		`Kafka message key: "contract" keeps one contract's records ordered on one partition, "tx" keys by transaction hash, "record" keys by record ID`)
+	cmd.Flags().StringVar(&s.amqpURL, "amqp-url", "",
+		"AMQP 0-9-1 broker URL, e.g. amqp://guest:guest@localhost:5672/; requires --amqp-queue")
+	cmd.Flags().StringVar(&s.amqpQueue, "amqp-queue", "",
+		"declare this durable queue and publish records to it instead of stdout; requires --amqp-url")
+	cmd.Flags().StringVar(&s.amqpExchange, "amqp-exchange", "",
+		"AMQP exchange to publish to (default: the default exchange, routing by queue name)")
+	cmd.Flags().StringVar(&s.amqpRoutingKey, "amqp-routing-key", "",
+		"AMQP routing key (default: the queue name)")
+	registerFlagCompletion(cmd, "kafka-partition-by", string(sink.PartitionContract), string(sink.PartitionTx), string(sink.PartitionRecord))
 	s.sinks.register(cmd)
 }
 
@@ -328,7 +354,7 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	if err := s.validateRuntime(); err != nil {
 		return err
 	}
-	return nil
+	return s.validateBroker()
 }
 
 // validateRuntime checks the high availability, health and drain options.
@@ -497,9 +523,22 @@ func (s *streamFlags) newSink(
 	}
 
 	var out stream.Sink
-	if s.output == "" {
+	switch {
+	case s.kafkaTopic != "":
+		k, err := s.newKafkaSink()
+		if err != nil {
+			return nil, err
+		}
+		out = k
+	case s.amqpQueue != "":
+		a, err := s.newAMQPSink()
+		if err != nil {
+			return nil, err
+		}
+		out = a
+	case s.output == "":
 		out = build(w)
-	} else {
+	default:
 		rotator, err := sink.NewFileRotator(s.output, build, sink.RotatorOptions{
 			MaxSize:    s.rotateSize,
 			MaxAge:     s.rotateInterval,
@@ -555,6 +594,17 @@ func (s *streamFlags) newSink(
 		},
 	})
 	if dlq == nil {
+		// Batcher.Close flushes and stops its timer, but it does not close
+		// what it wraps: a broker connection underneath the batcher would
+		// outlive its last publish without this pairing.
+		if closer, ok := out.(io.Closer); ok {
+			return &closingSink{
+				Sink: batcher,
+				closeFn: func() error {
+					return errors.Join(batcher.Close(), closer.Close())
+				},
+			}, nil
+		}
 		return batcher, nil
 	}
 	// Batcher.Close stops its timer and flushes, but it does not close what it

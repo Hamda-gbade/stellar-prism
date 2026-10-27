@@ -15,6 +15,8 @@ require (
 	github.com/marcboeker/go-duckdb/v2 v2.4.3
 	github.com/nats-io/nats.go v1.47.0
 	github.com/parquet-go/parquet-go v0.32.0
+	github.com/rabbitmq/amqp091-go v1.16.0
+	github.com/segmentio/kafka-go v0.4.51
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.20.1
 	github.com/stellar-optics/stellar-xdr-lens v0.2.0
