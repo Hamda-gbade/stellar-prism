@@ -31,6 +31,12 @@ type Stats struct {
 	Gaps int
 	// Recovered counts gaps the stream skipped past under GapResume.
 	Recovered int
+	// Sampled counts records dropped by deterministic sampling.
+	Sampled int
+	// RateLimited counts records dropped by the token bucket rate limiter.
+	RateLimited int
+	// Rewinds counts how many times the stream stepped back to replay records.
+	Rewinds int
 }
 
 // Page describes the progress of one page that was emitted in full.
@@ -158,6 +164,16 @@ type Options struct {
 	// re-emitting from its original start. Nil (the default) keeps the
 	// position in memory only. *StateFile is the file-backed implementation.
 	State StateStore
+	// Rewind coordinates stepping back to replay records.
+	//
+	// The tailer applies a pending request before its next fetch: the source
+	// is repositioned, the cursor is cleared and the de-duplication mark is
+	// reset, so the records in between are emitted again. That is deliberate
+	// reprocessing, and it is the only way a stream re-emits a record within
+	// a single run.
+	Rewind *RewindController
+	// OnRewind, when set, is called after a rewind has been applied.
+	OnRewind func(RewindTarget)
 }
 
 // StateStore is the seam durable cursors plug into: it holds the stream's
@@ -234,6 +250,12 @@ type Tailer struct {
 	// fixed-width and zero-padded, a plain string comparison orders them
 	// correctly, which is what makes de-duplication a single comparison.
 	lastID string
+	// lastLedger is the ledger of the most recently emitted record. It is
+	// the fallback anchor for a rewind when the cursor cannot be read.
+	lastLedger uint32
+	// rewoundTo is the ledger the last rewind landed on. It is what makes a
+	// rewind that reached past the server's retention window detectable.
+	rewoundTo uint32
 
 	// persisted is the last position successfully written to the Store, and
 	// persistedOK records whether anything has been written or restored yet.
@@ -396,6 +418,13 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 			return t.finish(nil)
 		}
 
+		// A rewind is applied before the fetch, so a request made while the
+		// stream is running takes effect at a page boundary rather than in
+		// the middle of a page.
+		if err := t.applyRewind(); err != nil {
+			return t.finish(err)
+		}
+
 		batch, err := t.fetchWithRetry(ctx)
 		if err != nil {
 			if IsCancellation(err) {
@@ -404,7 +433,17 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 			return err
 		}
 
-		if gapErr := t.checkGap(batch); gapErr != nil {
+		gapErr := t.checkGap(batch)
+		if gapErr == nil {
+			gapErr = t.checkRewindGap(batch)
+		}
+		// The rewind check applies to the page that follows the rewind.
+		// Once that page has been seen the target has been passed, and
+		// comparing it with a later retention floor would report a gap
+		// that is not one: the server's floor moves forward with time.
+		t.rewoundTo = 0
+
+		if gapErr != nil {
 			t.stats.Gaps++
 			recovered, recoverErr := t.recovery.Handle(t.src, gapErr)
 			if recoverErr != nil {
@@ -716,6 +755,92 @@ func (t *Tailer) checkGap(b Batch) *GapError {
 	return nil
 }
 
+// applyRewind consumes a pending rewind request and repositions the stream.
+//
+// Repositioning clears the cursor and the de-duplication mark, which is what
+// makes the records in between be emitted again: a rewind is deliberate
+// reprocessing, and it is the only way a stream re-emits a record within a
+// single run.
+func (t *Tailer) applyRewind() error {
+	if t.opts.Rewind == nil {
+		return nil
+	}
+	req, ok := t.opts.Rewind.Take()
+	if !ok {
+		return nil
+	}
+
+	if t.reorder != nil {
+		if _, _, err := t.emitReady(context.Background(), t.reorder.Flush()); err != nil {
+			return err
+		}
+		t.reorder = NewReorderBuffer()
+	}
+
+	anchor, ok := t.rewindAnchor(req)
+	if !ok {
+		return fmt.Errorf(
+			"cannot rewind the %s stream: it has not reached a position yet", t.src.Name())
+	}
+	target, err := req.Distance.Target(anchor)
+	if err != nil {
+		return fmt.Errorf("rewinding the %s stream: %w", t.src.Name(), err)
+	}
+
+	rewinder, ok := t.src.(Rewinder)
+	if !ok {
+		return fmt.Errorf(
+			"source %q cannot be rewound because it does not implement Rewinder", t.src.Name())
+	}
+
+	rewinder.Rewind(target.Ledger)
+	t.cursor = ""
+	t.lastID = ""
+	t.rewoundTo = target.Ledger
+	t.stats.Rewinds++
+
+	if t.opts.OnRewind != nil {
+		t.opts.OnRewind(target)
+	}
+	return nil
+}
+
+// rewindAnchor reports the position a rewind is measured from.
+//
+// An explicit anchor wins, because the caller knows where it wants the step
+// measured from. Otherwise the step is measured from the stream's own
+// position: the cursor it reached, or the last record it emitted.
+func (t *Tailer) rewindAnchor(req RewindRequest) (uint32, bool) {
+	if req.Anchor != 0 {
+		return req.Anchor, true
+	}
+	if t.cursor != "" {
+		if at, ok := t.src.CursorLedger(t.cursor); ok {
+			return at, true
+		}
+	}
+	if t.lastLedger != 0 {
+		return t.lastLedger, true
+	}
+	return 0, false
+}
+
+// checkRewindGap reports whether a rewind reached past the server's
+// retention window.
+//
+// Rewinding is a request to reprocess records, so landing before the oldest
+// retained ledger means the records that were wanted are gone. That is a
+// gap, and it is reported like any other rather than skipped over.
+func (t *Tailer) checkRewindGap(b Batch) *GapError {
+	if t.rewoundTo == 0 || b.Oldest == 0 {
+		return nil
+	}
+	if t.rewoundTo < b.Oldest {
+		return &GapError{Source: t.src.Name(), From: t.rewoundTo, Oldest: b.Oldest}
+	}
+	return nil
+}
+
 // restore loads a persisted position, if any, before the first fetch.
 //
 // A missing row is a first run and leaves the configured start position
@@ -859,6 +984,7 @@ func (t *Tailer) emitReady(ctx context.Context, records []Record) (done bool, em
 			}
 			if !matched {
 				t.lastID = r.ID
+				t.lastLedger = r.Sequence
 				t.stats.Filtered++
 				for i := range t.pages {
 					if _, ok := t.pages[i].records[r.ID]; ok {
@@ -876,6 +1002,7 @@ func (t *Tailer) emitReady(ctx context.Context, records []Record) (done bool, em
 			return false, emitted, fmt.Errorf("writing record %s: %w", r.ID, err)
 		}
 		t.lastID = r.ID
+		t.lastLedger = r.Sequence
 		t.stats.Emitted++
 		emitted++
 		t.reportReadyPages()

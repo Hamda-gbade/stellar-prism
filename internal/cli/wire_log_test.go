@@ -125,6 +125,7 @@ func TestEventsCommandWireLogMasksAuthorization(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "wire.ndjson")
 	_, stderr, err := run(t, "events", "--from", "9000", "--json",
+		"--insecure-skip-network-check",
 		"--rpc-url", authenticatedURL(srv.URL),
 		"--wire-log", path)
 	if err != nil {
@@ -184,6 +185,7 @@ func TestEventsCommandWireLogToStderr(t *testing.T) {
 	defer srv.Close()
 
 	_, stderr, err := run(t, "events", "--from", "9000", "--json",
+		"--insecure-skip-network-check",
 		"--rpc-url", authenticatedURL(srv.URL),
 		"--wire-log", "-")
 	if err != nil {

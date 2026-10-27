@@ -6,6 +6,11 @@
 //
 // Flag names deliberately mirror stellar-xdr-lens where the concept is
 // shared (--json, --color), so the two tools feel like one family.
+//
+// Configuration is resolved through Viper: ~/.config/prism/config.yaml,
+// .prism.yaml in the current directory, environment variables prefixed with
+// PRISM_, and then explicit CLI flags. See config.go for the resolution
+// order and the tests for the acceptance criteria.
 package cli
 
 import (
@@ -154,11 +159,24 @@ func closeClient(c rpc.Client, stderr io.Writer) {
 	}
 }
 
+// isTerminalWriter reports whether w is an interactive character device.
+// Status output must never leak into a redirected command pipeline.
+func isTerminalWriter(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
 // globalFlags holds options shared by every subcommand.
 type globalFlags struct {
-	serveSSE  string
-	serveWS   string
-	serveGRPC string
+	serveSSE         string
+	serveWS          string
+	serveGRPC        string
+	network          string
+	skipNetworkCheck bool
 	// color is one of "auto", "always" or "never", matching lens.
 	color string
 	// rpcURLs overrides the endpoints; empty falls back to the environment.
@@ -172,6 +190,19 @@ type globalFlags struct {
 	// wireLogMaxBody caps each recorded body; zero uses the library default
 	// and a negative value disables body capture.
 	wireLogMaxBody int64
+
+	// configFile is an explicit path to a prism config file. When empty,
+	// Viper searches ~/.config/prism/config.yaml and then .prism.yaml in the
+	// current directory.
+	configFile string
+	// pprofPort enables the runtime profiling server on 127.0.0.1 when it is
+	// greater than zero.
+	pprofPort int
+	// profilerFactory builds the profiler cmd/prism supplies. It is nil in
+	// library tests that do not exercise profiling.
+	profilerFactory ProfilerFactory
+	// profiler is the running profiling server, if one was started.
+	profiler Profiler
 }
 
 // validateWireLog checks the debug wire-log options before a command opens a
@@ -193,20 +224,30 @@ func (g *globalFlags) validateWireLog(cmd *cobra.Command) error {
 // binary add commands whose implementation belongs in package main (such as
 // the documentation generator) without growing this package's dependencies.
 func Execute(args []string, stdout, stderr io.Writer, extra ...*cobra.Command) error {
-	root := newRootCmd(stdout, stderr)
+	return ExecuteWithProfiler(args, stdout, stderr, nil, extra...)
+}
+
+// ExecuteWithProfiler is Execute with a runtime profiler factory. The binary
+// passes the pprof implementation from cmd/prism; tests that only exercise
+// command behaviour can leave it nil.
+func ExecuteWithProfiler(args []string, stdout, stderr io.Writer, factory ProfilerFactory, extra ...*cobra.Command) (err error) {
+	root, g := newRootCmdWithProfiler(stdout, stderr, factory)
 	root.AddCommand(extra...)
 	root.SetArgs(args)
+	defer func() {
+		err = errors.Join(err, g.closeProfiler())
+	}()
 	return root.Execute()
 }
 
-func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
+func newRootCmdWithProfiler(stdout, stderr io.Writer, factory ProfilerFactory) (*cobra.Command, *globalFlags) {
 	// Serialise stderr once at the root. Commands may add their own wrappers
 	// for a narrower scope, but the wire logger and the stream diagnostics
 	// must ultimately share this lock: bytes.Buffer, which tests use, is not
 	// safe for concurrent writes.
 	stderr = newSyncWriter(stderr)
 
-	g := &globalFlags{}
+	g := &globalFlags{profilerFactory: factory}
 
 	root := &cobra.Command{
 		Use:   "prism",
@@ -249,7 +290,10 @@ redacted before anything is written.`,
 			if _, err := parseColorMode(g.color); err != nil {
 				return err
 			}
-			return g.validateWireLog(cmd)
+			if err := g.validateWireLog(cmd); err != nil {
+				return err
+			}
+			return g.startProfiler(stderr)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return cmd.Help()
@@ -269,11 +313,19 @@ redacted before anything is written.`,
 		`write a debug NDJSON log of RPC requests and responses to this file, with Authorization and other credential headers redacted ("-" writes to stderr)`)
 	root.PersistentFlags().Int64Var(&g.wireLogMaxBody, "wire-log-max-body", 0,
 		"maximum bytes of each body recorded by --wire-log (0 uses 1 MiB, -1 disables body capture)")
+	root.PersistentFlags().IntVar(&g.pprofPort, "pprof-port", 0,
+		"serve Go runtime profiles on http://127.0.0.1:PORT/debug/pprof/ (0 disables)")
+	root.PersistentFlags().StringVar(&g.network, "network", "testnet",
+		"expected Stellar network: testnet, mainnet, futurenet, or standalone")
+	root.PersistentFlags().BoolVar(&g.skipNetworkCheck, "insecure-skip-network-check", false,
+		"skip RPC network passphrase validation")
+	registerFlagCompletion(root, "network", "testnet", "mainnet", "futurenet", "standalone")
 	registerFlagCompletion(root, "color", string(colorAuto), string(colorAlways), string(colorNever))
 
 	root.PersistentFlags().StringVar(&g.serveSSE, "serve-sse", "", "broadcast SSE at this listen address (/events); retains 1024 records for replay")
 	root.PersistentFlags().StringVar(&g.serveSSE, "sse", "", "alias for --serve-sse")
 	root.PersistentFlags().StringVar(&g.serveWS, "ws", "", "broadcast WebSocket events at this listen address (/events or /ws)")
+	root.PersistentFlags().StringVar(&g.configFile, "config", "", "explicit config file to load (default: ~/.config/prism/config.yaml then .prism.yaml in cwd)")
 	root.PersistentFlags().StringVar(&g.serveGRPC, "serve-grpc", "", "serve gRPC PrismStream at this listen address")
 	root.AddCommand(
 		newServeCmd(g, stdout, stderr),
@@ -293,10 +345,12 @@ redacted before anything is written.`,
 		newDiffCmd(g, stdout, stderr),
 		newGenerateTypesCmd(g, stdout, stderr),
 		newAuditCmd(g, stdout, stderr),
+		newAggregateCmd(g, stdout, stderr),
+		newRewindCmd(stdout),
 		newVersionCmd(stdout),
 		newCompletionCmd(stdout),
 	)
-	return root
+	return root, g
 }
 
 func newVersionCmd(stdout io.Writer) *cobra.Command {

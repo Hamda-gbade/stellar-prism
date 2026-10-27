@@ -56,6 +56,8 @@ cmd/prism/            main; maps errors to exit codes
 internal/cli/         cobra commands — thin wrappers over pkg/stream
   color.go            --color parsing and NO_COLOR handling
   completion.go       bash/zsh/fish/powershell script generation
+  config.go           Viper-based configuration file resolution (~/.config/prism/config.yaml, .prism.yaml)
+  config_test.go      unit tests for config resolution
   abi_resolve.go      contract WASM lookup and embedded-spec parsing
   state.go            the cursor journal, the pruner, and the resume point
   runtime.go          the health server, the lease and the state key source
@@ -86,13 +88,7 @@ pkg/stream/
   drainer.go          concurrent historical backfill + ordered merge
   batcher.go          count/time batching sink wrapper
   gap_recovery.go     GapStrategy, Rewinder and gap handling
-  pruning.go          CursorMetadata, MetadataStore, Pruner
-  cursor_store.go     file-backed cursor metadata journal
-  ha.go               lease-based leader election (active-passive)
-  ha_lock_unix.go     flock(2) primitives for the lease
-  health.go           the liveness/readiness probe server and its monitor
-  crypto_state.go     AES-256-GCM encrypted cursor journal
-  kms.go              AWS and GCP key management clients
+  rewind.go           rewind distances, targets and the rewind controller
   context.go          TaskGroup and cancellation helpers
   clock.go            Clock and Backoff, both injectable
   topic_pattern.go    client-side topic matching over decoded text
@@ -400,6 +396,38 @@ unchanged here — and filtering lives at the sink seam rather than inside the
 tailer, so the delivery guarantee and cursor mechanics are untouched by
 output shaping.
 
+### Expression filter rules
+
+`--filter-expr` compiles a Go-like boolean expression once and evaluates it
+against every event through the `ruleEngine` in `internal/cli/rule_engine.go`.
+The engine is stateless: compilation happens before the stream starts, and
+`Match` is a pure function of the record. That keeps the evaluator offline-
+first and trivially testable without a network or a process.
+
+Supported context fields are `value`, `topics`, `contract`, `type`, `tx`,
+`ledger`, `txIndex` and `opIndex`. `value` and `topics` are decoded from XDR
+through lens, so `value.amount`, `topics[0].symbol` and nested map fields are
+all reachable. Operators follow Go syntax: arithmetic (`+`, `-`, `*`, `/`, `%`),
+comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`), boolean logic (`&&`, `||`, `!`),
+indexing (`topics[0]`) and parentheses.
+
+The rule engine wraps one or more compiled `stream.ExpressionFilter` predicates.
+Each predicate is matched in order; a record that any rule rejects is dropped,
+and a rule that errors on a particular record rejects it and reports the
+underlying reason through the returned error. An empty engine passes every
+event through.
+
+The CLI exposes `CompileRules(exprs ...string) (*ruleEngine, error)` for
+consumer code that prefers an explicit compile step. It trims whitespace and
+skips empty strings, so flag values with surrounding spaces are handled
+gracefully.
+
+| Added | Where |
+|---|---|
+| `ruleEngine`, `NewRuleEngine`, `CompileRules` | `internal/cli/rule_engine.go` |
+| `--filter-expr` | `prism events` |
+
+
 ### Per-contract fan-out
 
 `--fanout-dir` routes one stream to one NDJSON file per contract while the
@@ -469,6 +497,10 @@ cancellation is a clean stop, not an error. `Drainer.Run` waits for every
 worker on every path, including sink failure and limit exhaustion, soa terminated backfill cannot leak goroutines or leave a worker writing to a
 closed sink.
 
+The rewind watcher in `internal/cli/rewind.go` is the only other goroutine the
+CLI starts. It owns a signal channel and nothing else: `Close` stops the
+signal delivery and waits for the goroutine to return, so a command that
+ends leaves nothing behind.
 
 ### What is deliberately *not* handled
 
@@ -553,6 +585,256 @@ body replay, writer and reader failures, and close idempotence. The integration
 test in `internal/cli` drives a real `httptest` RPC server through the CLI and
 asserts that the Authorization header and URL password are absent from the
 written log.
+
+## Active-passive high availability (`pkg/stream/ha.go`)
+
+A single prism instance is a single point of failure, and two instances
+streaming the same contract emit the same records twice and fight over the
+cursor file. `--ha-lease-file` makes a pair **active-passive**: the leader
+streams, the standby waits and takes over.
+
+Two mechanisms cooperate, because each covers a failure the other cannot.
+
+- **An advisory lock on the lease file** (`flock(2)`) is held for the whole of
+  a leader's term. The kernel drops it the moment the process dies, so a
+  crashed leader is replaced at once — no TTL to wait out.
+- **A lease record beside it** (`<path>.lease`) carries the holder, an
+  expiry and an **epoch**. It covers the case the lock cannot: a leader that
+  is alive but partitioned, and so neither renews nor exits. Its lease
+  expires, a standby fences it by claiming a higher epoch, and the old leader
+  notices on its next renewal that it has been replaced and stops.
+
+The epoch is the fencing token. It increases every time the lease changes
+hands, so a leader that was slow, paused or partitioned can tell that its
+term has ended and step down instead of continuing to emit alongside the new
+leader. The tailer compares the epoch on every poll: a change means the
+pages queued so far describe work the previous leader did, so they are
+dropped rather than committed, and the stream rewinds to the cursor the
+previous leader committed.
+
+```
+  leader                              standby
+  ──────                              ───────
+  flock(lease)  ──► held
+  write record {holder, epoch: 7, expires}
+                    renew every --ha-heartbeat
+                                         flock(lease)  ──► busy, lease live
+                                         ...lease expires...
+                                         write record {holder, epoch: 8}
+  renew ──► epoch 8 > 7, fenced
+  release the term                     flock(lease)  ──► held
+                                       write record {holder, epoch: 9}
+```
+
+The lease file must be on a file system that supports advisory locking (a
+shared NFS mount, for instance) so every instance sees the same lock. On a
+platform without `flock`, `lockFile` returns an error rather than pretending
+the lease works — the alternative would produce exactly the duplicate events
+the lease exists to prevent.
+
+A standby is alive but not ready: it is waiting for the lease, not serving.
+The health monitor is told about the change through the election's `OnChange`
+callback, so `/healthz` keeps answering 200 while `/readyz` answers 503.
+
+## Liveness and readiness probes (`pkg/stream/health.go`)
+
+`--health-port` serves the three endpoints a container orchestrator asks
+for. The state behind them is a `HealthMonitor`, fed by the tailer:
+
+| Endpoint | Answers |
+|---|---|
+| `/healthz` | 200 while the process is running and still making progress; 503 when it is stuck |
+| `/readyz` | 200 when the RPC is answering, the stream has not gapped, and the lag is within `--max-lag`; 503 otherwise |
+| `/metrics` | The same state in the Prometheus exposition format |
+
+The tailer reports progress after every successful fetch through
+`Options.OnProgress`, so the lag is the real distance between the stream's
+position and the server's head rather than a guess. A failed fetch marks the
+endpoint unreachable; a detected gap marks the stream gapped. Both make the
+stream not ready, because neither is a state a consumer should be sent into.
+
+Liveness is a staleness check: the monitor records when it was last updated,
+and a process that has not reported for `StaleAfter` (30s by default) is
+considered stuck. A standby is exempt — it is waiting for the lease, not
+wedged.
+
+## Runtime profiling (`--pprof-port`)
+
+`--pprof-port` starts the Go runtime's profiling HTTP server for the lifetime
+of the command:
+
+```sh
+prism events --contract CBGSB... --follow --pprof-port 6060
+# prism: serving pprof on http://127.0.0.1:6060/debug/pprof/
+```
+
+The server is bound to `127.0.0.1` deliberately: profiles expose memory
+contents and stack traces, so they must not be reachable from the network by
+default. The flag is a port rather than an address for the same reason.
+
+The endpoints are the standard library's `/debug/pprof/` set: `heap` and
+`allocs` for memory, `profile` for a CPU sample, `goroutine` for stacks, and
+`trace` for execution traces. For example:
+
+```sh
+# Heap profile, then inspect it with the Go toolchain
+curl -o heap.pprof 'http://127.0.0.1:6060/debug/pprof/heap'
+go tool pprof -top prism heap.pprof
+
+# A 30-second CPU profile
+go tool pprof 'http://127.0.0.1:6060/debug/pprof/profile?seconds=30'
+```
+
+`cmd/prism/pprof.go` owns the server; `internal/cli` owns the flag and the
+lifecycle. The CLI starts it before the command's `RunE` and closes it when
+the command returns, using `http.Server.Shutdown` and then waiting for the
+serving goroutine, so Ctrl-C, a validation failure and a normal exit all leave
+nothing listening or running. `internal/cli.ProfilerFactory` is the seam: the
+binary supplies the real implementation, while tests use a fake to assert the
+flag wiring and cleanup without opening a socket.
+
+## Graceful drain (`Tailer.Drain`)
+
+On SIGTERM or Ctrl-C, prism stops scheduling new RPC calls and then gives
+the sinks and the state store a bounded window to finish:
+
+```sh
+prism events --follow --drain-timeout 15s
+```
+
+`Tailer.Drain(ctx, timeout)` writes out the records still held in the reorder
+buffer, flushes the sink and reports the pages that were delivered, which is
+what commits the final cursor. The timeout bounds the whole operation, and a
+drain that overruns it is reported rather than waited out: a process that is
+about to be killed cannot be helped by a longer flush.
+
+Two details make the drain safe rather than merely best-effort:
+
+- **Only one flush runs at a time.** `flushOutput` admits one flush through a
+  gate; a flush that overran its deadline is abandoned, and a second one
+  waits for it rather than starting alongside it. A sink that buffers would
+  otherwise write the same batch twice.
+- **The cursor is committed only for delivered pages.** A page that was
+  partly emitted is not reported, so a drain that fails half-way leaves the
+  cursor where it was and the next run re-emits the records that were not
+  delivered.
+
+The CLI runs the drain inside its own deadline and joins any error with the
+run's own, so a drain failure is reported rather than swallowed.
+
+## Run summary (`--stats`)
+
+Every streaming command accepts `--stats`, which prints one line on stderr as
+the command exits:
+
+```console
+$ prism events --from 1234567 --follow --stats
+...
+prism: stats: processed=1042 duplicates=7 retries=1 elapsed=2m3s
+```
+
+| Part | Meaning |
+|---|---|
+| `processed` | records handed to the sinks, summed over the backfill and follow phases |
+| `duplicates` | records dropped as duplicates: the tailer's high-water mark (`Stats.Duplicates`) plus the `--dedup-window` ring (`DedupSink.Dropped`) |
+| `retries` | fetches that failed and were retried |
+| `elapsed` | wall-clock time from the start of the run, rounded to milliseconds |
+
+Details:
+
+- **stderr, never stdout.** The summary is a diagnostic like every other
+  `prism:` line, so a piped `--json` stream is unaffected.
+- **Printed once, at the end.** Each phase contributes its `stream.Stats` as
+  it finishes; one deferred call prints after the drain, the cursor commit
+  and the sink close, so the numbers describe what actually reached the
+  sinks.
+- **Silent when there is nothing to summarise.** Without `--stats`, or when
+  the run fails before it starts fetching — a sink that cannot be built, an
+  unresolvable head — nothing is printed and the error stands alone.
+- **Nothing new to clean up.** `internal/cli/stats.go` is a plain struct the
+  run feeds; the reporter holds no goroutine and no timer. The one hazard is
+  counters owned by the *drain* goroutine: a drain that overruns
+  `--drain-timeout` is abandoned to it, so the summary reports snapshots
+  taken before it started — chosen with `errors.Is(drainErr, errTimedOut)` —
+  or a fresh read after a drain that completed and was joined.
+
+The flag is additive: a stream that does not ask for it prints exactly what
+it printed before.
+
+## Heartbeat (`--heartbeat`)
+
+A follow on a quiet contract is indistinguishable from a hung process unless
+something keeps saying the stream is alive. `--heartbeat` prints one line on
+stderr for every interval the stream waits without delivering a record:
+
+```console
+$ prism events --follow --heartbeat 30s
+prism: heartbeat: idle for 30s with no records
+prism: heartbeat: idle for 60s with no records
+```
+
+Details:
+
+- **Driven by the tailer's own waits.** `internal/cli/heartbeat.go` wraps
+  the injected `Clock` (`Options.Clock`), slicing each wait at the interval
+  so the beat lands *while* the stream waits — a line printed only after a
+  wait ends would say nothing about a process stuck inside one. The waits
+  are sliced rather than raced against a timer, so the beat needs no
+  goroutine of its own and there is nothing new to clean up at termination.
+- **Idle means idle.** The wrapped `OnPage` marks every page emitted in
+  full, restarting the window, so heartbeats never interrupt a busy stream
+  however long its polls take. The chain preserves what `OnPage` already
+  did — recording the cursor in `--state-file`.
+- **Follow only.** The backfill workers keep the plain clock: their waits
+  are fetch retries, not idle follow intervals, and `--heartbeat` without
+  `--follow` is rejected rather than silently ignored.
+- **Cancellation is unaffected.** Ctrl-C interrupts a wait at the next
+  slice boundary, with the wrapped clock's error passed through untouched.
+- **stderr, never stdout**, like every other `prism:` line, and only when
+  the flag is passed: a run that does not ask for it prints exactly what it
+  printed before.
+
+Retry backoffs pass through the wrapped clock too, so a long backoff may
+beat as well — which is honest: the process really is waiting, and the
+retry messages around it explain why.
+
+## Encrypted state files (`pkg/stream/crypto_state.go`)
+
+The cursor journal holds stream metadata, and on a shared file system or in a
+cloud bucket that is worth encrypting. `--state-passphrase-env` (or
+`--state-passphrase-file`, or a key management service) makes prism write an
+encrypted journal instead.
+
+The file is a header line followed by one envelope per entry:
+
+```
+{"version":1,"alg":"aes-256-gcm","key":{"kdf":"pbkdf2-hmac-sha256", ...}}
+{"version":1,"nonce":"...","ciphertext":"..."}
+```
+
+Each entry is sealed with authenticated **AES-256-GCM** under a fresh random
+nonce, with a fixed label as additional authenticated data so a ciphertext
+cannot be moved from one file into another. A file that was tampered with,
+truncated or written with a different key fails the authentication tag and is
+rejected with a clear error rather than being read as if it were intact.
+
+The key comes from exactly one place, decided by the flags and validated
+before anything is fetched. A passphrase is stretched into a key with
+PBKDF2-HMAC-SHA256 over a random salt, and the salt and iteration count are
+recorded in the header so the file stays readable by a future version; a key
+management service generates the data key and keeps the wrapped form, so the
+plaintext key never reaches the disk.
+
+| Source | Flag |
+|---|---|
+| Environment variable | `--state-passphrase-env NAME` |
+| File | `--state-passphrase-file PATH` |
+| AWS KMS | `--state-kms-provider aws --state-kms-key-id ARN` |
+| GCP KMS | `--state-kms-provider gcp --state-kms-key-id NAME` |
+
+Passing more than one source is an error rather than a silently ignored flag:
+an operator who believes the file is encrypted with a passphrase must never
+end up with a file encrypted with something else.
 
 ## Derived transaction streams
 
@@ -807,67 +1089,74 @@ compressed). Rotation is synchronous; the active file is reopened before
 pruning, so a failed prune cannot stop the stream. `--rotate-*` without
 `--output-file` is rejected.
 
-## Dead letter queue (`--dlq-file`)
+## Rewinding the stream (`--rewind`)
 
-A long-running tail must not die because one record is malformed or one write
-fails. `--dlq-file` wraps the chosen sink in `sink.DLQ`, which records the
-failure and keeps the stream running:
+A stream's cursor is the position it has reached. `--rewind` steps it back so
+the records in between are processed again — the manual escape hatch for "the
+event I need was just before where I was looking".
 
-```
-                      ┌──────────────┐
-   Tailer ── Record ─►│ sink.DLQ     ├──► chosen sink ──► stdout / --output-file
-                      │              │
-                      │   failure    ├──► --dlq-file (NDJSON, append)
-                      └──────────────┘
+```console
+$ prism events --contract CDLZF...CYSC --rewind 500 --follow
+prism: rewinding 500 ledgers back to ledger 3966312
 ```
 
-The wrapper implements both `stream.Sink` and `stream.BatchSink`, so every
-streaming command gains it without knowing it exists.
+The distance is either a count of ledgers (`500`, `500l`) or a duration
+(`45s`, `30m`, `2h`, `1h30m`, `7d`). A duration is converted with
+`NominalLedgerInterval` — five seconds, roughly one ledger close — so it
+lands near the requested point rather than exactly on it.
 
-| Field | Meaning |
+### Where the step is measured from
+
+The step is measured from the start the command resolved: `--from` when it is
+given, and the server's head otherwise. So `--from 3966000 --rewind 500`
+starts at ledger 3965500, and `--rewind 500` on its own starts 500 ledgers
+before the head.
+
+A step that would reach before the first ledger is clamped to it rather than
+rejected: "as far back as the chain goes" is a request, not a mistake. The
+clamp is reported, because a rewind that quietly landed somewhere else would
+be worse than one that did not happen.
+
+### Rewinding a running stream
+
+While following, `SIGUSR2` asks for the same step again. The signal is only
+handled while `--rewind` is in effect; without it, `SIGUSR2` keeps its usual
+meaning and terminates the process. The signal is handled by one goroutine
+that owns nothing but the request (`internal/cli/rewind.go`); the tailer
+applies it at the next page boundary, so a request never lands in the middle
+of a page.
+
+### What a rewind does to the guarantee
+
+A rewind re-emits the records between the old and the new position. That is
+the point of it, and it is the only way a record is emitted twice within a
+single run: the de-duplication mark is reset along with the cursor, because
+the records being reprocessed are exactly the ones the mark would suppress.
+
+A rewind that lands before the server's retention window is a gap, and it is
+reported like any other: the tailer compares the rewind target with the
+server's oldest retained ledger and returns a `*GapError`, so the run exits
+2 rather than continuing with a hole in the stream. Under
+`--gap-strategy resume` the usual recovery applies and the missed range is
+announced.
+
+### The pieces
+
+`pkg/stream/rewind.go` holds the logic:
+
+| Symbol | Role |
 |---|---|
-| `kind` | always `"dlq"`, so a queue file is distinguishable from stream NDJSON |
-| `stage` | `validation`, `delivery` or `flush` |
-| `error` | the failure that prevented delivery |
-| `failedAt` | UTC timestamp, injectable through `DLQOptions.Now` |
-| `record` | the original record, preserved field-for-field; absent for `flush` |
+| `ParseRewind` | parses `500` or `30m` into a `RewindDistance` |
+| `RewindDistance.Ledgers` | converts a distance into ledgers |
+| `RewindDistance.Target` | computes where a step lands, clamping at the first ledger |
+| `RewindController` | hands a request to the tailer, safely |
+| `RewindRequest` | the request itself: a distance and an optional anchor |
 
-Two classes of failure are captured:
-
-- **Validation.** `sink.ValidateRecord` checks the structural contract every
-  sink relies on: a non-empty ID, a known `Kind`, and a payload pointer that
-  matches that kind. It deliberately does *not* reject XDR that lens cannot
-  decode — the built-in sinks already report that inline, and treating a
-  display problem as a delivery failure would be wrong.
-- **Delivery.** If the wrapped sink's `Emit` returns an error, the record is
-  written to the queue and the error is swallowed. Only a failure to write the
-  dead letter itself is returned, because at that point the record would vanish
-  with no trace. A primary `Flush` failure is captured as a `flush` entry for
-  the same reason: the per-record failures are already accounted for, and
-  failing the command at shutdown would defeat the queue's purpose.
-
-A captured record counts as delivered, so the tailer advances its cursor past
-it. The queue is the durable copy: replay its `record` field through a sink if
-the primary output must be complete. This is deliberate — blocking the cursor
-on a record the primary can never write would stall the stream forever — and
-it is why the queue is append-only and flushed per entry.
-
-`EmitBatch` validates and delivers one record at a time. A batch sink can fail
-part-way through a batch, after some records were written, so forwarding the
-whole batch again would duplicate them and forwarding nothing would lose them.
-Per-record isolation is what makes every failure attributable; the trade-off
-is that a DLQ-wrapped run does not amortise the wrapped sink's flushes. The
-batcher still controls when the tailer hands records over.
-
-The DLQ starts no goroutines. `Close` flushes the queue, closes the wrapped
-sink when it implements `io.Closer`, and closes the queue writer (when
-`CloseWriter` is set) — so `Ctrl-C`, a failed run and a normal exit all leave
-nothing open behind. It is idempotent, and each `Close` performs the flush it
-needs rather than returning early.
-
-`--dlq-file` is append-only and must differ from `--output-file`. Without
-`--dlq-file` the sink chain is unchanged: nothing is opened and no wrapper is
-inserted.
+The controller is the seam: whoever asks for the rewind — a flag, a signal
+handler — and the tailer, which is the only goroutine allowed to move a
+cursor, meet there. A request carrying an explicit anchor is measured from
+that anchor; one without is measured from the stream's own position, which
+is the cursor it reached or the last record it emitted.
 
 ## Testing the guarantee
 
@@ -888,10 +1177,10 @@ Covered: clean streams, drops at every position, consecutive drops, replayed
 pages, out-of-order pages, retention overrun with both gap policies, lagging
 backends, permanent errors, retry exhaustion, cancellation mid-follow, sink
 failure, full-page draining, concurrent backfill, batcher count/time/explicit
-flushes, durable-cursor resume across restarts, replay suppression across
-restarts, corrupt/foreign/uninterpretable state files, persist failures mid-page,
-and task-group cancellation. Gap recovery is also unit-tested
-without a network through the `Rewinder` seam.
+flushes, and task-group cancellation. Gap recovery is also unit-tested
+without a network through the `Rewinder` seam. Rewinding is covered the same
+way: a rewind applied mid-stream, in a follow loop, against a source that
+cannot be repositioned, and across the retention window.
 
 Time is injected via `Clock`, so there are no real sleeps and no wall-clock
 flakiness. Follow-loop tests carry a sleep budget that cancels the context, so
@@ -945,23 +1234,53 @@ The invariants were verified by breaking the code on purpose:
 |---|---|
 | De-duplication disabled | `TestTailSuppressesReplayedPages` and `TestTailRejectsOutOfOrderPages` fail with exact diagnostics |
 | Gap detection disabled | `TestTailDetectsRetentionGap` fails in 0.00s |
-| Checkpoint written before the page was emitted | `TestTailDoesNotReportAPartiallyEmittedPage` and `TestTailDoesNotReportAPageTheSinkRejected` fail |
-| Pruner goroutine abandoned instead of joined | `TestPrunerCloseJoinsItsGoroutine` fails: `Close()` returned while the pruner was still running |
-| Second `Close` returning without joining the goroutine | `TestPrunerConcurrentCloseWaitsForTheGoroutine` fails: `Close() returned (<nil>) while the pruner was still running` |
-| Diagnostics written to stderr without serialisation | `TestSyncWriterSerialisesConcurrentWrites` fails with a `DATA RACE` report from the race detector |
-| Prune keeping the oldest entries | `TestFileMetadataStorePruneKeepsTheNewestPerKey` fails |
-| Final compaction at shutdown removed | `TestEventsCommandPrunesTheStateFile` fails: 10 checkpoints left instead of 2 |
-| DLQ swallowing a failure without recording it | `TestDLQCapturesDeliveryFailure` fails: no dead letter on disk |
-| DLQ returning a captured delivery failure | `TestDLQCapturesDeliveryFailure` fails: `Emit()` returned the error |
-| DLQ closing without flushing | `TestDLQClosesWriterAndPrimaryIdempotently` fails: the queue file is empty |
-| Transaction cursor parsed as a ledger sequence | `TestTransactionTailDetectsRetentionGap` fails: the stream passes over the pruned range instead of reporting it |
-| Transaction source treats a short page before the head as terminal | `TestTransactionTailContinuesShortPageBeforeHead` and `TestTransactionsCommandShortPageKeepsDraining` fail with one record instead of two |
-| Per-emit persistence disabled | `TestTailStateRecordsPositionAfterEachEmit`, `TestTailStateResumesAcrossRestart` and the CLI restart test fail |
-| Startup restore disabled | `TestTailStateResumesAcrossRestart`, `TestTailStateRefusesPositionFromAnotherStream`, `TestTailStateRejectsUninterpretableToken` and `TestTailStateGapDetectedOnResume` fail |
-| Restored high-water mark dropped | `TestTailStateSuppressesReplayAfterRestart` fails, naming the re-emitted IDs |
+| De-duplication mark not reset on a rewind | `TestTailAppliesRewind` and `TestTailRewindsWhileFollowing` fail with exact diagnostics |
+| Source not repositioned on a rewind | `TestTailAppliesRewind` fails in 0.00s |
+| Retention check after a rewind disabled | `TestTailRewindReportsRetentionGap` fails in 0.00s |
+| Retention check after a rewind applied to every later page | `TestTailRewindChecksRetentionOnlyOnce` fails in 0.00s |
 
 If you change the state machine, re-run that exercise. A test suite that
 cannot fail is not protecting anything.
+
+## Performance benchmarks (`pkg/stream/bench_test.go`)
+
+The streaming core has an offline benchmark suite sized around the documented
+operational target of 50,000 events per second:
+
+```sh
+make bench
+# or:
+go test -run '^$' -bench 'FiftyThousandEvents' -benchmem ./pkg/stream
+```
+
+Each benchmark iteration processes a 50,000-event corpus through a real code
+path; the reported `events/op` makes the scale explicit, and the custom
+`events/s`, `allocs/event` and `bytes/event` metrics avoid having to divide
+`allocs/op` by hand. The suite covers:
+
+| Benchmark | What it measures |
+|---|---|
+| `BenchmarkTailerFiftyThousandEvents/raw` | the tailer, reorder buffer and sink seam end to end |
+| `BenchmarkTailerFiftyThousandEvents/dedup` | the same path with the `--dedup-window` sink enabled |
+| `BenchmarkDedupSinkFiftyThousandEvents` | fingerprinting plus the bounded de-duplication ring |
+| `BenchmarkReorderBufferFiftyThousandEvents` | per-ledger sorting and release |
+| `BenchmarkEventKeyFiftyThousandEvents` | the de-duplication key itself |
+
+The benchmarks use a fixed in-memory source and no wall-clock waits, so they
+make no network calls and produce the same record IDs on every run. `TestStreamingFiftyThousandEvents`
+runs the same corpus as an ordinary integration test: it asserts that every
+record was delivered exactly once, that throughput clears the 50,000 events/s
+target (with a lower floor under the race detector, whose overhead is not a
+property of the stream), that allocation stays under the per-event budget, and
+that the run leaves no goroutine behind. The test logs the measured throughput
+and allocation so a regression is visible even when it stays inside the
+budget.
+
+On the reference CI machine the raw tailer path is well above the target
+(roughly 1.4M events/s in a normal build, ~370 bytes/event); the dedup path is
+roughly 0.7M events/s at ~423 bytes/event. These numbers are diagnostics, not
+contracts — the contract is the test's 50,000 events/s floor and allocation
+ceiling.
 
 ## Relationship to stellar-xdr-lens
 

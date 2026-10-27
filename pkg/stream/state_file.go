@@ -91,6 +91,55 @@ func OpenStateFile(path string) (*StateFile, error) {
 // Path reports the file this StateFile persists to.
 func (s *StateFile) Path() string { return s.path }
 
+// Rewind atomically replaces the saved position with target and keeps a
+// timestamped backup of the previous complete state. Cursor and high-water
+// identifiers are cleared so replayed records are not de-duplicated away.
+func (s *StateFile) Rewind(target uint32) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, err := s.Load()
+	if err != nil {
+		return "", err
+	}
+	if current.Source == "" {
+		return "", errors.New("cannot rewind an empty state file")
+	}
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		return "", fmt.Errorf("reading state backup: %w", err)
+	}
+	backup := fmt.Sprintf("%s.backup-%d", s.path, time.Now().UTC().UnixNano())
+	if err := os.WriteFile(backup, data, 0o600); err != nil {
+		return "", fmt.Errorf("writing state backup: %w", err)
+	}
+	current.Ledger, current.PagingToken, current.Cursor, current.LastID = target, "", "", ""
+	current.UpdatedAt = time.Now().UTC()
+	current.Version = StateVersion
+	encoded, err := json.Marshal(current)
+	if err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(s.path), filepath.Base(s.path)+".rewind-*")
+	if err != nil {
+		return "", err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if _, err = tmp.Write(encoded); err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return "", err
+	}
+	if err = os.Rename(name, s.path); err != nil {
+		return "", err
+	}
+	return backup, nil
+}
+
 // Load reads the persisted state.
 //
 // A missing or empty file yields the zero State, which the tailer reads as
