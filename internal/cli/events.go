@@ -25,6 +25,7 @@ import (
 type streamFlags struct {
 	follow           bool
 	from             uint32
+	since            time.Duration
 	rewind           string
 	limit            int
 	asJSON           bool
@@ -53,11 +54,24 @@ type streamFlags struct {
 	// runStream, because only the command knows which filters select records.
 	// See cursorKey.
 	derivedKey string
-	quiet      bool
-	verbosity  int
-	stats      bool
-	process    func([]stream.Record) ([]stream.Record, error)
-	filter     stream.RecordFilter
+
+	// Broker output. When configured, records are published to the broker
+	// instead of written to stdout.
+	kafkaBrokers     []string
+	kafkaTopic       string
+	kafkaPartitionBy string
+	amqpURL          string
+	amqpQueue        string
+	amqpExchange     string
+	amqpRoutingKey   string
+
+	quiet     bool
+	verbosity int
+	stats     bool
+	dryRun    bool
+	statsBar  bool
+	process   func([]stream.Record) ([]stream.Record, error)
+	filter    stream.RecordFilter
 
 	sinks sinkFlags
 
@@ -111,7 +125,8 @@ type streamFlags struct {
 
 	// dlqFile is the optional dead letter queue. When set, records that fail
 	// validation or delivery are written there instead of stopping the run.
-	dlqFile string
+	dlqFile          string
+	maxRecordRetries int
 
 	// stateKey identifies this stream inside the cursor metadata file. Two
 	// runs share a key only when they watch the same thing, so a recorded
@@ -126,6 +141,16 @@ type streamFlags struct {
 	// dedupWindow is the events-only re-poll de-duplicator window. Zero
 	// disables it.
 	dedupWindow int
+
+	// sampleRate is the fraction of events to keep (0.0 to 1.0). Zero disables sampling.
+	sampleRate float64
+	// maxRate is the maximum number of events per second to emit. Zero disables rate limiting.
+	maxRate float64
+
+	// excludeTopics are topic patterns to exclude (base64 ScVal or symbol string).
+	excludeTopics []string
+	// excludeContracts are contract IDs to exclude.
+	excludeContracts []string
 }
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
@@ -133,6 +158,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"keep streaming as new ledgers close, like tail -f")
 	cmd.Flags().Uint32Var(&s.from, "from", 0,
 		"start from this ledger and continue forward (default: the latest ledger)")
+	cmd.Flags().DurationVar(&s.since, "since", 0,
+		"start about this long ago, e.g. --since 10m; converted to an approximate start ledger (mutually exclusive with --from)")
 	cmd.Flags().StringVar(&s.rewind, "rewind", "",
 		"step back from the start point and reprocess those records: a ledger count (500) or a duration (30m); while following, SIGUSR2 steps back again")
 	cmd.Flags().IntVarP(&s.limit, "limit", "n", 0,
@@ -176,6 +203,10 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"suppress diagnostic output on stderr; only emit final exit code")
 	cmd.Flags().BoolVar(&s.stats, "stats", false,
 		"print a run summary on exit: records processed, duplicates dropped, retries and elapsed time")
+	cmd.Flags().BoolVar(&s.dryRun, "dry-run", false,
+		"validate filters and report matches without writing to configured sinks")
+	cmd.Flags().BoolVar(&s.statsBar, "stats-bar", false,
+		"show live ledger timing and ingest statistics on stderr (with --follow and a terminal stdout)")
 	cmd.Flags().StringVar(&s.output, "output-file", "",
 		"append records to this file instead of stdout")
 	cmd.Flags().Int64Var(&s.rotateSize, "rotate-size", 0,
@@ -222,6 +253,23 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"how long a shutdown may take to flush records and commit the final cursor")
 	cmd.Flags().StringVar(&s.dlqFile, "dlq-file", "",
 		"append malformed or undeliverable records to this file as NDJSON instead of stopping the stream")
+	cmd.Flags().IntVar(&s.maxRecordRetries, "max-record-retries", 0,
+		"retry a failed record this many times before writing it to the dead-letter queue")
+	cmd.Flags().StringSliceVar(&s.kafkaBrokers, "kafka-brokers", nil,
+		"Kafka broker addresses (comma-separated); requires --kafka-topic")
+	cmd.Flags().StringVar(&s.kafkaTopic, "kafka-topic", "",
+		"publish records as JSON to this Kafka topic instead of stdout; requires --kafka-brokers")
+	cmd.Flags().StringVar(&s.kafkaPartitionBy, "kafka-partition-by", string(sink.PartitionContract),
+		`Kafka message key: "contract" keeps one contract's records ordered on one partition, "tx" keys by transaction hash, "record" keys by record ID`)
+	cmd.Flags().StringVar(&s.amqpURL, "amqp-url", "",
+		"AMQP 0-9-1 broker URL, e.g. amqp://guest:guest@localhost:5672/; requires --amqp-queue")
+	cmd.Flags().StringVar(&s.amqpQueue, "amqp-queue", "",
+		"declare this durable queue and publish records to it instead of stdout; requires --amqp-url")
+	cmd.Flags().StringVar(&s.amqpExchange, "amqp-exchange", "",
+		"AMQP exchange to publish to (default: the default exchange, routing by queue name)")
+	cmd.Flags().StringVar(&s.amqpRoutingKey, "amqp-routing-key", "",
+		"AMQP routing key (default: the queue name)")
+	registerFlagCompletion(cmd, "kafka-partition-by", string(sink.PartitionContract), string(sink.PartitionTx), string(sink.PartitionRecord))
 	s.sinks.register(cmd)
 }
 
@@ -282,8 +330,20 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	if s.dlqFile != "" && s.output != "" && samePath(s.dlqFile, s.output) {
 		return fmt.Errorf("--dlq-file must differ from --output-file")
 	}
+	if s.maxRecordRetries < 0 {
+		return fmt.Errorf("--max-record-retries must not be negative")
+	}
+	if s.maxRecordRetries > 0 && s.dlqFile == "" {
+		return fmt.Errorf("--max-record-retries requires --dlq-file")
+	}
 	if s.dedupWindow < 0 {
 		return fmt.Errorf("--dedup-window must not be negative")
+	}
+	if s.sampleRate < 0 || s.sampleRate > 1 {
+		return fmt.Errorf("--sample-rate must be between 0.0 and 1.0")
+	}
+	if s.maxRate < 0 {
+		return fmt.Errorf("--max-rate must not be negative")
 	}
 	if s.heartbeat < 0 {
 		return fmt.Errorf("--heartbeat must not be negative")
@@ -291,13 +351,27 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	if s.heartbeat > 0 && !s.follow {
 		return fmt.Errorf("--heartbeat requires --follow")
 	}
+	if s.statsBar && !s.follow {
+		return fmt.Errorf("--stats-bar requires --follow")
+	}
 	if err := s.validateState(cmd); err != nil {
 		return err
 	}
 	if err := s.validateRuntime(); err != nil {
 		return err
 	}
-	return nil
+	return s.validateBroker()
+}
+
+func (s *streamFlags) rewindDistance() (stream.RewindDistance, bool, error) {
+	if s.rewind == "" {
+		return stream.RewindDistance{}, false, nil
+	}
+	d, err := stream.ParseRewind(s.rewind)
+	if err != nil {
+		return stream.RewindDistance{}, false, fmt.Errorf("--rewind: %w", err)
+	}
+	return d, true, nil
 }
 
 // validateRuntime checks the high availability, health and drain options.
@@ -425,21 +499,6 @@ func (s *streamFlags) validateStateEncryption(cmd *cobra.Command) error {
 	return nil
 }
 
-// rewindDistance parses the --rewind flag.
-//
-// It reports whether a rewind was asked for at all, so the caller can tell
-// "no rewind" from "a rewind of nothing", which is not a thing.
-func (s *streamFlags) rewindDistance() (stream.RewindDistance, bool, error) {
-	if s.rewind == "" {
-		return stream.RewindDistance{}, false, nil
-	}
-	distance, err := stream.ParseRewind(s.rewind)
-	if err != nil {
-		return stream.RewindDistance{}, false, fmt.Errorf("--rewind: %w", err)
-	}
-	return distance, true, nil
-}
-
 // newSink builds the output sink implied by the flags.
 //
 // With --output-file the chosen format is built on top of a rotating writer,
@@ -450,10 +509,14 @@ func (s *streamFlags) rewindDistance() (stream.RewindDistance, bool, error) {
 // underlying sink, so rotation still sees whole batches.
 func (s *streamFlags) newSink(
 	w io.Writer,
+	diagnostics io.Writer,
 	colorMode string,
 	onBatchError func(error),
 	onDeadLetter func(sink.DLQEntry),
 ) (stream.Sink, error) {
+	if s.dryRun {
+		return sink.NewDryRunSink(diagnostics), nil
+	}
 	build := func(out io.Writer) stream.Sink {
 		format := strings.ToLower(s.format)
 		if s.tsv {
@@ -477,9 +540,22 @@ func (s *streamFlags) newSink(
 	}
 
 	var out stream.Sink
-	if s.output == "" {
+	switch {
+	case s.kafkaTopic != "":
+		k, err := s.newKafkaSink()
+		if err != nil {
+			return nil, err
+		}
+		out = k
+	case s.amqpQueue != "":
+		a, err := s.newAMQPSink()
+		if err != nil {
+			return nil, err
+		}
+		out = a
+	case s.output == "":
 		out = build(w)
-	} else {
+	default:
 		rotator, err := sink.NewFileRotator(s.output, build, sink.RotatorOptions{
 			MaxSize:    s.rotateSize,
 			MaxAge:     s.rotateInterval,
@@ -508,8 +584,9 @@ func (s *streamFlags) newSink(
 		}
 
 		dlq, err = sink.NewDLQ(out, file, sink.DLQOptions{
-			CloseWriter:  true,
-			OnDeadLetter: onDeadLetter,
+			MaxRecordRetries: s.maxRecordRetries,
+			CloseWriter:      true,
+			OnDeadLetter:     onDeadLetter,
 		})
 		if err != nil {
 			_ = file.Close()
@@ -534,6 +611,17 @@ func (s *streamFlags) newSink(
 		},
 	})
 	if dlq == nil {
+		// Batcher.Close flushes and stops its timer, but it does not close
+		// what it wraps: a broker connection underneath the batcher would
+		// outlive its last publish without this pairing.
+		if closer, ok := out.(io.Closer); ok {
+			return &closingSink{
+				Sink: batcher,
+				closeFn: func() error {
+					return errors.Join(batcher.Close(), closer.Close())
+				},
+			}, nil
+		}
 		return batcher, nil
 	}
 	// Batcher.Close stops its timer and flushes, but it does not close what it
@@ -551,6 +639,24 @@ type errorSink struct{ err error }
 
 func (s errorSink) Emit(stream.Record) error { return s.err }
 func (s errorSink) Flush() error             { return s.err }
+
+// dryRunFilter reports records rejected before they reach DryRunSink, making
+// filter validation observable without enabling any configured delivery sink.
+type dryRunFilter struct {
+	next        stream.RecordFilter
+	diagnostics io.Writer
+}
+
+func (f dryRunFilter) Match(record stream.Record) (bool, error) {
+	matched, err := f.next.Match(record)
+	if err != nil {
+		return false, err
+	}
+	if !matched {
+		_, _ = fmt.Fprintf(f.diagnostics, "dry-run: reject id=%s ledger=%d kind=%s\n", record.ID, record.Sequence, record.Kind)
+	}
+	return matched, nil
+}
 
 // closingSink gives a wrapper without its own Close a teardown path. It is how
 // a sink chain tells runStream that there is more to release than the outermost
@@ -688,11 +794,12 @@ Events are retained by RPC for roughly 24 hours, so --from cannot reach
 further back than that. If the stream ever falls behind that window, prism
 reports the missed ledger range and exits 2 rather than skipping silently.
 
---rewind steps the start point back so the records in between are processed
-again. It is measured from --from, or from the server's head when --from is
-absent, and it accepts a ledger count (500) or a duration (30m). While
-following, sending SIGUSR2 asks for the same step again, which reprocesses
-the records between the old and the new position.`,
+With --pg-dsn the position is committed to PostgreSQL after every record, so
+an interrupted run resumes where it stopped instead of starting over.
+
+With --state-file the position reached is recorded after every page, and a
+background pruner keeps that file from growing without bound. Add --resume to
+start the next run where the last one stopped.`,
 		Example: `  # Follow one contract
   prism events --contract CBGSB... --follow
 
@@ -710,6 +817,12 @@ the records between the old and the new position.`,
 
   # Backfill from a ledger then keep following
   prism events --from 1234567 --follow
+
+  # Resume across restarts with a durable cursor in PostgreSQL
+  prism events --contract CBGSB... --follow --pg-dsn "$PRISM_PG_DSN"
+
+  # Durable cursor: resume where the previous run stopped
+  prism events --contract CBGSB... --follow --state-file ./prism.state.json
 
   # Reprocess the last 500 ledgers, then keep following
   prism events --contract CBGSB... --rewind 500 --follow`,
@@ -779,7 +892,21 @@ the records between the old and the new position.`,
 				if watchlist != nil {
 					query.Watchlist = watchlist
 				}
-				return stream.NewEventSource(client, query)
+				var src stream.Source
+				src, err := stream.NewEventSource(client, query)
+				if err != nil {
+					return nil, err
+				}
+				if sf.sampleRate > 0 || sf.maxRate > 0 {
+					src = stream.NewSampleFilter(src, sf.sampleRate, sf.maxRate)
+				}
+				if len(sf.excludeTopics) > 0 || len(sf.excludeContracts) > 0 {
+					src, err = stream.NewExcludeFilter(src, sf.excludeTopics, sf.excludeContracts)
+					if err != nil {
+						return nil, err
+					}
+				}
+				return src, nil
 			}
 
 			// The key names this exact query: same filters, same stream, and
@@ -816,10 +943,18 @@ the records between the old and the new position.`,
 	// within one filter, which StringSlice's comma-splitting would destroy.
 	cmd.Flags().StringArrayVar(&sf.topicPatterns, "topic-pattern", nil,
 		`client-side topic pattern as comma-separated segments over decoded topics: "*", "**", "prefix:TEXT", "re:REGEX", or plain text with "*" and "?" globs; repeatable, up to 5`)
+	cmd.Flags().StringArrayVar(&sf.excludeTopics, "exclude-topic", nil,
+		"topic to exclude: base64 ScVal or symbol string (e.g., 'transfer'); repeatable")
+	cmd.Flags().StringSliceVar(&sf.excludeContracts, "exclude-contract", nil,
+		"contract ID to exclude; repeatable")
 	cmd.Flags().StringVar(&sf.fanoutDir, "fanout-dir", "",
 		"write each watched contract's events to its own NDJSON file in this directory, in addition to the main output")
 	cmd.Flags().IntVar(&sf.dedupWindow, "dedup-window", 0,
 		"drop re-polled duplicate events, remembering this many recent fingerprints (0 disables; 4096 covers a page with margin)")
+	cmd.Flags().Float64Var(&sf.sampleRate, "sample-rate", 0,
+		"fraction of matching events to emit deterministically (0.0 to 1.0; 0 disables)")
+	cmd.Flags().Float64Var(&sf.maxRate, "max-rate", 0,
+		"maximum events per second to emit (0 disables)")
 	sf.register(cmd, stream.DefaultPageLimit)
 	registerFlagCompletion(cmd, "type", "contract", "system", "diagnostic")
 	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
@@ -921,6 +1056,14 @@ func runStream(
 			err = cause
 		}
 	}()
+	if !g.skipNetworkCheck {
+		networkClient, ok := client.(rpc.NetworkClient)
+		if ok {
+			if err := rpc.ValidateNetwork(ctx, networkClient, g.network); err != nil {
+				return err
+			}
+		}
+	}
 
 	// Diagnostics come from more than one goroutine: the stream reports
 	// retries and gaps, and the background cursor pruner reports what it
@@ -983,7 +1126,7 @@ func runStream(
 		from = target.Ledger
 	}
 
-	out, err := sf.newSink(stdout, g.color, func(err error) {
+	out, err := sf.newSink(stdout, stderr, g.color, func(err error) {
 		fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
 	}, func(entry sink.DLQEntry) {
 		record := "-"
@@ -995,6 +1138,9 @@ func runStream(
 	})
 	if err != nil {
 		return err
+	}
+	if sf.statsBar {
+		out = sink.NewStatusBar(out, stderr, sink.StatusBarOptions{Enabled: isTerminalWriter(stdout)})
 	}
 	if sf.sinks.metrics != nil {
 		if addr := sf.sinks.metrics.Addr(); addr != "" {
@@ -1090,6 +1236,9 @@ func runStream(
 	opts, err := sf.options(stderr, sf.quiet)
 	if err != nil {
 		return err
+	}
+	if sf.dryRun && opts.Filter != nil {
+		opts.Filter = dryRunFilter{next: opts.Filter, diagnostics: stderr}
 	}
 	opts.Process = sf.process
 
@@ -1254,7 +1403,7 @@ func runStream(
 		defer watcher.Close()
 	}
 
-	if sf.from > 0 && sf.backfillWorkers > 1 {
+	if from > 0 && sf.backfillWorkers > 1 {
 		drainer, err := stream.NewDrainer(stream.DrainerConfig{
 			NewSource:        newSource,
 			Sink:             out,
@@ -1342,6 +1491,12 @@ func runStream(
 	// afresh.
 	stats := tailer.Stats()
 	dropped := dedupDropped(dedupOut)
+	// Capture sampling and rate limiting stats from the SampleFilter if present.
+	var sampled, rateLimited int
+	if filterSrc, ok := src.(*stream.SampleFilter); ok {
+		sampled = filterSrc.Sampled()
+		rateLimited = filterSrc.RateLimited()
+	}
 	drainErr := runWithTimeout(sf.drainTimeout, func() error {
 		var errs []error
 		if err := tailer.Drain(context.WithoutCancel(ctx), sf.drainTimeout); err != nil {
@@ -1371,6 +1526,11 @@ func runStream(
 		summary.addDuplicates(dropped)
 	} else {
 		summary.add(tailer.Stats())
+	}
+	// Add sampled and rate limited counts to summary
+	if sampled > 0 || rateLimited > 0 {
+		summary.addSampled(sampled)
+		summary.addRateLimited(rateLimited)
 	}
 	return reportStreamError(runErr, stderr, store, key)
 }

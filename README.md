@@ -66,6 +66,7 @@ returns — there is no polling loop, no cursor advancement, no reconnection, an
 | **Gap detection** | ❌ | ✅ |
 | **Active-passive HA** | ❌ | ✅ (`--ha-lease-file`) |
 | **Health/readiness probes** | ❌ | ✅ (`--health-port`) |
+| **Runtime pprof profiles** | ❌ | ✅ (`--pprof-port`) |
 | **Graceful drain on SIGTERM** | ❌ | ✅ (`--drain-timeout`) |
 | **Encrypted state file** | ❌ | ✅ (`--state-passphrase-env`) |
 | Ledger streaming | ❌ | ✅ |
@@ -280,6 +281,21 @@ stream's own progress, so it is the real distance to the head and not a guess.
 
 A standby answers `/healthz` with 200 — it is waiting, not stuck — and
 `/readyz` with 503, so the orchestrator keeps traffic away from it.
+
+### Runtime profiling
+
+`--pprof-port` starts the Go runtime's profiling server on loopback for the
+lifetime of the command:
+
+```sh
+prism events --contract CDLZF... --follow --pprof-port 6060
+# prism: serving pprof on http://127.0.0.1:6060/debug/pprof/
+```
+
+Use `/debug/pprof/heap` and `/debug/pprof/allocs` for memory, or
+`/debug/pprof/profile?seconds=30` for CPU. The server binds to `127.0.0.1`
+because profiles expose memory and stack contents; it is shut down and its
+goroutine joined when the command exits, including on Ctrl-C.
 
 ### Graceful drain
 
