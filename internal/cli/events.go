@@ -26,6 +26,7 @@ type streamFlags struct {
 	follow           bool
 	from             uint32
 	since            time.Duration
+	rewind           string
 	limit            int
 	asJSON           bool
 	format           string
@@ -53,13 +54,24 @@ type streamFlags struct {
 	// runStream, because only the command knows which filters select records.
 	// See cursorKey.
 	derivedKey string
-	quiet      bool
-	verbosity  int
-	stats      bool
-	dryRun     bool
-	statsBar   bool
-	process    func([]stream.Record) ([]stream.Record, error)
-	filter     stream.RecordFilter
+
+	// Broker output. When configured, records are published to the broker
+	// instead of written to stdout.
+	kafkaBrokers     []string
+	kafkaTopic       string
+	kafkaPartitionBy string
+	amqpURL          string
+	amqpQueue        string
+	amqpExchange     string
+	amqpRoutingKey   string
+
+	quiet     bool
+	verbosity int
+	stats     bool
+	dryRun    bool
+	statsBar  bool
+	process   func([]stream.Record) ([]stream.Record, error)
+	filter    stream.RecordFilter
 
 	sinks sinkFlags
 
@@ -148,6 +160,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"start from this ledger and continue forward (default: the latest ledger)")
 	cmd.Flags().DurationVar(&s.since, "since", 0,
 		"start about this long ago, e.g. --since 10m; converted to an approximate start ledger (mutually exclusive with --from)")
+	cmd.Flags().StringVar(&s.rewind, "rewind", "",
+		"step back from the start point and reprocess those records: a ledger count (500) or a duration (30m); while following, SIGUSR2 steps back again")
 	cmd.Flags().IntVarP(&s.limit, "limit", "n", 0,
 		"stop after this many records (0 means unlimited)")
 	cmd.Flags().BoolVar(&s.asJSON, "json", false,
@@ -241,6 +255,21 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"append malformed or undeliverable records to this file as NDJSON instead of stopping the stream")
 	cmd.Flags().IntVar(&s.maxRecordRetries, "max-record-retries", 0,
 		"retry a failed record this many times before writing it to the dead-letter queue")
+	cmd.Flags().StringSliceVar(&s.kafkaBrokers, "kafka-brokers", nil,
+		"Kafka broker addresses (comma-separated); requires --kafka-topic")
+	cmd.Flags().StringVar(&s.kafkaTopic, "kafka-topic", "",
+		"publish records as JSON to this Kafka topic instead of stdout; requires --kafka-brokers")
+	cmd.Flags().StringVar(&s.kafkaPartitionBy, "kafka-partition-by", string(sink.PartitionContract),
+		`Kafka message key: "contract" keeps one contract's records ordered on one partition, "tx" keys by transaction hash, "record" keys by record ID`)
+	cmd.Flags().StringVar(&s.amqpURL, "amqp-url", "",
+		"AMQP 0-9-1 broker URL, e.g. amqp://guest:guest@localhost:5672/; requires --amqp-queue")
+	cmd.Flags().StringVar(&s.amqpQueue, "amqp-queue", "",
+		"declare this durable queue and publish records to it instead of stdout; requires --amqp-url")
+	cmd.Flags().StringVar(&s.amqpExchange, "amqp-exchange", "",
+		"AMQP exchange to publish to (default: the default exchange, routing by queue name)")
+	cmd.Flags().StringVar(&s.amqpRoutingKey, "amqp-routing-key", "",
+		"AMQP routing key (default: the queue name)")
+	registerFlagCompletion(cmd, "kafka-partition-by", string(sink.PartitionContract), string(sink.PartitionTx), string(sink.PartitionRecord))
 	s.sinks.register(cmd)
 }
 
@@ -276,6 +305,9 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	if s.backfillWorkers < 1 {
 		return fmt.Errorf("--backfill-workers must be at least 1")
 	}
+	if _, _, err := s.rewindDistance(); err != nil {
+		return err
+	}
 	if _, err := stream.ParseGapStrategy(s.gapStrategy); err != nil {
 		return err
 	}
@@ -305,6 +337,7 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 		if s.dlqFile != "" && samePath(s.sinks.auditFile, s.dlqFile) {
 			return fmt.Errorf("--sink-audit must differ from --dlq-file")
 		}
+	}
 	if s.maxRecordRetries < 0 {
 		return fmt.Errorf("--max-record-retries must not be negative")
 	}
@@ -335,7 +368,18 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	if err := s.validateRuntime(); err != nil {
 		return err
 	}
-	return nil
+	return s.validateBroker()
+}
+
+func (s *streamFlags) rewindDistance() (stream.RewindDistance, bool, error) {
+	if s.rewind == "" {
+		return stream.RewindDistance{}, false, nil
+	}
+	d, err := stream.ParseRewind(s.rewind)
+	if err != nil {
+		return stream.RewindDistance{}, false, fmt.Errorf("--rewind: %w", err)
+	}
+	return d, true, nil
 }
 
 // validateRuntime checks the high availability, health and drain options.
@@ -504,9 +548,22 @@ func (s *streamFlags) newSink(
 	}
 
 	var out stream.Sink
-	if s.output == "" {
+	switch {
+	case s.kafkaTopic != "":
+		k, err := s.newKafkaSink()
+		if err != nil {
+			return nil, err
+		}
+		out = k
+	case s.amqpQueue != "":
+		a, err := s.newAMQPSink()
+		if err != nil {
+			return nil, err
+		}
+		out = a
+	case s.output == "":
 		out = build(w)
-	} else {
+	default:
 		rotator, err := sink.NewFileRotator(s.output, build, sink.RotatorOptions{
 			MaxSize:    s.rotateSize,
 			MaxAge:     s.rotateInterval,
@@ -562,6 +619,17 @@ func (s *streamFlags) newSink(
 		},
 	})
 	if dlq == nil {
+		// Batcher.Close flushes and stops its timer, but it does not close
+		// what it wraps: a broker connection underneath the batcher would
+		// outlive its last publish without this pairing.
+		if closer, ok := out.(io.Closer); ok {
+			return &closingSink{
+				Sink: batcher,
+				closeFn: func() error {
+					return errors.Join(batcher.Close(), closer.Close())
+				},
+			}, nil
+		}
 		return batcher, nil
 	}
 	// Batcher.Close stops its timer and flushes, but it does not close what it
@@ -762,7 +830,10 @@ start the next run where the last one stopped.`,
   prism events --contract CBGSB... --follow --pg-dsn "$PRISM_PG_DSN"
 
   # Durable cursor: resume where the previous run stopped
-  prism events --contract CBGSB... --follow --state-file ./prism.state.json`,
+  prism events --contract CBGSB... --follow --state-file ./prism.state.json
+
+  # Reprocess the last 500 ledgers, then keep following
+  prism events --contract CBGSB... --rewind 500 --follow`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := sf.validate(cmd); err != nil {
@@ -1044,6 +1115,25 @@ func runStream(
 		}
 	}()
 
+	// A rewind moves the start point back, so the records in between are
+	// processed again. It is measured from the start the command resolved,
+	// which is --from when given and the server's head otherwise.
+	distance, hasRewind, err := sf.rewindDistance()
+	if err != nil {
+		return err
+	}
+	if hasRewind {
+		target, err := distance.Target(from)
+		if err != nil {
+			return fmt.Errorf("--rewind: %w", err)
+		}
+		if !sf.quiet {
+			fmt.Fprintf(stderr, "prism: rewinding %d ledgers back to ledger %d\n",
+				target.Back, target.Ledger)
+		}
+		from = target.Ledger
+	}
+
 	out, err := sf.newSink(stdout, stderr, g.color, func(err error) {
 		fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
 	}, func(entry sink.DLQEntry) {
@@ -1303,6 +1393,22 @@ func runStream(
 			}
 			startFrom = latest
 		}
+	}
+
+	// While following, the same distance can be asked for again at runtime:
+	// SIGUSR2 asks the stream to step back, and the records in between are
+	// processed a second time.
+	if hasRewind && sf.follow {
+		controller := stream.NewRewindController()
+		opts.Rewind = controller
+		opts.OnRewind = func(target stream.RewindTarget) {
+			if !sf.quiet {
+				fmt.Fprintf(stderr, "prism: rewound %d ledgers back to ledger %d\n",
+					target.Back, target.Ledger)
+			}
+		}
+		watcher := newRewindWatcher(ctx, notifyRewindSignals(), controller, distance, stderr)
+		defer watcher.Close()
 	}
 
 	if from > 0 && sf.backfillWorkers > 1 {

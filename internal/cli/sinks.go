@@ -132,6 +132,12 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 	flags.BoolVar(&s.natsJetStream, "nats-jetstream", false, "wait for JetStream publish acknowledgements")
 	flags.StringVar(&s.zmqEndpoint, "sink-zmq", "", "ZeroMQ PUB endpoint")
 	flags.StringVar(&s.zmqTopic, "zmq-topic", "stellar.events.{{.ContractID}}", "ZeroMQ topic template using .ContractID, .Topic0, .ID or .Ledger")
+	flags.StringVar(&s.auditFile, "sink-audit", "",
+		"write a tamper-evident audit trail, chained with SHA-256 and signed at checkpoints, to this file")
+	flags.StringVar(&s.auditKeyFile, "sink-audit-key", "",
+		"Ed25519 private key signing the audit checkpoints (default <audit file>.key, created if absent)")
+	flags.IntVar(&s.auditCheckpoint, "sink-audit-checkpoint", sink.DefaultAuditCheckpointRecords,
+		"write a signed audit checkpoint every this many records (0 writes one after every record)")
 	flags.StringVar(&s.parquetDir, "sink-parquet-dir", "", "write partitioned Parquet files under this directory")
 	flags.StringVar(&s.sqsQueue, "sink-sqs-queue", "", "AWS SQS queue URL")
 	flags.StringVar(&s.snsTopic, "sink-sns-topic", "", "AWS SNS topic ARN")
@@ -209,6 +215,9 @@ func (s *sinkFlags) validate(cmd *cobra.Command) error {
 	if s.natsURL == "" && s.natsJetStream {
 		return fmt.Errorf("--nats-jetstream requires --sink-nats")
 	}
+	if s.parquetDir != "" && strings.TrimSpace(s.parquetDir) == "" {
+		return fmt.Errorf("--sink-parquet-dir must not be blank")
+	}
 	return s.validateAudit(cmd)
 }
 
@@ -228,8 +237,6 @@ func (s *sinkFlags) validateAudit(cmd *cobra.Command) error {
 	}
 	if s.auditCheckpoint < 0 {
 		return fmt.Errorf("--sink-audit-checkpoint must not be negative")
-	if s.parquetDir != "" && strings.TrimSpace(s.parquetDir) == "" {
-		return fmt.Errorf("--sink-parquet-dir must not be blank")
 	}
 	return nil
 }
@@ -406,14 +413,14 @@ func (s *sinkFlags) addTo(base stream.Sink, decode bool, onAsyncError func(error
 			return nil, fmt.Errorf("aws config: %w", awsErr)
 		}
 		if s.sqsQueue != "" {
-			q, e := sink.NewSQSSink(sqs.NewFromConfig(cfg), s.sqsQueue, strings.HasSuffix(s.sqsQueue, ".fifo"), !raw)
+			q, e := sink.NewSQSSink(sqs.NewFromConfig(cfg), s.sqsQueue, strings.HasSuffix(s.sqsQueue, ".fifo"), decode)
 			if e != nil {
 				return nil, e
 			}
 			sinks = append(sinks, q)
 		}
 		if s.snsTopic != "" {
-			n, e := sink.NewSNSSink(sns.NewFromConfig(cfg), s.snsTopic, !raw)
+			n, e := sink.NewSNSSink(sns.NewFromConfig(cfg), s.snsTopic, decode)
 			if e != nil {
 				return nil, e
 			}
@@ -430,7 +437,7 @@ func (s *sinkFlags) addTo(base stream.Sink, decode bool, onAsyncError func(error
 			_ = client.Close()
 			return nil, fmt.Errorf("--sink-pubsub-topic must be projects/PROJECT/topics/TOPIC")
 		}
-		p, e := sink.NewPubSubSink(sink.AdaptPubSubPublisher(client.Publisher(s.pubsubTopic)), !raw)
+		p, e := sink.NewPubSubSink(sink.AdaptPubSubPublisher(client.Publisher(s.pubsubTopic)), decode)
 		if e != nil {
 			_ = client.Close()
 			return nil, e
