@@ -317,7 +317,7 @@ func TestBrokerSinkClosesOnCancellation(t *testing.T) {
 	}()
 
 	var out, errBuf bytes.Buffer
-	root := newRootCmd(&out, &errBuf)
+	root, _ := newRootCmdWithProfiler(&out, &errBuf, nil)
 	root.SetArgs([]string{"events", "--from", "5000", "--follow",
 		"--poll", "10ms",
 		"--kafka-brokers", "localhost:9092",

@@ -82,7 +82,7 @@ func (f *fakeAMQPPublisher) published() []sink.AMQPMessage {
 	return append([]sink.AMQPMessage(nil), f.msgs...)
 }
 
-func transactionRecord() stream.Record {
+func brokerTransactionRecord() stream.Record {
 	return stream.Record{
 		ID:       "0000000429496729600-0000000000",
 		Sequence: 100,
@@ -111,7 +111,7 @@ func TestKafkaPartitionsByContract(t *testing.T) {
 		t.Fatalf("NewKafka() error = %v", err)
 	}
 
-	recs := []stream.Record{eventRecord(), ledgerRecord(), transactionRecord()}
+	recs := []stream.Record{eventRecord(), ledgerRecord(), brokerTransactionRecord()}
 	if err := k.EmitBatch(recs); err != nil {
 		t.Fatalf("EmitBatch() error = %v", err)
 	}
@@ -124,7 +124,7 @@ func TestKafkaPartitionsByContract(t *testing.T) {
 	wantKeys := []string{
 		eventRecord().Event.ContractID,
 		ledgerRecord().Close.Hash,
-		transactionRecord().Transaction.Hash,
+		brokerTransactionRecord().Transaction.Hash,
 	}
 	for i, want := range wantKeys {
 		if got := string(msgs[i].Key); got != want {
@@ -149,7 +149,7 @@ func TestKafkaPartitionsByTx(t *testing.T) {
 	}
 
 	ev := eventRecord()
-	tx := transactionRecord()
+	tx := brokerTransactionRecord()
 	if err := k.EmitBatch([]stream.Record{ev, tx}); err != nil {
 		t.Fatalf("EmitBatch() error = %v", err)
 	}
